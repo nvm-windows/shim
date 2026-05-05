@@ -1,0 +1,10 @@
+.*
+!.github
+!.github/**
+!.gitignore
+*.main
+*.pdb
+*.log
+zig-out
+*.ps1
+!build.ps1

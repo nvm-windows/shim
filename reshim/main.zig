@@ -1,0 +1,531 @@
+const std = @import("std");
+const build_options = @import("build_options");
+const windows = std.os.windows;
+const registry = @import("registry");
+const config = @import("config");
+const eventlog = @import("eventlog");
+
+const shim_version = build_options.version;
+
+extern "kernel32" fn CreateHardLinkW(
+    lpFileName: [*:0]const u16,
+    lpExistingFileName: [*:0]const u16,
+    lpSecurityAttributes: ?*anyopaque,
+) callconv(.winapi) windows.BOOL;
+
+pub fn main() !void {
+    _ = eventlog;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var force = false;
+    var dry_run = false;
+    var target_version_dir: ?[]const u8 = null;
+    const argv = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, argv);
+
+    var i: usize = 1;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (std.mem.eql(u8, arg, "--version")) {
+            std.debug.print("{s}\n", .{shim_version});
+            return;
+        }
+
+        if (std.mem.eql(u8, arg, "--force")) {
+            force = true;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--dry-run")) {
+            dry_run = true;
+            continue;
+        }
+
+        if (target_version_dir == null) {
+            target_version_dir = arg;
+            continue;
+        }
+
+        std.debug.print("Unknown argument: {s}\n", .{arg});
+        std.debug.print("Usage: reshim [--force] [--dry-run] [node_install_dir]\n", .{});
+        return;
+    }
+
+    const install_root = if (target_version_dir == null)
+        registry.queryStringWithFallback(
+            allocator,
+            registry.preferenceHives(),
+            config.preference_registry_root,
+            config.reg_value_root,
+        ) catch {
+            std.debug.print("InstallRoot=<not found>\n", .{});
+            return;
+        }
+    else
+        try allocator.dupe(u8, std.fs.path.dirname(target_version_dir.?) orelse ".");
+    defer allocator.free(install_root);
+
+    const shim_dir = try std.fs.path.resolve(allocator, &.{ install_root, "..", ".shim" });
+    defer allocator.free(shim_dir);
+
+    var existing_before_force = std.StringHashMap(void).init(allocator);
+    defer {
+        var it_existing_before_force = existing_before_force.keyIterator();
+        while (it_existing_before_force.next()) |k| allocator.free(k.*);
+        existing_before_force.deinit();
+    }
+
+    if (force) {
+        try collectExistingShimNames(allocator, shim_dir, &existing_before_force);
+    }
+
+    var cmd_names = if (target_version_dir) |version_dir|
+        try collectCmdNamesFromVersionDir(allocator, version_dir)
+    else
+        try collectCmdNamesFromInstallRoot(allocator, install_root);
+    var planned_removals = std.ArrayListUnmanaged([]const u8){};
+    defer {
+        for (planned_removals.items) |name| allocator.free(name);
+        planned_removals.deinit(allocator);
+    }
+
+    cmd_names = try reconcileShimExecutables(allocator, shim_dir, cmd_names, force, dry_run, &planned_removals);
+    defer freeNameList(allocator, cmd_names);
+
+    if (dry_run) {
+        try writeDryRunJson(allocator, cmd_names, planned_removals.items);
+        return;
+    }
+
+    // std.debug.print("InstallRoot={s}\n", .{install_root});
+    // std.debug.print("ShimDir={s}\n", .{shim_dir});
+
+    if (cmd_names.len == 0) {
+        prewarmShims(allocator, shim_dir);
+        try writeStdoutf(allocator, "All shims up to date.\n", .{});
+        return;
+    }
+
+    const proxy_path = try std.fs.path.resolve(allocator, &.{ install_root, "..", "utils", "proxy.exe" });
+    defer allocator.free(proxy_path);
+
+    std.fs.accessAbsolute(proxy_path, .{}) catch {
+        prewarmShims(allocator, shim_dir);
+        std.debug.print("proxy.exe not found at {s}, cannot create shims.\n", .{proxy_path});
+        return;
+    };
+
+    var linked: usize = 0;
+    for (cmd_names) |name| {
+        const key = try allocator.dupe(u8, name);
+        defer allocator.free(key);
+        _ = std.ascii.lowerString(key, key);
+        const existed_before_force = force and existing_before_force.contains(key);
+
+        const link_name = try std.mem.concat(allocator, u8, &.{ name, ".exe" });
+        defer allocator.free(link_name);
+        const link_path = try std.fs.path.join(allocator, &.{ shim_dir, link_name });
+        defer allocator.free(link_path);
+
+        createHardLink(allocator, link_path, proxy_path) catch |err| {
+            std.debug.print("  failed {s}: {}\n", .{ link_name, err });
+            if (existed_before_force) {
+                const removed_msg = std.fmt.allocPrint(allocator, "Global module '{s}' was removed in shim mode.", .{name}) catch null;
+                if (removed_msg) |msg| {
+                    defer allocator.free(msg);
+                    eventlog.write(allocator, msg);
+                }
+            }
+            continue;
+        };
+        try writeStdoutf(allocator, "  linked: {s}\n", .{link_name});
+        if (!existed_before_force and shouldLogModuleEvent(name)) {
+            const created_msg = std.fmt.allocPrint(allocator, "Global module '{s}' was made available in shim mode.", .{name}) catch null;
+            if (created_msg) |msg| {
+                defer allocator.free(msg);
+                eventlog.write(allocator, msg);
+            }
+        }
+        linked += 1;
+    }
+
+    try writeStdoutf(allocator, "\nCreated {d} shim(s).\n", .{linked});
+    prewarmShims(allocator, shim_dir);
+}
+
+fn prewarmShims(allocator: std.mem.Allocator, shim_dir: []const u8) void {
+    runPrewarmCommand(allocator, shim_dir, "npm");
+    runPrewarmCommand(allocator, shim_dir, "node");
+}
+
+fn runPrewarmCommand(allocator: std.mem.Allocator, shim_dir: []const u8, command_name: []const u8) void {
+    const exe_name = std.fmt.allocPrint(allocator, "{s}.exe", .{command_name}) catch return;
+    defer allocator.free(exe_name);
+
+    const exe_path = std.fs.path.join(allocator, &.{ shim_dir, exe_name }) catch return;
+    defer allocator.free(exe_path);
+
+    std.fs.accessAbsolute(exe_path, .{}) catch return;
+
+    var child = std.process.Child.init(&.{ exe_path, "-v" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+
+    // Fire-and-forget: spawn but don't wait so nvm use returns immediately.
+    child.spawn() catch return;
+}
+
+fn createHardLink(allocator: std.mem.Allocator, link_path: []const u8, existing_path: []const u8) !void {
+    const link_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, link_path);
+    defer allocator.free(link_w);
+    const existing_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, existing_path);
+    defer allocator.free(existing_w);
+
+    if (CreateHardLinkW(link_w, existing_w, null) == 0) {
+        return error.CreateHardLinkFailed;
+    }
+}
+
+fn deleteFileWithRetries(abs_path: []const u8) !void {
+    const max_attempts: usize = 5000;
+
+    var attempt: usize = 0;
+    while (attempt < max_attempts) : (attempt += 1) {
+        std.fs.deleteFileAbsolute(abs_path) catch |err| {
+            if (err == error.AccessDenied and attempt + 1 < max_attempts) {
+                continue;
+            }
+            return err;
+        };
+        return;
+    }
+}
+
+fn writeDryRunJson(allocator: std.mem.Allocator, create_names: []const []const u8, remove_names: []const []const u8) !void {
+    var json = std.ArrayListUnmanaged(u8){};
+    defer json.deinit(allocator);
+
+    try json.appendSlice(allocator, "{\"create\":[");
+    for (create_names, 0..) |name, i| {
+        if (i != 0) try json.append(allocator, ',');
+        try json.append(allocator, '"');
+        try appendJsonEscaped(allocator, &json, name);
+        try json.appendSlice(allocator, ".exe\"");
+    }
+
+    try json.appendSlice(allocator, "],\"remove\":[");
+    for (remove_names, 0..) |name, i| {
+        if (i != 0) try json.append(allocator, ',');
+        try json.append(allocator, '"');
+        try appendJsonEscaped(allocator, &json, name);
+        try json.append(allocator, '"');
+    }
+    try json.appendSlice(allocator, "]}");
+
+    try std.fs.File.stdout().writeAll(json.items);
+    try std.fs.File.stdout().writeAll("\n");
+}
+
+fn writeStdoutf(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+    const msg = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(msg);
+    try std.fs.File.stdout().writeAll(msg);
+}
+
+fn appendJsonEscaped(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), input: []const u8) !void {
+    for (input) |ch| {
+        switch (ch) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => {
+                if (ch < 0x20) {
+                    const escaped = try std.fmt.allocPrint(allocator, "\\u{X:0>4}", .{@as(u16, ch)});
+                    defer allocator.free(escaped);
+                    try out.appendSlice(allocator, escaped);
+                } else {
+                    try out.append(allocator, ch);
+                }
+            },
+        }
+    }
+}
+
+fn reconcileShimExecutables(
+    allocator: std.mem.Allocator,
+    shim_dir: []const u8,
+    cmd_names: []const []const u8,
+    force: bool,
+    dry_run: bool,
+    planned_removals: *std.ArrayListUnmanaged([]const u8),
+) ![]const []const u8 {
+    const RemovalCandidate = struct {
+        file_name: []const u8,
+        log_module_removed: bool,
+    };
+
+    var live = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = live.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        live.deinit();
+    }
+
+    var existing = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = existing.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        existing.deinit();
+    }
+
+    var out = std.ArrayListUnmanaged([]const u8){};
+    defer out.deinit(allocator);
+
+    var removals = std.ArrayListUnmanaged(RemovalCandidate){};
+    defer {
+        for (removals.items) |candidate| allocator.free(candidate.file_name);
+        removals.deinit(allocator);
+    }
+
+    for (cmd_names) |name| {
+        const key = try allocator.dupe(u8, name);
+        _ = std.ascii.lowerString(key, key);
+
+        if (live.contains(key)) {
+            allocator.free(key);
+            continue;
+        }
+
+        try live.put(key, {});
+    }
+
+    var shim = std.fs.openDirAbsolute(shim_dir, .{ .iterate = true }) catch {
+        for (cmd_names) |name| {
+            try out.append(allocator, try allocator.dupe(u8, name));
+        }
+
+        freeNameList(allocator, cmd_names);
+        return out.toOwnedSlice(allocator);
+    };
+    defer shim.close();
+
+    var iter = shim.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.ascii.endsWithIgnoreCase(entry.name, ".exe")) continue;
+        if (std.ascii.eqlIgnoreCase(entry.name, "node.exe")) continue;
+        if (entry.name.len <= 4) continue;
+
+        const base_name = entry.name[0 .. entry.name.len - 4];
+        const key = try allocator.dupe(u8, base_name);
+        defer allocator.free(key);
+        _ = std.ascii.lowerString(key, key);
+
+        if (live.contains(key)) {
+            if (force) {
+                try removals.append(allocator, .{
+                    .file_name = try allocator.dupe(u8, entry.name),
+                    .log_module_removed = false,
+                });
+                continue;
+            }
+
+            try existing.put(try allocator.dupe(u8, key), {});
+            continue;
+        }
+
+        if (!live.contains(key)) {
+            try removals.append(allocator, .{
+                .file_name = try allocator.dupe(u8, entry.name),
+                .log_module_removed = shouldLogModuleEvent(base_name),
+            });
+        }
+    }
+
+    for (removals.items) |candidate| {
+        try planned_removals.append(allocator, try allocator.dupe(u8, candidate.file_name));
+
+        if (dry_run) continue;
+
+        const remove_path = try std.fs.path.join(allocator, &.{ shim_dir, candidate.file_name });
+        defer allocator.free(remove_path);
+
+        deleteFileWithRetries(remove_path) catch {
+            continue;
+        };
+
+        if (candidate.log_module_removed and candidate.file_name.len > 4) {
+            const base_name = candidate.file_name[0 .. candidate.file_name.len - 4];
+            const removed_msg = std.fmt.allocPrint(allocator, "Global module '{s}' was removed in shim mode.", .{base_name}) catch null;
+            if (removed_msg) |msg| {
+                defer allocator.free(msg);
+                eventlog.write(allocator, msg);
+            }
+        }
+    }
+
+    for (cmd_names) |name| {
+        const key = try allocator.dupe(u8, name);
+        defer allocator.free(key);
+        _ = std.ascii.lowerString(key, key);
+        const is_existing = existing.contains(key);
+
+        if (!is_existing) {
+            try out.append(allocator, try allocator.dupe(u8, name));
+        }
+    }
+
+    freeNameList(allocator, cmd_names);
+    return out.toOwnedSlice(allocator);
+}
+
+fn freeNameList(allocator: std.mem.Allocator, names: []const []const u8) void {
+    for (names) |name| allocator.free(name);
+    allocator.free(names);
+}
+
+fn collectCmdNamesFromInstallRoot(allocator: std.mem.Allocator, install_root: []const u8) ![]const []const u8 {
+    var dedupe = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = dedupe.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        dedupe.deinit();
+    }
+
+    var names = std.ArrayListUnmanaged([]const u8){};
+    defer names.deinit(allocator);
+
+    var root_dir = try std.fs.openDirAbsolute(install_root, .{ .iterate = true });
+    defer root_dir.close();
+
+    var root_iter = root_dir.iterate();
+    while (try root_iter.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        if (!isVersionDirName(entry.name)) continue;
+
+        var version_dir = root_dir.openDir(entry.name, .{ .iterate = true }) catch continue;
+        defer version_dir.close();
+
+        var version_iter = version_dir.iterate();
+        while (try version_iter.next()) |file_entry| {
+            if (file_entry.kind != .file) continue;
+            if (!std.ascii.endsWithIgnoreCase(file_entry.name, ".cmd")) continue;
+            if (file_entry.name.len <= 4) continue;
+
+            const base_name = file_entry.name[0 .. file_entry.name.len - 4];
+            const key = try allocator.dupe(u8, base_name);
+            _ = std.ascii.lowerString(key, key);
+
+            if (dedupe.contains(key)) {
+                allocator.free(key);
+                continue;
+            }
+
+            try dedupe.put(key, {});
+            try names.append(allocator, try allocator.dupe(u8, base_name));
+        }
+    }
+
+    std.mem.sort([]const u8, names.items, {}, lessThanIgnoreCase);
+    return names.toOwnedSlice(allocator);
+}
+
+fn collectCmdNamesFromVersionDir(allocator: std.mem.Allocator, version_dir_path: []const u8) ![]const []const u8 {
+    var dedupe = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = dedupe.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        dedupe.deinit();
+    }
+
+    var names = std.ArrayListUnmanaged([]const u8){};
+    defer names.deinit(allocator);
+
+    const is_abs = std.fs.path.isAbsolute(version_dir_path);
+    var version_dir = if (is_abs)
+        try std.fs.openDirAbsolute(version_dir_path, .{ .iterate = true })
+    else
+        try std.fs.cwd().openDir(version_dir_path, .{ .iterate = true });
+    defer version_dir.close();
+
+    var version_iter = version_dir.iterate();
+    while (try version_iter.next()) |file_entry| {
+        if (file_entry.kind != .file) continue;
+        if (!std.ascii.endsWithIgnoreCase(file_entry.name, ".cmd")) continue;
+        if (file_entry.name.len <= 4) continue;
+
+        const base_name = file_entry.name[0 .. file_entry.name.len - 4];
+        const key = try allocator.dupe(u8, base_name);
+        _ = std.ascii.lowerString(key, key);
+
+        if (dedupe.contains(key)) {
+            allocator.free(key);
+            continue;
+        }
+
+        try dedupe.put(key, {});
+        try names.append(allocator, try allocator.dupe(u8, base_name));
+    }
+
+    std.mem.sort([]const u8, names.items, {}, lessThanIgnoreCase);
+    return names.toOwnedSlice(allocator);
+}
+
+fn lessThanIgnoreCase(_: void, a: []const u8, b: []const u8) bool {
+    return std.ascii.lessThanIgnoreCase(a, b);
+}
+
+fn collectExistingShimNames(allocator: std.mem.Allocator, shim_dir: []const u8, out: *std.StringHashMap(void)) !void {
+    var shim = std.fs.openDirAbsolute(shim_dir, .{ .iterate = true }) catch return;
+    defer shim.close();
+
+    var iter = shim.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.ascii.endsWithIgnoreCase(entry.name, ".exe")) continue;
+        if (std.ascii.eqlIgnoreCase(entry.name, "node.exe")) continue;
+        if (entry.name.len <= 4) continue;
+
+        const base_name = entry.name[0 .. entry.name.len - 4];
+        const key = try allocator.dupe(u8, base_name);
+        _ = std.ascii.lowerString(key, key);
+
+        if (out.contains(key)) {
+            allocator.free(key);
+            continue;
+        }
+
+        try out.put(key, {});
+    }
+}
+
+fn shouldLogModuleEvent(name: []const u8) bool {
+    return !std.ascii.eqlIgnoreCase(name, "npm") and !std.ascii.eqlIgnoreCase(name, "npx");
+}
+
+fn isVersionDirName(name: []const u8) bool {
+    if (name.len < 2) return false;
+    if (name[0] != 'v' and name[0] != 'V') return false;
+
+    var i: usize = 1;
+    var segment_count: usize = 0;
+
+    while (i < name.len) {
+        const segment_start = i;
+        while (i < name.len and std.ascii.isDigit(name[i])) : (i += 1) {}
+        if (i == segment_start) return false;
+
+        segment_count += 1;
+        if (i == name.len) break;
+        if (name[i] != '.') return false;
+        i += 1;
+    }
+
+    return segment_count == 3;
+}

@@ -1,0 +1,16 @@
+pub const preference_registry_root = "Software\\Author Software\\Preferences\\nvm";
+pub const reg_value_version = "ActiveVersion";
+pub const reg_value_root = "InstallRoot";
+pub const reg_value_auto_use = "AutoUse";
+pub const reg_value_auto_install = "AutoInstall";
+pub const reg_value_auto_install_prompt = "AutoInstallPrompt";
+pub const reg_value_auto_detect = "AutoDetect";
+pub const reg_value_aliases = "Aliases";
+pub const reg_value_log_executions = "LogExecutions";
+pub const reg_nvm_cmd_path = "Software\\Classes\\nvm\\shell\\open\\command";
+pub const default_install_root = "%LOCALAPPDATA%\\Author Software\\nvm\\installs";
+pub const default_auto_detect = ".nvmrc,.node-version,package.json,package-lock.json";
+pub const reg_type_sz: u32 = 1;
+pub const reg_type_expand_sz: u32 = 2;
+pub const reg_type_dword: u32 = 4;
+pub const reg_type_multi_sz: u32 = 7;
