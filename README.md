@@ -4,7 +4,7 @@ This repo contains the shims used in NVM for Windows' "shim" operating mode. For
 
 This repo contains several required executables for full Node.js verison management.
 
-- `nvm.exe` ([nvm](https://github.com/nvm-windows/nvm)) is responsible for downloads, (un)installs, caching, and configuration.
+- `nvm.exe` ([cli](https://github.com/nvm-windows/cli)) is responsible for downloads, (un)installs, caching, and configuration.
 - `node.exe` (this repo) is the shim used to run Node.js.
 - `proxy.exe` (this repo) is the global module shim (npm, npx, custom).
 - `reshim.exe` (this repo) is a helper utility for syncing shims.
