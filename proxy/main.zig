@@ -1,6 +1,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const nodeversion = @import("nodeversion");
+const resolver = @import("resolver");
 const eventlog = @import("eventlog");
 const errors = @import("errors");
 
@@ -29,7 +30,7 @@ pub fn main() !void {
         return;
     }
 
-    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "--version")) {
+    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "--nvm-shim-version")) {
         std.debug.print("{s}\n", .{shim_version});
         return;
     }
@@ -57,6 +58,10 @@ pub fn main() !void {
         );
     }
 
+    if (!try enforcePackageManagerConstraint(allocator, cfg, resolved.version_source, command_name, resolved.node_bin.?)) {
+        std.process.exit(1);
+    }
+
     const needs_reshim = detectReshimNeeded(command_name, parsed_args.forwarded);
 
     const node_install_dir = std.fs.path.dirname(resolved.node_bin.?) orelse ".";
@@ -79,6 +84,98 @@ pub fn main() !void {
     }
 
     std.process.exit(process_exit_code);
+}
+
+fn enforcePackageManagerConstraint(
+    allocator: std.mem.Allocator,
+    cfg: nodeversion.ShimConfig,
+    version_source: []const u8,
+    command_name: []const u8,
+    node_bin: []const u8,
+) !bool {
+    if (!nodeversion.shouldCheckPackageManagerMismatch(version_source, cfg.package_manager_mismatch_action)) {
+        return true;
+    }
+
+    if (!isConstrainedPackageManagerHardlink(command_name)) {
+        return true;
+    }
+
+    const constraint = try nodeversion.detectPackageManagerConstraintFromFile(allocator, version_source);
+    if (constraint == null) {
+        return true;
+    }
+    defer constraint.?.deinit(allocator);
+
+    if (!std.ascii.eqlIgnoreCase(constraint.?.name, command_name)) {
+        const name_mismatch_message = try std.fmt.allocPrint(
+            allocator,
+            "invoked package manager {s} does not match required {s} in {s} (devEngines.packageManager)",
+            .{ command_name, constraint.?.name, version_source },
+        );
+        defer allocator.free(name_mismatch_message);
+
+        return handlePackageManagerMismatchAction(allocator, cfg.package_manager_mismatch_action, name_mismatch_message);
+    }
+
+    const current_version = try nodeversion.resolvePackageManagerVersion(allocator, node_bin, command_name);
+    if (current_version == null) {
+        return true;
+    }
+    defer allocator.free(current_version.?);
+
+    const is_match = resolver.versionSatisfiesSpec(allocator, constraint.?.version_spec, current_version.?) catch true;
+    if (is_match) {
+        return true;
+    }
+
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "{s} version {s} does not satisfy required {s} in {s} (devEngines.packageManager)",
+        .{ constraint.?.name, current_version.?, constraint.?.version_spec, version_source },
+    );
+    defer allocator.free(message);
+
+    return handlePackageManagerMismatchAction(allocator, cfg.package_manager_mismatch_action, message);
+}
+
+fn handlePackageManagerMismatchAction(
+    allocator: std.mem.Allocator,
+    action: nodeversion.PackageManagerMismatchAction,
+    message: []const u8,
+) !bool {
+    switch (action) {
+        .warn => {
+            var stderr_file = std.fs.File.stderr();
+            var stderr_buf: [512]u8 = undefined;
+            var stderr_writer = stderr_file.writer(&stderr_buf);
+            try stderr_writer.interface.print("warning: {s}\n", .{message});
+            try stderr_writer.interface.flush();
+            const log_msg = try std.fmt.allocPrint(allocator, "warning: {s}", .{message});
+            defer allocator.free(log_msg);
+            eventlog.write(allocator, log_msg);
+            return true;
+        },
+        .@"error" => {
+            var stderr_file = std.fs.File.stderr();
+            var stderr_buf: [512]u8 = undefined;
+            var stderr_writer = stderr_file.writer(&stderr_buf);
+            try stderr_writer.interface.print("error: {s}\n", .{message});
+            try stderr_writer.interface.flush();
+            const log_msg = try std.fmt.allocPrint(allocator, "error: {s}", .{message});
+            defer allocator.free(log_msg);
+            eventlog.write(allocator, log_msg);
+            return false;
+        },
+        .ignore => return true,
+    }
+}
+
+fn isConstrainedPackageManagerHardlink(command_name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(command_name, "npm") or
+        std.ascii.eqlIgnoreCase(command_name, "npx") or
+        std.ascii.eqlIgnoreCase(command_name, "pnpm") or
+        std.ascii.eqlIgnoreCase(command_name, "yarn");
 }
 
 fn resolveDelegatedCommandPath(allocator: std.mem.Allocator, node_install_dir: []const u8, command_name: []const u8) ![]u8 {

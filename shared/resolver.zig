@@ -41,6 +41,14 @@ pub fn normalizeVersionSpec(allocator: std.mem.Allocator, raw: []const u8) ![]u8
     return allocator.dupe(u8, trimmed);
 }
 
+pub fn versionSatisfiesSpec(allocator: std.mem.Allocator, spec: []const u8, version: []const u8) !bool {
+    const parsed = try parseFullSemver(version);
+    const req_set = try parseRequirementSet(allocator, spec);
+    defer allocator.free(req_set.alternatives);
+
+    return matchesAnyRequirement(parsed, req_set.alternatives);
+}
+
 pub fn resolveInstalledVersionSpec(allocator: std.mem.Allocator, root: []const u8, spec: []const u8, available_versions_text: ?[]const u8) !?[]u8 {
     const normalized = try normalizeVersionSpec(allocator, spec);
     defer allocator.free(normalized);

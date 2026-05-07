@@ -7,6 +7,7 @@ pub const reg_value_auto_install_prompt = "AutoInstallPrompt";
 pub const reg_value_auto_detect = "AutoDetect";
 pub const reg_value_aliases = "Aliases";
 pub const reg_value_log_executions = "LogExecutions";
+pub const reg_value_package_manager_mismatch_action = "PackageManagerMismatchAction";
 pub const reg_nvm_cmd_path = "Software\\Classes\\nvm\\shell\\open\\command";
 pub const default_install_root = "%LOCALAPPDATA%\\Author Software\\nvm\\installs";
 pub const default_auto_detect = ".nvmrc,.node-version,package.json,package-lock.json";

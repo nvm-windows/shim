@@ -29,7 +29,7 @@ pub fn main() !void {
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
-        if (std.mem.eql(u8, arg, "--version")) {
+        if (std.mem.eql(u8, arg, "--nvm-shim-version")) {
             std.debug.print("{s}\n", .{shim_version});
             return;
         }

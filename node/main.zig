@@ -129,12 +129,6 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
             continue;
         }
 
-        if (std.mem.eql(u8, arg, "--version")) {
-            show_shim_version = true;
-            i += 1;
-            continue;
-        }
-
         const eq_prefix = "--nvm-use=";
         if (std.mem.startsWith(u8, arg, eq_prefix)) {
             const raw = std.mem.trim(u8, arg[eq_prefix.len..], " \t\r\n");

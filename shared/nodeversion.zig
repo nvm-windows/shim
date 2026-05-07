@@ -12,9 +12,16 @@ const reg_value_auto_install_prompt = config.reg_value_auto_install_prompt;
 const reg_value_auto_detect = config.reg_value_auto_detect;
 const reg_value_aliases = config.reg_value_aliases;
 const reg_value_log_executions = config.reg_value_log_executions;
+const reg_value_package_manager_mismatch_action = config.reg_value_package_manager_mismatch_action;
 const reg_nvm_cmd_path = config.reg_nvm_cmd_path;
 const default_root = config.default_install_root;
 const default_auto_detect = config.default_auto_detect;
+
+pub const PackageManagerMismatchAction = enum {
+    ignore,
+    warn,
+    @"error",
+};
 
 pub const ShimConfig = struct {
     root: []u8,
@@ -25,6 +32,17 @@ pub const ShimConfig = struct {
     auto_detect: []const []const u8,
     aliases: []const []const u8,
     log_executions: bool,
+    package_manager_mismatch_action: PackageManagerMismatchAction,
+};
+
+pub const PackageManagerConstraint = struct {
+    name: []u8,
+    version_spec: []u8,
+
+    pub fn deinit(self: PackageManagerConstraint, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.version_spec);
+    }
 };
 
 pub const DetectedVersion = struct {
@@ -71,6 +89,11 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
         try allocator.alloc([]const u8, 0);
     const log_executions = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_log_executions)) orelse 0;
 
+    const raw_package_manager_mismatch_action = registry.queryStringWithFallback(allocator, config_hives, reg_path, reg_value_package_manager_mismatch_action) catch
+        try allocator.dupe(u8, "error");
+    defer allocator.free(raw_package_manager_mismatch_action);
+    const package_manager_mismatch_action = parsePackageManagerMismatchAction(raw_package_manager_mismatch_action);
+
     return .{
         .root = root,
         .active_version = version,
@@ -80,6 +103,7 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
         .auto_detect = auto_detect,
         .aliases = aliases,
         .log_executions = log_executions != 0,
+        .package_manager_mismatch_action = package_manager_mismatch_action,
     };
 }
 
@@ -249,6 +273,80 @@ pub fn autoInstallVersion(allocator: std.mem.Allocator, version: []const u8) !vo
     try runNvmCommand(allocator, &.{ "install", version });
 }
 
+pub fn shouldCheckPackageManagerMismatch(source: []const u8, action: PackageManagerMismatchAction) bool {
+    if (action == .ignore) return false;
+    return std.ascii.eqlIgnoreCase(source, "package.json") or std.ascii.eqlIgnoreCase(source, "package-lock.json");
+}
+
+pub fn detectPackageManagerConstraintFromFile(allocator: std.mem.Allocator, file_name: []const u8) !?PackageManagerConstraint {
+    if (!(std.ascii.eqlIgnoreCase(file_name, "package.json") or std.ascii.eqlIgnoreCase(file_name, "package-lock.json"))) {
+        return null;
+    }
+
+    const raw = std.fs.cwd().readFileAlloc(allocator, file_name, 1024 * 1024) catch return null;
+    defer allocator.free(raw);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return null;
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return null,
+    };
+
+    if (obj.get("devEngines")) |dev_engines_val| {
+        if (dev_engines_val == .object) {
+            if (dev_engines_val.object.get("packageManager")) |pm_val| {
+                if (pm_val == .object) {
+                    const name_val = pm_val.object.get("name") orelse return null;
+                    const version_val = pm_val.object.get("version") orelse return null;
+
+                    if (name_val != .string or version_val != .string) {
+                        return null;
+                    }
+
+                    const required_spec = std.mem.trim(u8, version_val.string, " \t\r\n");
+                    if (required_spec.len == 0) return null;
+
+                    return .{
+                        .name = try allocator.dupe(u8, name_val.string),
+                        .version_spec = try allocator.dupe(u8, required_spec),
+                    };
+                }
+            }
+        }
+    }
+
+    return null;
+}
+
+pub fn resolvePackageManagerVersion(allocator: std.mem.Allocator, node_bin: []const u8, command_name: []const u8) !?[]u8 {
+    const node_install_dir = std.fs.path.dirname(node_bin) orelse return null;
+
+    const package_name = if (std.ascii.eqlIgnoreCase(command_name, "npx")) "npm" else command_name;
+    const package_json = try std.fs.path.join(allocator, &.{ node_install_dir, "node_modules", package_name, "package.json" });
+    defer allocator.free(package_json);
+
+    const raw = std.fs.cwd().readFileAlloc(allocator, package_json, 1024 * 1024) catch return null;
+    defer allocator.free(raw);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return null;
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return null,
+    };
+
+    const version_val = obj.get("version") orelse return null;
+    if (version_val != .string) return null;
+
+    const version = std.mem.trim(u8, version_val.string, " \t\r\n");
+    if (version.len == 0) return null;
+
+    return allocator.dupe(u8, version);
+}
+
 fn extractPackageNodeEngine(allocator: std.mem.Allocator, raw: []const u8) !?[]u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return null;
     defer parsed.deinit();
@@ -285,6 +383,13 @@ fn extractPackageNodeEngine(allocator: std.mem.Allocator, raw: []const u8) !?[]u
     }
 
     return null;
+}
+
+fn parsePackageManagerMismatchAction(raw: []const u8) PackageManagerMismatchAction {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(value, "ignore")) return .ignore;
+    if (std.ascii.eqlIgnoreCase(value, "warn")) return .warn;
+    return .@"error";
 }
 
 fn executablePath(allocator: std.mem.Allocator, root: []const u8, version: []const u8) ![]u8 {
