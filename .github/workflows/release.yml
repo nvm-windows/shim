@@ -139,6 +139,7 @@ jobs:
       VERSION: ${{ needs.detect-version.outputs.version }}
       TAG: ${{ needs.detect-version.outputs.tag }}
       ZIG_VERSION: 0.15.2
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout Code
@@ -148,6 +149,8 @@ jobs:
 
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
           version: ${{ env.ZIG_VERSION }}
 
