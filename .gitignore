@@ -6,5 +6,6 @@
 *.pdb
 *.log
 zig-out
+**/zig-out
 *.ps1
 !build.ps1

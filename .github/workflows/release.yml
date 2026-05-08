@@ -1,0 +1,243 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - build.ps1
+      - build.zig
+      - node/**
+      - proxy/**
+      - reshim/**
+      - shared/**
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  detect-version:
+    name: Identify Release Version
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      should_release: ${{ steps.detect.outputs.should_release }}
+      version: ${{ steps.detect.outputs.version }}
+      tag: ${{ steps.detect.outputs.tag }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect Shim Version
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(python3 -c 'import json; d=json.load(open("node/winres/winres.json", "r", encoding="utf-8")); print((((d.get("RT_VERSION") or {}).get("#1") or {}).get("0000") or {}).get("info", {}).get("0409", {}).get("ProductVersion", ""))')"
+          if [[ -z "$version" ]]; then
+            echo "::error::Unable to read node/winres/winres.json ProductVersion"
+            exit 1
+          fi
+
+          tag="$version"
+          if [[ "$tag" == v* ]]; then
+            tag="$tag"
+          elif [[ "$tag" == V* ]]; then
+            tag="v${tag:1}"
+          else
+            tag="v$tag"
+          fi
+
+          legacy_tag="$version"
+          should_release="true"
+
+          if gh api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --silent >/dev/null 2>&1; then
+            should_release="false"
+          fi
+
+          if [[ "$legacy_tag" != "$tag" ]]; then
+            if gh api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${legacy_tag}" --silent >/dev/null 2>&1; then
+              should_release="false"
+            fi
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
+
+          if [[ "$should_release" == "false" ]]; then
+            echo "No release needed. Shim version '$version' already has a matching tag."
+          else
+            echo "Release needed for shim version '$version'."
+          fi
+
+  create-release:
+    name: Create Tag + Release
+    needs: detect-version
+    if: ${{ needs.detect-version.outputs.should_release == 'true' }}
+    runs-on: ubuntu-slim
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.detect-version.outputs.version }}
+      TAG: ${{ needs.detect-version.outputs.tag }}
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - name: Publish Metadata
+        id: meta
+        shell: bash
+        run: |
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Create Tag
+        shell: bash
+        run: |
+          gh api -X POST "/repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${TAG}" -f sha="${GITHUB_SHA}"
+
+      - name: Create Release
+        shell: bash
+        run: |
+          gh release create "${TAG}" --repo "${GH_REPO}" --title "${TAG}" --notes "Automated release for shim version ${VERSION}"
+
+  build-assets:
+    name: Build And Upload (${{ matrix.arch }})
+    needs:
+      - detect-version
+      - create-release
+    if: ${{ needs.detect-version.outputs.should_release == 'true' }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VERSION: ${{ needs.detect-version.outputs.version }}
+      TAG: ${{ needs.detect-version.outputs.tag }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+
+      - name: Install go-winres
+        shell: pwsh
+        run: |
+          go install github.com/tc-hib/go-winres@latest
+          echo "$(go env GOPATH)\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Ensure Zig Is Available
+        shell: pwsh
+        run: |
+          if (Get-Command zig -ErrorAction SilentlyContinue) {
+            zig version
+            exit 0
+          }
+
+          choco install zig -y --no-progress
+          zig version
+
+      - name: Build Shims + Package Asset
+        shell: pwsh
+        run: |
+          $assetDir = "artifacts\${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force -Path $assetDir | Out-Null
+
+          .\build.ps1 -Architecture "${{ matrix.arch }}" -Version "$env:VERSION" -OutputDir $assetDir
+
+          $nodeExe = Join-Path $assetDir ".shim\node.exe"
+          $proxyExe = Join-Path $assetDir "utils\proxy.exe"
+          $reshimExe = Join-Path $assetDir "utils\reshim.exe"
+
+          foreach ($required in @($nodeExe, $proxyExe, $reshimExe)) {
+            if (!(Test-Path $required)) {
+              throw "Expected build output missing: $required"
+            }
+          }
+
+          $nodeSha = (Get-FileHash $nodeExe -Algorithm SHA256).Hash.ToLower()
+          $proxySha = (Get-FileHash $proxyExe -Algorithm SHA256).Hash.ToLower()
+          $reshimSha = (Get-FileHash $reshimExe -Algorithm SHA256).Hash.ToLower()
+
+          $shaLines = @(
+            "$nodeSha *.shim/node.exe",
+            "$proxySha *utils/proxy.exe",
+            "$reshimSha *utils/reshim.exe"
+          )
+          $shaLines | Out-File -FilePath (Join-Path $assetDir "SHASUMS.txt") -Encoding ascii
+
+          Compress-Archive -Path (Join-Path $assetDir ".shim"), (Join-Path $assetDir "utils"), (Join-Path $assetDir "SHASUMS.txt") -DestinationPath "artifacts\shim-${{ matrix.arch }}.zip" -Force
+
+      - name: Upload Release Assets
+        shell: pwsh
+        run: |
+          gh release upload "$env:TAG" "artifacts\shim-${{ matrix.arch }}.zip" --clobber
+
+  rollback:
+    name: Rollback Failed Release
+    needs:
+      - detect-version
+      - create-release
+      - build-assets
+    if: ${{ failure() && needs.detect-version.outputs.should_release == 'true' }}
+    runs-on: ubuntu-slim
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.detect-version.outputs.tag }}
+
+    steps:
+      - name: Remove Release Then Tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_id=""
+          if release_id=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.id' 2>/dev/null); then
+            if [[ -n "${release_id}" && "${release_id}" != "null" ]]; then
+              gh api -X DELETE "/repos/${GITHUB_REPOSITORY}/releases/${release_id}"
+            fi
+          fi
+
+          gh api -X DELETE "/repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" || true
+
+  no-op:
+    name: No Release Needed
+    needs: detect-version
+    if: ${{ needs.detect-version.outputs.should_release != 'true' }}
+    runs-on: ubuntu-slim
+    steps:
+      - name: Skip
+        run: |
+          echo "Shim version '${{ needs.detect-version.outputs.version }}' already has a matching tag."
