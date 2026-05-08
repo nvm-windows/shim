@@ -7,6 +7,31 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Invoke-External {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$FilePath,
+    [Parameter(Mandatory = $true)]
+    [string[]]$Arguments
+  )
+
+  $psi = [System.Diagnostics.ProcessStartInfo]::new()
+  $psi.FileName = $FilePath
+  $psi.UseShellExecute = $false
+  $psi.RedirectStandardOutput = $false
+  $psi.RedirectStandardError = $false
+
+  foreach ($arg in $Arguments) {
+    [void]$psi.ArgumentList.Add([string]$arg)
+  }
+
+  $proc = [System.Diagnostics.Process]::Start($psi)
+  $proc.WaitForExit()
+  if ($proc.ExitCode -ne 0) {
+    throw "Command failed with exit code $($proc.ExitCode): $FilePath $($Arguments -join ' ')"
+  }
+}
+
 function Resolve-MtExe {
   $cmd = Get-Command mt.exe -ErrorAction SilentlyContinue
   if ($cmd) {
@@ -87,17 +112,17 @@ if ($versionNode) {
 }
 
 if ($fixed['file_version']) {
-  & $rcEdit $resolvedExePath --set-file-version $fixed['file_version']
+  Invoke-External -FilePath $rcEdit -Arguments @($resolvedExePath, '--set-file-version', "$($fixed['file_version'])")
 }
 
 if ($fixed['product_version']) {
-  & $rcEdit $resolvedExePath --set-product-version $fixed['product_version']
+  Invoke-External -FilePath $rcEdit -Arguments @($resolvedExePath, '--set-product-version', "$($fixed['product_version'])")
 }
 
 foreach ($key in @('Comments', 'CompanyName', 'FileDescription', 'FileVersion', 'InternalName', 'LegalCopyright', 'LegalTrademarks', 'OriginalFilename', 'PrivateBuild', 'ProductName', 'ProductVersion', 'SpecialBuild')) {
   $val = $versionInfo[$key]
   if ($null -ne $val -and "$val" -ne "") {
-    & $rcEdit $resolvedExePath --set-version-string $key "$val"
+    Invoke-External -FilePath $rcEdit -Arguments @($resolvedExePath, '--set-version-string', $key, "$val")
   }
 }
 
@@ -116,7 +141,7 @@ if ($iconRel) {
   if (!(Test-Path $iconPath)) {
     throw "Icon file not found at $iconPath"
   }
-  & $rcEdit $resolvedExePath --set-icon $iconPath
+  Invoke-External -FilePath $rcEdit -Arguments @($resolvedExePath, '--set-icon', $iconPath)
 }
 
 $manifestNode = $null
@@ -164,7 +189,7 @@ if ($manifestNode) {
     $tmpManifest = Join-Path $env:TEMP ("winres-manifest-" + [System.Guid]::NewGuid().ToString("N") + ".xml")
     $manifestXml | Out-File -LiteralPath $tmpManifest -Encoding utf8
     try {
-      & $mtExe -manifest $tmpManifest "-outputresource:$resolvedExePath;#1"
+      Invoke-External -FilePath $mtExe -Arguments @('-manifest', $tmpManifest, "-outputresource:$resolvedExePath;#1")
     } finally {
       Remove-Item -LiteralPath $tmpManifest -Force -ErrorAction SilentlyContinue
     }
