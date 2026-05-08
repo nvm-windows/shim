@@ -66,7 +66,7 @@ function Ensure-RcEdit {
   New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
 
   $downloadUrl = "https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe"
-  Invoke-WebRequest -Uri $downloadUrl -OutFile $rcEditPath
+  Invoke-WebRequest -Uri $downloadUrl -OutFile $rcEditPath | Out-Null
   return $rcEditPath
 }
 
