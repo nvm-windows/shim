@@ -151,6 +151,19 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
+      - name: Set up rcedit
+        shell: pwsh
+        run: |
+          $rcEditDir = Join-Path $env:GITHUB_WORKSPACE "scripts\.tools"
+          $rcEditPath = Join-Path $rcEditDir "rcedit-x64.exe"
+          New-Item -ItemType Directory -Force -Path $rcEditDir | Out-Null
+
+          if (!(Test-Path -LiteralPath $rcEditPath)) {
+            Invoke-WebRequest -Uri "https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe" -OutFile $rcEditPath
+          }
+
+          "RCEDIT_PATH=$rcEditPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Build Shims + Package Asset
         shell: pwsh
         run: |

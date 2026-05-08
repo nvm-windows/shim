@@ -7,87 +7,42 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-function Normalize-PathString {
+function Resolve-RcEditPath {
   param(
-    [Parameter(Mandatory = $true)]
-    [object]$Value
+    [string]$ProvidedPath = $env:RCEDIT_PATH
   )
 
-  if ($Value -is [System.Array]) {
-    return ([string]::Concat(@($Value | ForEach-Object { [string]$_ }))).Trim()
+  if (-not [string]::IsNullOrWhiteSpace($ProvidedPath)) {
+    $resolvedProvided = [System.IO.Path]::GetFullPath($ProvidedPath)
+    if (Test-Path -LiteralPath $resolvedProvided) {
+      return $resolvedProvided
+    }
+    throw "RCEDIT_PATH is set but file was not found at: $resolvedProvided"
   }
 
-  return ([string]$Value).Trim()
-}
-
-function Resolve-ExistingExecutablePath {
-  param(
-    [Parameter(Mandatory = $true)]
-    [object]$Value
-  )
-
-  $candidates = @()
-
-  if ($Value -is [System.Array]) {
-    $allParts = New-Object System.Collections.Generic.List[string]
-
-    foreach ($item in $Value) {
-      $part = [string]$item
-      $candidates += $part
-      [void]$allParts.Add($part)
-    }
-
-    if ($allParts.Count -gt 0) {
-      $joined = [string]::Concat($allParts)
-      if (-not [string]::IsNullOrWhiteSpace($joined)) {
-        $candidates = @($joined) + $candidates
-      }
-    }
-  } else {
-    $candidates += [string]$Value
+  $localPath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".tools\rcedit-x64.exe"))
+  if (Test-Path -LiteralPath $localPath) {
+    return $localPath
   }
 
-  foreach ($candidate in $candidates) {
-    if ([string]::IsNullOrWhiteSpace($candidate)) {
-      continue
-    }
-
-    $trimmed = $candidate.Trim()
-
-    if (Test-Path -LiteralPath $trimmed) {
-      return (Resolve-Path -LiteralPath $trimmed).Path
-    }
-
-    $match = [regex]::Match($trimmed, '([A-Za-z]:\\.*?\.exe)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-    if ($match.Success) {
-      $possiblePath = $match.Groups[1].Value
-      if (Test-Path -LiteralPath $possiblePath) {
-        return (Resolve-Path -LiteralPath $possiblePath).Path
-      }
-    }
-  }
-
-  return $null
+  throw "rcedit not found. Set RCEDIT_PATH or place rcedit at: $localPath"
 }
 
 function Invoke-External {
   param(
     [Parameter(Mandatory = $true)]
-    [object]$FilePath,
+    [string]$FilePath,
     [Parameter(Mandatory = $true)]
     [string[]]$Arguments
   )
 
-  $resolvedFilePath = Resolve-ExistingExecutablePath -Value $FilePath
-
-  if ([string]::IsNullOrWhiteSpace($resolvedFilePath) -or !(Test-Path -LiteralPath $resolvedFilePath)) {
-    $valueType = if ($null -eq $FilePath) { '<null>' } else { $FilePath.GetType().FullName }
-    throw "Executable not found. Type=$valueType Raw='$FilePath'"
+  if ([string]::IsNullOrWhiteSpace($FilePath) -or !(Test-Path -LiteralPath $FilePath)) {
+    throw "Executable not found at: $FilePath"
   }
 
-  & $resolvedFilePath @Arguments
+  & $FilePath @Arguments
   if ($LASTEXITCODE -ne 0) {
-    throw "Command failed with exit code ${LASTEXITCODE}: $resolvedFilePath $($Arguments -join ' ')"
+    throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $($Arguments -join ' ')"
   }
 }
 
@@ -114,21 +69,6 @@ function Resolve-MtExe {
   return $null
 }
 
-function Ensure-RcEdit {
-  $toolsDir = Join-Path $PSScriptRoot ".tools"
-  $rcEditPath = Join-Path $toolsDir "rcedit-x64.exe"
-
-  if (Test-Path $rcEditPath) {
-    return [System.IO.Path]::GetFullPath($rcEditPath)
-  }
-
-  New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
-
-  $downloadUrl = "https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe"
-  Invoke-WebRequest -Uri $downloadUrl -OutFile $rcEditPath | Out-Null
-  return [System.IO.Path]::GetFullPath($rcEditPath)
-}
-
 $resolvedExePath = [System.IO.Path]::GetFullPath($ExePath)
 $resolvedWinresPath = [System.IO.Path]::GetFullPath($WinresPath)
 
@@ -143,7 +83,7 @@ if (!(Test-Path $resolvedWinresPath)) {
 $json = Get-Content -LiteralPath $resolvedWinresPath -Raw | ConvertFrom-Json -AsHashtable
 $baseDir = Split-Path -Parent $resolvedWinresPath
 
-$rcEdit = Normalize-PathString -Value (Ensure-RcEdit)
+$rcEdit = Resolve-RcEditPath
 
 $versionNode = $null
 if ($json.ContainsKey('RT_VERSION') -and $json['RT_VERSION'] -is [hashtable]) {
@@ -214,7 +154,7 @@ if ($json.ContainsKey('RT_MANIFEST') -and $json['RT_MANIFEST'] -is [hashtable]) 
   }
 }
 if ($manifestNode) {
-  $mtExe = Normalize-PathString -Value (Resolve-MtExe)
+  $mtExe = Resolve-MtExe
   if ($mtExe) {
     $identityName = $manifestNode['identity']['name']
     $identityVersion = $manifestNode['identity']['version']
