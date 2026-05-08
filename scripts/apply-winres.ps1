@@ -48,8 +48,11 @@ function Invoke-External {
 
 function Resolve-MtExe {
   $cmd = Get-Command mt.exe -ErrorAction SilentlyContinue
-  if ($cmd) {
-    return $cmd.Source
+  if ($cmd -and -not [string]::IsNullOrWhiteSpace($cmd.Source)) {
+    $source = [string]$cmd.Source
+    if (Test-Path -LiteralPath $source) {
+      return [System.IO.Path]::GetFullPath($source)
+    }
   }
 
   $kitsRoot = "C:\Program Files (x86)\Windows Kits\10\bin"
@@ -63,7 +66,7 @@ function Resolve-MtExe {
     Sort-Object -Descending
 
   if ($candidates.Count -gt 0) {
-    return $candidates[0]
+    return [System.IO.Path]::GetFullPath($candidates[0])
   }
 
   return $null
@@ -155,7 +158,7 @@ if ($json.ContainsKey('RT_MANIFEST') -and $json['RT_MANIFEST'] -is [hashtable]) 
 }
 if ($manifestNode) {
   $mtExe = Resolve-MtExe
-  if ($mtExe) {
+  if ($mtExe -and (Test-Path -LiteralPath $mtExe)) {
     $identityName = $manifestNode['identity']['name']
     $identityVersion = $manifestNode['identity']['version']
     $description = $manifestNode['description']
@@ -193,6 +196,6 @@ if ($manifestNode) {
       Remove-Item -LiteralPath $tmpManifest -Force -ErrorAction SilentlyContinue
     }
   } else {
-    Write-Warning "mt.exe was not found. Manifest update skipped for $resolvedExePath"
+    Write-Warning "Valid mt.exe was not found. Manifest update skipped for $resolvedExePath"
   }
 }

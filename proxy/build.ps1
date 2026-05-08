@@ -65,17 +65,22 @@ if ($RegistryOverride) {
 
 Push-Location $scriptRoot
 try {
+	$zigExe = (Get-Command zig -ErrorAction Stop).Source
+	if (!(Test-Path -LiteralPath $zigExe)) {
+		throw "zig executable not found at $zigExe"
+	}
+
 	# Uses build.zig module imports to load shared registry/config without file staging.
 	Push-Location $shimRoot
 	try {
-		zig @zigArgs
+		& $zigExe @zigArgs
 
 		if ($LASTEXITCODE -ne 0) {
 			if ($BuildProfile -ne "Debug") {
 				Write-Warning "zig build failed with profile '$BuildProfile'. Retrying with Debug profile to work around potential AV heuristic blocks."
 				$retryArgs = @($zigArgs | Where-Object { $_ -notlike "-Doptimize=*" })
 				$retryArgs += "-Doptimize=Debug"
-				zig @retryArgs
+				& $zigExe @retryArgs
 			}
 
 			if ($LASTEXITCODE -ne 0) {
