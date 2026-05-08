@@ -7,6 +7,19 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Normalize-PathString {
+  param(
+    [Parameter(Mandatory = $true)]
+    [object]$Value
+  )
+
+  if ($Value -is [System.Array]) {
+    return ([string]::Concat(@($Value | ForEach-Object { [string]$_ }))).Trim()
+  }
+
+  return ([string]$Value).Trim()
+}
+
 function Resolve-ExistingExecutablePath {
   param(
     [Parameter(Mandatory = $true)]
@@ -106,14 +119,14 @@ function Ensure-RcEdit {
   $rcEditPath = Join-Path $toolsDir "rcedit-x64.exe"
 
   if (Test-Path $rcEditPath) {
-    return (Resolve-Path -LiteralPath $rcEditPath).Path
+    return [System.IO.Path]::GetFullPath($rcEditPath)
   }
 
   New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
 
   $downloadUrl = "https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe"
   Invoke-WebRequest -Uri $downloadUrl -OutFile $rcEditPath | Out-Null
-  return (Resolve-Path -LiteralPath $rcEditPath).Path
+  return [System.IO.Path]::GetFullPath($rcEditPath)
 }
 
 $resolvedExePath = [System.IO.Path]::GetFullPath($ExePath)
@@ -130,7 +143,7 @@ if (!(Test-Path $resolvedWinresPath)) {
 $json = Get-Content -LiteralPath $resolvedWinresPath -Raw | ConvertFrom-Json -AsHashtable
 $baseDir = Split-Path -Parent $resolvedWinresPath
 
-$rcEdit = Ensure-RcEdit
+$rcEdit = Normalize-PathString -Value (Ensure-RcEdit)
 
 $versionNode = $null
 if ($json.ContainsKey('RT_VERSION') -and $json['RT_VERSION'] -is [hashtable]) {
@@ -201,7 +214,7 @@ if ($json.ContainsKey('RT_MANIFEST') -and $json['RT_MANIFEST'] -is [hashtable]) 
   }
 }
 if ($manifestNode) {
-  $mtExe = Resolve-MtExe
+  $mtExe = Normalize-PathString -Value (Resolve-MtExe)
   if ($mtExe) {
     $identityName = $manifestNode['identity']['name']
     $identityVersion = $manifestNode['identity']['version']
