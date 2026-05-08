@@ -23,7 +23,7 @@ env:
 
 jobs:
   detect-version:
-    name: Identify Release Version
+    name: Identify Shim Release Version
     runs-on: ubuntu-slim
     permissions:
       contents: read
