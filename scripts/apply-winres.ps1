@@ -16,8 +16,26 @@ function Resolve-ExistingExecutablePath {
   $candidates = @()
 
   if ($Value -is [System.Array]) {
+    $charParts = New-Object System.Collections.Generic.List[string]
+    $allSingleChars = $true
+
     foreach ($item in $Value) {
       $candidates += [string]$item
+
+      if ($item -is [char]) {
+        [void]$charParts.Add([string]$item)
+      } elseif ($item -is [string] -and $item.Length -eq 1) {
+        [void]$charParts.Add($item)
+      } else {
+        $allSingleChars = $false
+      }
+    }
+
+    if ($allSingleChars -and $charParts.Count -gt 0) {
+      $joined = [string]::Concat($charParts)
+      if (-not [string]::IsNullOrWhiteSpace($joined)) {
+        $candidates = @($joined) + $candidates
+      }
     }
   } else {
     $candidates += [string]$Value
@@ -28,8 +46,18 @@ function Resolve-ExistingExecutablePath {
       continue
     }
 
-    if (Test-Path -LiteralPath $candidate) {
-      return (Resolve-Path -LiteralPath $candidate).Path
+    $trimmed = $candidate.Trim()
+
+    if (Test-Path -LiteralPath $trimmed) {
+      return (Resolve-Path -LiteralPath $trimmed).Path
+    }
+
+    $match = [regex]::Match($trimmed, '([A-Za-z]:\\.*?\.exe)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($match.Success) {
+      $possiblePath = $match.Groups[1].Value
+      if (Test-Path -LiteralPath $possiblePath) {
+        return (Resolve-Path -LiteralPath $possiblePath).Path
+      }
     }
   }
 
