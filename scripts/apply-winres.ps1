@@ -7,21 +7,52 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Resolve-ExistingExecutablePath {
+  param(
+    [Parameter(Mandatory = $true)]
+    [object]$Value
+  )
+
+  $candidates = @()
+
+  if ($Value -is [System.Array]) {
+    foreach ($item in $Value) {
+      $candidates += [string]$item
+    }
+  } else {
+    $candidates += [string]$Value
+  }
+
+  foreach ($candidate in $candidates) {
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+      continue
+    }
+
+    if (Test-Path -LiteralPath $candidate) {
+      return (Resolve-Path -LiteralPath $candidate).Path
+    }
+  }
+
+  return [string]$Value
+}
+
 function Invoke-External {
   param(
     [Parameter(Mandatory = $true)]
-    [string]$FilePath,
+    [object]$FilePath,
     [Parameter(Mandatory = $true)]
     [string[]]$Arguments
   )
 
-  if (!(Test-Path -LiteralPath $FilePath)) {
-    throw "Executable not found: $FilePath"
+  $resolvedFilePath = Resolve-ExistingExecutablePath -Value $FilePath
+
+  if (!(Test-Path -LiteralPath $resolvedFilePath)) {
+    throw "Executable not found: $resolvedFilePath"
   }
 
-  & $FilePath @Arguments
+  & $resolvedFilePath @Arguments
   if ($LASTEXITCODE -ne 0) {
-    throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $($Arguments -join ' ')"
+    throw "Command failed with exit code ${LASTEXITCODE}: $resolvedFilePath $($Arguments -join ' ')"
   }
 }
 
@@ -53,14 +84,14 @@ function Ensure-RcEdit {
   $rcEditPath = Join-Path $toolsDir "rcedit-x64.exe"
 
   if (Test-Path $rcEditPath) {
-    return $rcEditPath
+    return (Resolve-Path -LiteralPath $rcEditPath).Path
   }
 
   New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
 
   $downloadUrl = "https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe"
   Invoke-WebRequest -Uri $downloadUrl -OutFile $rcEditPath | Out-Null
-  return $rcEditPath
+  return (Resolve-Path -LiteralPath $rcEditPath).Path
 }
 
 $resolvedExePath = [System.IO.Path]::GetFullPath($ExePath)
