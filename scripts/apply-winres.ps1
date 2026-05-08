@@ -16,23 +16,16 @@ function Resolve-ExistingExecutablePath {
   $candidates = @()
 
   if ($Value -is [System.Array]) {
-    $charParts = New-Object System.Collections.Generic.List[string]
-    $allSingleChars = $true
+    $allParts = New-Object System.Collections.Generic.List[string]
 
     foreach ($item in $Value) {
-      $candidates += [string]$item
-
-      if ($item -is [char]) {
-        [void]$charParts.Add([string]$item)
-      } elseif ($item -is [string] -and $item.Length -eq 1) {
-        [void]$charParts.Add($item)
-      } else {
-        $allSingleChars = $false
-      }
+      $part = [string]$item
+      $candidates += $part
+      [void]$allParts.Add($part)
     }
 
-    if ($allSingleChars -and $charParts.Count -gt 0) {
-      $joined = [string]::Concat($charParts)
+    if ($allParts.Count -gt 0) {
+      $joined = [string]::Concat($allParts)
       if (-not [string]::IsNullOrWhiteSpace($joined)) {
         $candidates = @($joined) + $candidates
       }
@@ -61,7 +54,7 @@ function Resolve-ExistingExecutablePath {
     }
   }
 
-  return [string]$Value
+  return $null
 }
 
 function Invoke-External {
@@ -74,8 +67,9 @@ function Invoke-External {
 
   $resolvedFilePath = Resolve-ExistingExecutablePath -Value $FilePath
 
-  if (!(Test-Path -LiteralPath $resolvedFilePath)) {
-    throw "Executable not found: $resolvedFilePath"
+  if ([string]::IsNullOrWhiteSpace($resolvedFilePath) -or !(Test-Path -LiteralPath $resolvedFilePath)) {
+    $valueType = if ($null -eq $FilePath) { '<null>' } else { $FilePath.GetType().FullName }
+    throw "Executable not found. Type=$valueType Raw='$FilePath'"
   }
 
   & $resolvedFilePath @Arguments
