@@ -81,10 +81,18 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
     const auto_install = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_auto_install)) orelse 1;
     const auto_install_prompt = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_auto_install_prompt)) orelse 1;
 
-    const auto_detect_raw = registry.queryStringWithFallback(allocator, config_hives, reg_path, reg_value_auto_detect) catch
-        try allocator.dupe(u8, default_auto_detect);
-    defer allocator.free(auto_detect_raw);
-    const auto_detect = try parseCsvList(allocator, auto_detect_raw);
+    const auto_detect = auto_detect: {
+        if (try registry.queryMultiStringOptionalWithFallback(allocator, config_hives, reg_path, reg_value_auto_detect)) |configured| {
+            if (configured.len > 0) break :auto_detect configured;
+            for (configured) |value| allocator.free(value);
+            allocator.free(configured);
+        }
+
+        const auto_detect_raw = registry.queryStringWithFallback(allocator, config_hives, reg_path, reg_value_auto_detect) catch
+            try allocator.dupe(u8, default_auto_detect);
+        defer allocator.free(auto_detect_raw);
+        break :auto_detect try parseCsvList(allocator, auto_detect_raw);
+    };
     const aliases = (try registry.queryMultiStringOptionalWithFallback(allocator, config_hives, reg_path, reg_value_aliases)) orelse
         try allocator.alloc([]const u8, 0);
     const log_executions = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_log_executions)) orelse 0;
