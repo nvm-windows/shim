@@ -15,20 +15,13 @@ function Invoke-External {
     [string[]]$Arguments
   )
 
-  $psi = [System.Diagnostics.ProcessStartInfo]::new()
-  $psi.FileName = $FilePath
-  $psi.UseShellExecute = $false
-  $psi.RedirectStandardOutput = $false
-  $psi.RedirectStandardError = $false
-
-  foreach ($arg in $Arguments) {
-    [void]$psi.ArgumentList.Add([string]$arg)
+  if (!(Test-Path -LiteralPath $FilePath)) {
+    throw "Executable not found: $FilePath"
   }
 
-  $proc = [System.Diagnostics.Process]::Start($psi)
-  $proc.WaitForExit()
-  if ($proc.ExitCode -ne 0) {
-    throw "Command failed with exit code $($proc.ExitCode): $FilePath $($Arguments -join ' ')"
+  & $FilePath @Arguments
+  if ($LASTEXITCODE -ne 0) {
+    throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $($Arguments -join ' ')"
   }
 }
 
