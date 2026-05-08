@@ -92,7 +92,7 @@ try {
 	}
 
 	Copy-Item -Force (Join-Path $localPrefixDir "bin\node.exe") $outputPath
-	go-winres patch --in .\winres\winres.json --no-backup $outputPath
+	& "$shimRoot\scripts\apply-winres.ps1" -ExePath $outputPath -WinresPath (Join-Path $scriptRoot "winres\winres.json")
 
 	if ($SyncSiblingNvm4w) {
 		if (!(Test-Path $siblingOutputDir)) {

@@ -88,7 +88,7 @@ try {
 	}
 
 	Copy-Item -Force (Join-Path $localPrefixDir "bin\proxy.exe") $outputPath
-	go-winres patch --in .\winres\winres.json --no-backup $outputPath
+	& "$shimRoot\scripts\apply-winres.ps1" -ExePath $outputPath -WinresPath (Join-Path $scriptRoot "winres\winres.json")
 }
 finally {
 	Pop-Location

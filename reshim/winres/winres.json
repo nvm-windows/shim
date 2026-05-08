@@ -3,7 +3,7 @@
     "#1": {
       "0409": {
         "identity": {
-          "name": "Global Module Shim Manager",
+          "name": "Node.js Global Module Shim Manager",
           "version": "1.0.0"
         },
         "description": "NVM for Windows Global Module Shim Manager",
@@ -35,7 +35,7 @@
           "0409": {
             "Comments": "NVM for Windows Global Module Shim Manager",
             "CompanyName": "Author Software Inc.",
-            "FileDescription": "Global Module Shim Manager",
+            "FileDescription": "Node.jsGlobal Module Shim Manager",
             "FileVersion": "1.0.0",
             "InternalName": "global_module_shim_manager",
             "LegalCopyright": "Author Software Inc.",

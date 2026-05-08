@@ -3,7 +3,7 @@
     "#1": {
       "0409": {
         "identity": {
-          "name": "Module Shim",
+          "name": "Node.js Module Shim",
           "version": "1.0.0"
         },
         "description": "NVM for Windows Module Shim",
@@ -35,7 +35,7 @@
           "0409": {
             "Comments": "NVM for Windows Module Shim",
             "CompanyName": "Author Software Inc.",
-            "FileDescription": "Global Module Shim",
+            "FileDescription": "Node.js Module Shim",
             "FileVersion": "1.0.0",
             "InternalName": "module_shim",
             "LegalCopyright": "Author Software Inc.",

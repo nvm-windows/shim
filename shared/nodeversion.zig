@@ -344,7 +344,7 @@ pub fn resolvePackageManagerVersion(allocator: std.mem.Allocator, node_bin: []co
     const version = std.mem.trim(u8, version_val.string, " \t\r\n");
     if (version.len == 0) return null;
 
-    return allocator.dupe(u8, version);
+    return @as(?[]u8, try allocator.dupe(u8, version));
 }
 
 fn extractPackageNodeEngine(allocator: std.mem.Allocator, raw: []const u8) !?[]u8 {
