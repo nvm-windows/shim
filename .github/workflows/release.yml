@@ -146,42 +146,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Ensure Zig Is Available
-        shell: pwsh
-        run: |
-          $zigRoot = Join-Path $env:RUNNER_TEMP ("zig-" + $env:ZIG_VERSION)
-          $zigExe = Join-Path $zigRoot "zig.exe"
-
-          if (!(Test-Path $zigExe)) {
-            $zigArch = if ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) { "aarch64" } else { "x86_64" }
-            $zigPlatform = "zig-windows-${zigArch}-$env:ZIG_VERSION"
-            $zipPath = Join-Path $env:RUNNER_TEMP ("${zigPlatform}.zip")
-            $downloadUrl = "https://ziglang.org/download/$env:ZIG_VERSION/${zigPlatform}.zip"
-
-            Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath
-
-            if (Test-Path $zigRoot) {
-              Remove-Item $zigRoot -Recurse -Force
-            }
-            New-Item -ItemType Directory -Force -Path $zigRoot | Out-Null
-            Expand-Archive -Path $zipPath -DestinationPath $zigRoot -Force
-
-            $extractedRoot = Join-Path $zigRoot $zigPlatform
-            if (Test-Path $extractedRoot) {
-              Get-ChildItem -Path $extractedRoot -Force | ForEach-Object {
-                Move-Item -Path $_.FullName -Destination $zigRoot -Force
-              }
-              Remove-Item $extractedRoot -Recurse -Force
-            }
-          }
-
-          if (!(Test-Path $zigExe)) {
-            throw "Expected zig executable not found at $zigExe"
-          }
-
-          echo "$zigRoot" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-          & $zigExe version
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
 
       - name: Build Shims + Package Asset
         shell: pwsh
