@@ -138,6 +138,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       VERSION: ${{ needs.detect-version.outputs.version }}
       TAG: ${{ needs.detect-version.outputs.tag }}
+      ZIG_VERSION: 0.15.1
 
     steps:
       - name: Checkout Code
@@ -159,13 +160,17 @@ jobs:
       - name: Ensure Zig Is Available
         shell: pwsh
         run: |
-          if (Get-Command zig -ErrorAction SilentlyContinue) {
-            zig version
-            exit 0
+          choco install zig --version $env:ZIG_VERSION -y --allow-downgrade --no-progress
+
+          $zigExe = "C:\ProgramData\chocolatey\lib\zig\tools\zig-x86_64-windows-$env:ZIG_VERSION\zig.exe"
+          if (!(Test-Path $zigExe)) {
+            throw "Expected zig executable not found at $zigExe"
           }
 
-          choco install zig -y --no-progress
-          zig version
+          $zigDir = Split-Path -Parent $zigExe
+          echo "$zigDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          & $zigExe version
 
       - name: Build Shims + Package Asset
         shell: pwsh
