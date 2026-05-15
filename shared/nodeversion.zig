@@ -13,6 +13,7 @@ const reg_value_auto_detect = config.reg_value_auto_detect;
 const reg_value_aliases = config.reg_value_aliases;
 const reg_value_log_executions = config.reg_value_log_executions;
 const reg_value_package_manager_mismatch_action = config.reg_value_package_manager_mismatch_action;
+const reg_value_npm_module_minimum_age = config.reg_value_npm_module_minimum_age;
 const reg_nvm_cmd_path = config.reg_nvm_cmd_path;
 const default_root = config.default_install_root;
 const default_auto_detect = config.default_auto_detect;
@@ -33,6 +34,7 @@ pub const ShimConfig = struct {
     aliases: []const []const u8,
     log_executions: bool,
     package_manager_mismatch_action: PackageManagerMismatchAction,
+    npm_module_minimum_age: ?u64,
 };
 
 pub const PackageManagerConstraint = struct {
@@ -96,6 +98,22 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
     const aliases = (try registry.queryMultiStringOptionalWithFallback(allocator, config_hives, reg_path, reg_value_aliases)) orelse
         try allocator.alloc([]const u8, 0);
     const log_executions = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_log_executions)) orelse 0;
+    const npm_module_minimum_age = age: {
+        if (try registry.queryQwordOptionalWithFallback(config_hives, reg_path, reg_value_npm_module_minimum_age)) |value| {
+            break :age value;
+        }
+
+        if (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_npm_module_minimum_age)) |value| {
+            break :age @as(u64, value);
+        }
+
+        const raw_age = registry.queryStringWithFallback(allocator, config_hives, reg_path, reg_value_npm_module_minimum_age) catch {
+            break :age null;
+        };
+        defer allocator.free(raw_age);
+
+        break :age parseMinimumAgeMinutes(raw_age);
+    };
 
     const raw_package_manager_mismatch_action = registry.queryStringWithFallback(allocator, config_hives, reg_path, reg_value_package_manager_mismatch_action) catch
         try allocator.dupe(u8, "error");
@@ -112,6 +130,7 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
         .aliases = aliases,
         .log_executions = log_executions != 0,
         .package_manager_mismatch_action = package_manager_mismatch_action,
+        .npm_module_minimum_age = npm_module_minimum_age,
     };
 }
 
@@ -400,6 +419,16 @@ fn parsePackageManagerMismatchAction(raw: []const u8) PackageManagerMismatchActi
     return .@"error";
 }
 
+fn parseMinimumAgeMinutes(raw: []const u8) ?u64 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    return std.fmt.parseUnsigned(u64, trimmed, 10) catch |err| switch (err) {
+        error.Overflow => std.math.maxInt(u64),
+        else => null,
+    };
+}
+
 fn executablePath(allocator: std.mem.Allocator, root: []const u8, version: []const u8) ![]u8 {
     const bare = if (version.len > 0 and (version[0] == 'v' or version[0] == 'V')) version[1..] else version;
     const version_dir = try std.fmt.allocPrint(allocator, "v{s}", .{bare});
@@ -535,4 +564,15 @@ test "selectEffectiveVersion keeps requested version when no alias matches" {
     };
 
     try std.testing.expectEqualStrings("18.20.8", selectEffectiveVersion(&aliases, "18.20.8"));
+}
+
+test "parseMinimumAgeMinutes parses valid decimal strings" {
+    try std.testing.expectEqual(@as(?u64, 1440), parseMinimumAgeMinutes("1440"));
+    try std.testing.expectEqual(@as(?u64, 0), parseMinimumAgeMinutes("0"));
+}
+
+test "parseMinimumAgeMinutes saturates overflow and rejects invalid" {
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), parseMinimumAgeMinutes("10000000000000000000000000"));
+    try std.testing.expect(parseMinimumAgeMinutes("not-a-number") == null);
+    try std.testing.expect(parseMinimumAgeMinutes("   ") == null);
 }

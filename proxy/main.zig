@@ -71,7 +71,7 @@ pub fn main() !void {
     const command_path = try resolveDelegatedCommandPath(allocator, node_install_dir_abs, command_name);
     defer allocator.free(command_path);
 
-    const process_exit_code = runDelegatedCommand(allocator, node_install_dir_abs, command_path, parsed_args.forwarded) catch |err| blk: {
+    const process_exit_code = runDelegatedCommand(allocator, node_install_dir_abs, command_name, command_path, cfg.npm_module_minimum_age, parsed_args.forwarded) catch |err| blk: {
         std.debug.print("proxy failed to run {s}: {s}\n", .{ command_name, @errorName(err) });
         break :blk 1;
     };
@@ -199,22 +199,33 @@ fn resolveDelegatedCommandPath(allocator: std.mem.Allocator, node_install_dir: [
     return error.CommandNotFound;
 }
 
-fn runDelegatedCommand(allocator: std.mem.Allocator, node_install_dir: []const u8, command_path: []const u8, forwarded: []const []const u8) !u8 {
+fn runDelegatedCommand(
+    allocator: std.mem.Allocator,
+    node_install_dir: []const u8,
+    command_name: []const u8,
+    command_path: []const u8,
+    npm_module_minimum_age: ?u64,
+    forwarded: []const []const u8,
+) !u8 {
     var env_map = try std.process.getEnvMap(allocator);
     defer env_map.deinit();
+
+    const forwarded_args = try filterForwardedArgsForAgePolicy(allocator, command_name, npm_module_minimum_age, forwarded);
+    defer allocator.free(forwarded_args);
 
     const old_path = env_map.get("PATH") orelse "";
     const child_path = try std.fmt.allocPrint(allocator, "{s};{s}", .{ node_install_dir, old_path });
     defer allocator.free(child_path);
     try env_map.put("PATH", child_path);
+    try applyPackageManagerMinimumAgeGate(allocator, &env_map, command_name, npm_module_minimum_age);
 
     const ext = std.fs.path.extension(command_path);
     const use_cmd = std.ascii.eqlIgnoreCase(ext, ".cmd") or std.ascii.eqlIgnoreCase(ext, ".bat");
 
     var argv = if (use_cmd)
-        try allocator.alloc([]const u8, forwarded.len + 4)
+        try allocator.alloc([]const u8, forwarded_args.len + 4)
     else
-        try allocator.alloc([]const u8, forwarded.len + 1);
+        try allocator.alloc([]const u8, forwarded_args.len + 1);
     defer allocator.free(argv);
 
     if (use_cmd) {
@@ -222,12 +233,12 @@ fn runDelegatedCommand(allocator: std.mem.Allocator, node_install_dir: []const u
         argv[1] = "/d";
         argv[2] = "/c";
         argv[3] = command_path;
-        for (forwarded, 0..) |arg, i| {
+        for (forwarded_args, 0..) |arg, i| {
             argv[i + 4] = arg;
         }
     } else {
         argv[0] = command_path;
-        for (forwarded, 0..) |arg, i| {
+        for (forwarded_args, 0..) |arg, i| {
             argv[i + 1] = arg;
         }
     }
@@ -245,6 +256,81 @@ fn runDelegatedCommand(allocator: std.mem.Allocator, node_install_dir: []const u
         .Exited => |code| code,
         else => 1,
     };
+}
+
+fn filterForwardedArgsForAgePolicy(
+    allocator: std.mem.Allocator,
+    command_name: []const u8,
+    npm_module_minimum_age: ?u64,
+    forwarded: []const []const u8,
+) ![]const []const u8 {
+    if (!(std.ascii.eqlIgnoreCase(command_name, "yarn") and (npm_module_minimum_age orelse 0) != 0)) {
+        return allocator.dupe([]const u8, forwarded);
+    }
+
+    var filtered = std.ArrayListUnmanaged([]const u8){};
+    defer filtered.deinit(allocator);
+
+    for (forwarded) |arg| {
+        if (std.ascii.eqlIgnoreCase(arg, "--bypass-age-policy")) continue;
+        try filtered.append(allocator, arg);
+    }
+
+    return filtered.toOwnedSlice(allocator);
+}
+
+const PackageManagerAgeGateEnv = struct {
+    key: []const u8,
+    value: []u8,
+
+    fn deinit(self: PackageManagerAgeGateEnv, allocator: std.mem.Allocator) void {
+        allocator.free(self.value);
+    }
+};
+
+fn applyPackageManagerMinimumAgeGate(
+    allocator: std.mem.Allocator,
+    env_map: *std.process.EnvMap,
+    command_name: []const u8,
+    npm_module_minimum_age: ?u64,
+) !void {
+    const minutes = npm_module_minimum_age orelse return;
+    if (minutes == 0) return;
+
+    const age_gate = try buildPackageManagerMinimumAgeGate(allocator, command_name, minutes) orelse return;
+    defer age_gate.deinit(allocator);
+
+    try env_map.put(age_gate.key, age_gate.value);
+}
+
+fn buildPackageManagerMinimumAgeGate(
+    allocator: std.mem.Allocator,
+    command_name: []const u8,
+    minutes: u64,
+) !?PackageManagerAgeGateEnv {
+    if (std.ascii.eqlIgnoreCase(command_name, "npm")) {
+        const days = (minutes + 1439) / 1440;
+        return .{
+            .key = "npm_config_min_release_age",
+            .value = try std.fmt.allocPrint(allocator, "{d}", .{days}),
+        };
+    }
+
+    if (std.ascii.eqlIgnoreCase(command_name, "pnpm")) {
+        return .{
+            .key = "pnpm_config_minimum_release_age",
+            .value = try std.fmt.allocPrint(allocator, "{d}", .{minutes}),
+        };
+    }
+
+    if (std.ascii.eqlIgnoreCase(command_name, "yarn")) {
+        return .{
+            .key = "YARN_NPM_MINIMAL_AGE_GATE",
+            .value = try std.fmt.allocPrint(allocator, "{d}", .{minutes}),
+        };
+    }
+
+    return null;
 }
 
 fn runReshim(allocator: std.mem.Allocator, install_root: []const u8, node_install_dir: []const u8) void {
@@ -414,4 +500,60 @@ test "parseArgs rejects invalid nvm use flag" {
     try std.testing.expectError(error.InvalidNvmUseFlag, parseArgs(allocator, &.{"--nvm-use"}));
     try std.testing.expectError(error.InvalidNvmUseFlag, parseArgs(allocator, &.{ "--nvm-use", "   " }));
     try std.testing.expectError(error.InvalidNvmUseFlag, parseArgs(allocator, &.{"--nvm-use="}));
+}
+
+test "buildPackageManagerMinimumAgeGate emits npm, pnpm, and yarn formats" {
+    const allocator = std.testing.allocator;
+
+    // npm: minutes rounded up to days, plain integer
+    const npm_gate_exact = (try buildPackageManagerMinimumAgeGate(allocator, "npm", 1440)).?;
+    defer npm_gate_exact.deinit(allocator);
+    try std.testing.expectEqualStrings("npm_config_min_release_age", npm_gate_exact.key);
+    try std.testing.expectEqualStrings("1", npm_gate_exact.value);
+
+    const npm_gate_round = (try buildPackageManagerMinimumAgeGate(allocator, "npm", 10081)).?;
+    defer npm_gate_round.deinit(allocator);
+    try std.testing.expectEqualStrings("8", npm_gate_round.value);
+}
+
+test "buildPackageManagerMinimumAgeGate emits pnpm and yarn formats" {
+    const allocator = std.testing.allocator;
+
+    const pnpm_gate = (try buildPackageManagerMinimumAgeGate(allocator, "pnpm", 1440)).?;
+    defer pnpm_gate.deinit(allocator);
+    try std.testing.expectEqualStrings("pnpm_config_minimum_release_age", pnpm_gate.key);
+    try std.testing.expectEqualStrings("1440", pnpm_gate.value);
+
+    const yarn_gate = (try buildPackageManagerMinimumAgeGate(allocator, "yarn", 1440)).?;
+    defer yarn_gate.deinit(allocator);
+    try std.testing.expectEqualStrings("YARN_NPM_MINIMAL_AGE_GATE", yarn_gate.key);
+    try std.testing.expectEqualStrings("1440", yarn_gate.value);
+}
+
+test "filterForwardedArgsForAgePolicy strips yarn bypass flag when minutes is non-zero" {
+    const allocator = std.testing.allocator;
+    const original = [_][]const u8{ "add", "left-pad", "--bypass-age-policy", "--dev", "--BYPASS-AGE-POLICY" };
+
+    const filtered = try filterForwardedArgsForAgePolicy(allocator, "yarn", 1440, &original);
+    defer allocator.free(filtered);
+
+    try std.testing.expectEqual(@as(usize, 3), filtered.len);
+    try std.testing.expectEqualStrings("add", filtered[0]);
+    try std.testing.expectEqualStrings("left-pad", filtered[1]);
+    try std.testing.expectEqualStrings("--dev", filtered[2]);
+}
+
+test "filterForwardedArgsForAgePolicy keeps yarn bypass flag when minutes is zero or missing" {
+    const allocator = std.testing.allocator;
+    const original = [_][]const u8{ "add", "--bypass-age-policy" };
+
+    const missing = try filterForwardedArgsForAgePolicy(allocator, "yarn", null, &original);
+    defer allocator.free(missing);
+    try std.testing.expectEqual(@as(usize, 2), missing.len);
+    try std.testing.expectEqualStrings("--bypass-age-policy", missing[1]);
+
+    const zero = try filterForwardedArgsForAgePolicy(allocator, "yarn", 0, &original);
+    defer allocator.free(zero);
+    try std.testing.expectEqual(@as(usize, 2), zero.len);
+    try std.testing.expectEqualStrings("--bypass-age-policy", zero[1]);
 }

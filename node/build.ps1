@@ -12,6 +12,14 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if ([string]::IsNullOrWhiteSpace($Architecture)) {
+	if ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
+		$Architecture = "arm64"
+	} else {
+		$Architecture = "amd64"
+	}
+}
+
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $shimRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptRoot ".."))
 $outputPath = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($scriptRoot, $OutputExe))

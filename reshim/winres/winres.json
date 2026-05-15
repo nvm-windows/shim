@@ -3,8 +3,8 @@
     "#1": {
       "0409": {
         "identity": {
-          "name": "Node.js Global Module Shim Manager",
-          "version": "1.0.0"
+          "name": "AuthorSoftware.NVM4WNodeGlobalModuleShimManager",
+          "version": "1.0.0.0"
         },
         "description": "NVM for Windows Global Module Shim Manager",
         "minimum-os": "win10",

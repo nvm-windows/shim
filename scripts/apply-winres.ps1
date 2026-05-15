@@ -40,10 +40,16 @@ function Invoke-External {
     throw "Executable not found at: $FilePath"
   }
 
-  & $FilePath @Arguments
-  if ($LASTEXITCODE -ne 0) {
-    throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $($Arguments -join ' ')"
+  $maxAttempts = 3
+  for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+    & $FilePath @Arguments
+    if ($LASTEXITCODE -eq 0) { return }
+    if ($attempt -lt $maxAttempts) {
+      Write-Warning "rcedit attempt $attempt failed (exit $LASTEXITCODE). Retrying in 1s..."
+      Start-Sleep -Seconds 1
+    }
   }
+  throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $($Arguments -join ' ')"
 }
 
 function Resolve-MtExe {
@@ -70,6 +76,31 @@ function Resolve-MtExe {
   }
 
   return $null
+}
+
+function Escape-Xml {
+  param([string]$Value)
+
+  if ($null -eq $Value) {
+    return ""
+  }
+
+  return [System.Security.SecurityElement]::Escape($Value)
+}
+
+function Get-SafeAssemblyIdentityName {
+  param([string]$Name)
+
+  $raw = if ([string]::IsNullOrWhiteSpace($Name)) { "nvm.windows.shim" } else { $Name.Trim() }
+  $safe = [System.Text.RegularExpressions.Regex]::Replace($raw, "[^A-Za-z0-9._-]", ".")
+  $safe = [System.Text.RegularExpressions.Regex]::Replace($safe, "[.]{2,}", ".")
+  $safe = $safe.Trim('.')
+
+  if ([string]::IsNullOrWhiteSpace($safe)) {
+    return "nvm.windows.shim"
+  }
+
+  return $safe
 }
 
 $resolvedExePath = [System.IO.Path]::GetFullPath($ExePath)
@@ -159,9 +190,20 @@ if ($json.ContainsKey('RT_MANIFEST') -and $json['RT_MANIFEST'] -is [hashtable]) 
 if ($manifestNode) {
   $mtExe = Resolve-MtExe
   if ($mtExe -and (Test-Path -LiteralPath $mtExe)) {
-    $identityName = $manifestNode['identity']['name']
-    $identityVersion = $manifestNode['identity']['version']
-    $description = $manifestNode['description']
+    $identityName = Get-SafeAssemblyIdentityName -Name "$($manifestNode['identity']['name'])"
+    $identityVersion = "$($manifestNode['identity']['version'])".Trim()
+    # SxS requires exactly four numeric parts (a.b.c.d); pad or default as needed.
+    if ([string]::IsNullOrWhiteSpace($identityVersion)) {
+      $identityVersion = "1.0.0.0"
+    } else {
+      $parts = $identityVersion -split '\.'
+      while ($parts.Count -lt 4) { $parts += "0" }
+      $identityVersion = ($parts[0..3] | ForEach-Object { if ($_ -match '^\d+$') { $_ } else { "0" } }) -join "."
+    }
+    $description = Escape-Xml -Value "$($manifestNode['description'])"
+    if ([string]::IsNullOrWhiteSpace($description)) {
+      $description = "NVM for Windows shim"
+    }
 
     $level = "asInvoker"
     if ($manifestNode['execution-level']) {
@@ -176,7 +218,7 @@ if ($manifestNode) {
     $manifestXml = @"
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="$identityName" version="$identityVersion" processorArchitecture="*"/>
+  <assemblyIdentity type="win32" name="$(Escape-Xml -Value $identityName)" version="$(Escape-Xml -Value $identityVersion)" processorArchitecture="*"/>
   <description>$description</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
