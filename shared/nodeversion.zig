@@ -347,31 +347,84 @@ pub fn detectPackageManagerConstraintFromFile(allocator: std.mem.Allocator, file
     return null;
 }
 
-pub fn resolvePackageManagerVersion(allocator: std.mem.Allocator, node_bin: []const u8, command_name: []const u8) !?[]u8 {
+pub fn resolvePackageManagerVersion(allocator: std.mem.Allocator, node_bin: []const u8, command_name: []const u8, command_path: []const u8) !?[]u8 {
     const node_install_dir = std.fs.path.dirname(node_bin) orelse return null;
 
     const package_name = if (std.ascii.eqlIgnoreCase(command_name, "npx")) "npm" else command_name;
     const package_json = try std.fs.path.join(allocator, &.{ node_install_dir, "node_modules", package_name, "package.json" });
     defer allocator.free(package_json);
 
-    const raw = std.fs.cwd().readFileAlloc(allocator, package_json, 1024 * 1024) catch return null;
+    const raw = std.fs.cwd().readFileAlloc(allocator, package_json, 1024 * 1024) catch {
+        return try resolvePackageManagerVersionFromCommand(allocator, node_install_dir, command_path);
+    };
     defer allocator.free(raw);
 
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
+        return try resolvePackageManagerVersionFromCommand(allocator, node_install_dir, command_path);
+    };
     defer parsed.deinit();
 
     const obj = switch (parsed.value) {
         .object => |o| o,
-        else => return null,
+        else => return try resolvePackageManagerVersionFromCommand(allocator, node_install_dir, command_path),
     };
 
-    const version_val = obj.get("version") orelse return null;
-    if (version_val != .string) return null;
+    const version_val = obj.get("version") orelse return try resolvePackageManagerVersionFromCommand(allocator, node_install_dir, command_path);
+    if (version_val != .string) return try resolvePackageManagerVersionFromCommand(allocator, node_install_dir, command_path);
 
     const version = std.mem.trim(u8, version_val.string, " \t\r\n");
-    if (version.len == 0) return null;
+    if (version.len == 0) return try resolvePackageManagerVersionFromCommand(allocator, node_install_dir, command_path);
 
     return @as(?[]u8, try allocator.dupe(u8, version));
+}
+
+fn resolvePackageManagerVersionFromCommand(allocator: std.mem.Allocator, node_install_dir: []const u8, command_path: []const u8) !?[]u8 {
+    var env_map = try std.process.getEnvMap(allocator);
+    defer env_map.deinit();
+
+    const old_path = env_map.get("PATH") orelse "";
+    const child_path = try std.fmt.allocPrint(allocator, "{s};{s}", .{ node_install_dir, old_path });
+    defer allocator.free(child_path);
+    try env_map.put("PATH", child_path);
+
+    const ext = std.fs.path.extension(command_path);
+    const use_cmd = std.ascii.eqlIgnoreCase(ext, ".cmd") or std.ascii.eqlIgnoreCase(ext, ".bat");
+
+    var argv = if (use_cmd)
+        try allocator.alloc([]const u8, 5)
+    else
+        try allocator.alloc([]const u8, 2);
+    defer allocator.free(argv);
+
+    if (use_cmd) {
+        argv[0] = "cmd.exe";
+        argv[1] = "/d";
+        argv[2] = "/c";
+        argv[3] = command_path;
+        argv[4] = "--version";
+    } else {
+        argv[0] = command_path;
+        argv[1] = "--version";
+    }
+
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+        .env_map = &env_map,
+    }) catch return null;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    if (result.term != .Exited or result.term.Exited != 0) {
+        return null;
+    }
+
+    var lines = std.mem.tokenizeAny(u8, result.stdout, "\r\n");
+    const line = lines.next() orelse return null;
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    return try allocator.dupe(u8, trimmed);
 }
 
 fn extractPackageNodeEngine(allocator: std.mem.Allocator, raw: []const u8) !?[]u8 {

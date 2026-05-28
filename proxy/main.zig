@@ -58,18 +58,18 @@ pub fn main() !void {
         );
     }
 
-    if (!try enforcePackageManagerConstraint(allocator, cfg, resolved.version_source, command_name, resolved.node_bin.?)) {
-        std.process.exit(1);
-    }
-
-    const needs_reshim = detectReshimNeeded(command_name, parsed_args.forwarded);
-
     const node_install_dir = std.fs.path.dirname(resolved.node_bin.?) orelse ".";
     const node_install_dir_abs = try std.fs.path.resolve(allocator, &.{node_install_dir});
     defer allocator.free(node_install_dir_abs);
 
     const command_path = try resolveDelegatedCommandPath(allocator, node_install_dir_abs, command_name);
     defer allocator.free(command_path);
+
+    if (!try enforcePackageManagerConstraint(allocator, cfg, resolved.version_source, command_name, resolved.node_bin.?, command_path)) {
+        std.process.exit(1);
+    }
+
+    const needs_reshim = detectReshimNeeded(command_name, parsed_args.forwarded);
 
     const process_exit_code = runDelegatedCommand(allocator, node_install_dir_abs, command_name, command_path, cfg.npm_module_minimum_age, parsed_args.forwarded) catch |err| blk: {
         std.debug.print("proxy failed to run {s}: {s}\n", .{ command_name, @errorName(err) });
@@ -92,6 +92,7 @@ fn enforcePackageManagerConstraint(
     version_source: []const u8,
     command_name: []const u8,
     node_bin: []const u8,
+    command_path: []const u8,
 ) !bool {
     if (!nodeversion.shouldCheckPackageManagerMismatch(version_source, cfg.package_manager_mismatch_action)) {
         return true;
@@ -118,7 +119,7 @@ fn enforcePackageManagerConstraint(
         return handlePackageManagerMismatchAction(allocator, cfg.package_manager_mismatch_action, name_mismatch_message);
     }
 
-    const current_version = try nodeversion.resolvePackageManagerVersion(allocator, node_bin, command_name);
+    const current_version = try nodeversion.resolvePackageManagerVersion(allocator, node_bin, command_name, command_path);
     if (current_version == null) {
         return true;
     }
@@ -179,13 +180,38 @@ fn isConstrainedPackageManagerHardlink(command_name: []const u8) bool {
 }
 
 fn resolveDelegatedCommandPath(allocator: std.mem.Allocator, node_install_dir: []const u8, command_name: []const u8) ![]u8 {
+    if (try findCommandPathInDirectory(allocator, node_install_dir, command_name)) |path| {
+        return path;
+    }
+
+    if (try getOptionalEnvVarOwned(allocator, "PNPM_HOME")) |pnpm_home| {
+        defer allocator.free(pnpm_home);
+
+        if (std.ascii.eqlIgnoreCase(command_name, "pnpm")) {
+            if (try findCommandPathInDirectory(allocator, pnpm_home, command_name)) |path| {
+                return path;
+            }
+        }
+
+        const pnpm_home_bin = try std.fs.path.join(allocator, &.{ pnpm_home, "bin" });
+        defer allocator.free(pnpm_home_bin);
+
+        if (try findCommandPathInDirectory(allocator, pnpm_home_bin, command_name)) |path| {
+            return path;
+        }
+    }
+
+    return error.CommandNotFound;
+}
+
+fn findCommandPathInDirectory(allocator: std.mem.Allocator, dir_path: []const u8, command_name: []const u8) !?[]u8 {
     const exts = [_][]const u8{ ".cmd", ".exe", ".bat" };
 
     for (exts) |ext| {
         const filename = try std.fmt.allocPrint(allocator, "{s}{s}", .{ command_name, ext });
         defer allocator.free(filename);
 
-        const full = try std.fs.path.join(allocator, &.{ node_install_dir, filename });
+        const full = try std.fs.path.join(allocator, &.{ dir_path, filename });
         errdefer allocator.free(full);
 
         std.fs.cwd().access(full, .{}) catch {
@@ -196,7 +222,28 @@ fn resolveDelegatedCommandPath(allocator: std.mem.Allocator, node_install_dir: [
         return full;
     }
 
-    return error.CommandNotFound;
+    return null;
+}
+
+fn getOptionalEnvVarOwned(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
+    const raw = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return null,
+        else => return err,
+    };
+
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n\"");
+    if (trimmed.len == 0) {
+        allocator.free(raw);
+        return null;
+    }
+
+    if (trimmed.ptr == raw.ptr and trimmed.len == raw.len) {
+        return raw;
+    }
+
+    const copy = try allocator.dupe(u8, trimmed);
+    allocator.free(raw);
+    return copy;
 }
 
 fn runDelegatedCommand(

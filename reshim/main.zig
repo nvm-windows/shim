@@ -412,25 +412,11 @@ fn collectCmdNamesFromInstallRoot(allocator: std.mem.Allocator, install_root: []
         var version_dir = root_dir.openDir(entry.name, .{ .iterate = true }) catch continue;
         defer version_dir.close();
 
-        var version_iter = version_dir.iterate();
-        while (try version_iter.next()) |file_entry| {
-            if (file_entry.kind != .file) continue;
-            if (!std.ascii.endsWithIgnoreCase(file_entry.name, ".cmd")) continue;
-            if (file_entry.name.len <= 4) continue;
-
-            const base_name = file_entry.name[0 .. file_entry.name.len - 4];
-            const key = try allocator.dupe(u8, base_name);
-            _ = std.ascii.lowerString(key, key);
-
-            if (dedupe.contains(key)) {
-                allocator.free(key);
-                continue;
-            }
-
-            try dedupe.put(key, {});
-            try names.append(allocator, try allocator.dupe(u8, base_name));
-        }
+        try collectCmdNamesFromCommandDirectory(allocator, &version_dir, &dedupe, &names);
     }
+
+    try appendPnpmHomeBinCmdNames(allocator, &dedupe, &names);
+    try appendUniqueCommandName(allocator, &dedupe, &names, "pnpm");
 
     std.mem.sort([]const u8, names.items, {}, lessThanIgnoreCase);
     return names.toOwnedSlice(allocator);
@@ -454,27 +440,89 @@ fn collectCmdNamesFromVersionDir(allocator: std.mem.Allocator, version_dir_path:
         try std.fs.cwd().openDir(version_dir_path, .{ .iterate = true });
     defer version_dir.close();
 
-    var version_iter = version_dir.iterate();
-    while (try version_iter.next()) |file_entry| {
+    try collectCmdNamesFromCommandDirectory(allocator, &version_dir, &dedupe, &names);
+    try appendPnpmHomeBinCmdNames(allocator, &dedupe, &names);
+    try appendUniqueCommandName(allocator, &dedupe, &names, "pnpm");
+
+    std.mem.sort([]const u8, names.items, {}, lessThanIgnoreCase);
+    return names.toOwnedSlice(allocator);
+}
+
+fn collectCmdNamesFromCommandDirectory(
+    allocator: std.mem.Allocator,
+    dir: *std.fs.Dir,
+    dedupe: *std.StringHashMap(void),
+    names: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var iter = dir.iterate();
+    while (try iter.next()) |file_entry| {
         if (file_entry.kind != .file) continue;
         if (!std.ascii.endsWithIgnoreCase(file_entry.name, ".cmd")) continue;
         if (file_entry.name.len <= 4) continue;
 
         const base_name = file_entry.name[0 .. file_entry.name.len - 4];
-        const key = try allocator.dupe(u8, base_name);
-        _ = std.ascii.lowerString(key, key);
+        try appendUniqueCommandName(allocator, dedupe, names, base_name);
+    }
+}
 
-        if (dedupe.contains(key)) {
-            allocator.free(key);
-            continue;
-        }
+fn appendPnpmHomeBinCmdNames(
+    allocator: std.mem.Allocator,
+    dedupe: *std.StringHashMap(void),
+    names: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    const pnpm_home = (try getOptionalEnvVarOwned(allocator, "PNPM_HOME")) orelse return;
+    defer allocator.free(pnpm_home);
 
-        try dedupe.put(key, {});
-        try names.append(allocator, try allocator.dupe(u8, base_name));
+    const pnpm_home_bin = try std.fs.path.join(allocator, &.{ pnpm_home, "bin" });
+    defer allocator.free(pnpm_home_bin);
+
+    const is_abs = std.fs.path.isAbsolute(pnpm_home_bin);
+    var pnpm_bin_dir = if (is_abs)
+        std.fs.openDirAbsolute(pnpm_home_bin, .{ .iterate = true }) catch return
+    else
+        std.fs.cwd().openDir(pnpm_home_bin, .{ .iterate = true }) catch return;
+    defer pnpm_bin_dir.close();
+
+    try collectCmdNamesFromCommandDirectory(allocator, &pnpm_bin_dir, dedupe, names);
+}
+
+fn appendUniqueCommandName(
+    allocator: std.mem.Allocator,
+    dedupe: *std.StringHashMap(void),
+    names: *std.ArrayListUnmanaged([]const u8),
+    base_name: []const u8,
+) !void {
+    const key = try allocator.dupe(u8, base_name);
+    _ = std.ascii.lowerString(key, key);
+
+    if (dedupe.contains(key)) {
+        allocator.free(key);
+        return;
     }
 
-    std.mem.sort([]const u8, names.items, {}, lessThanIgnoreCase);
-    return names.toOwnedSlice(allocator);
+    try dedupe.put(key, {});
+    try names.append(allocator, try allocator.dupe(u8, base_name));
+}
+
+fn getOptionalEnvVarOwned(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
+    const raw = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return null,
+        else => return err,
+    };
+
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n\"");
+    if (trimmed.len == 0) {
+        allocator.free(raw);
+        return null;
+    }
+
+    if (trimmed.ptr == raw.ptr and trimmed.len == raw.len) {
+        return raw;
+    }
+
+    const copy = try allocator.dupe(u8, trimmed);
+    allocator.free(raw);
+    return copy;
 }
 
 fn lessThanIgnoreCase(_: void, a: []const u8, b: []const u8) bool {
@@ -506,7 +554,9 @@ fn collectExistingShimNames(allocator: std.mem.Allocator, shim_dir: []const u8, 
 }
 
 fn shouldLogModuleEvent(name: []const u8) bool {
-    return !std.ascii.eqlIgnoreCase(name, "npm") and !std.ascii.eqlIgnoreCase(name, "npx");
+    return !std.ascii.eqlIgnoreCase(name, "npm") and
+        !std.ascii.eqlIgnoreCase(name, "npx") and
+        !std.ascii.eqlIgnoreCase(name, "pnpm");
 }
 
 fn isVersionDirName(name: []const u8) bool {

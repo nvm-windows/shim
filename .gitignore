@@ -10,3 +10,4 @@ zig-out
 *.ps1
 !build.ps1
 !scripts/apply-winres.ps1
+bin
