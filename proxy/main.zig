@@ -58,18 +58,18 @@ pub fn main() !void {
         );
     }
 
-    if (!try enforcePackageManagerConstraint(allocator, cfg, resolved.version_source, command_name, resolved.node_bin.?)) {
-        std.process.exit(1);
-    }
-
-    const needs_reshim = detectReshimNeeded(command_name, parsed_args.forwarded);
-
     const node_install_dir = std.fs.path.dirname(resolved.node_bin.?) orelse ".";
     const node_install_dir_abs = try std.fs.path.resolve(allocator, &.{node_install_dir});
     defer allocator.free(node_install_dir_abs);
 
     const command_path = try resolveDelegatedCommandPath(allocator, node_install_dir_abs, command_name);
     defer allocator.free(command_path);
+
+    if (!try enforcePackageManagerConstraint(allocator, cfg, resolved.version_source, command_name, resolved.node_bin.?, command_path)) {
+        std.process.exit(1);
+    }
+
+    const needs_reshim = detectReshimNeeded(command_name, parsed_args.forwarded);
 
     const process_exit_code = runDelegatedCommand(allocator, node_install_dir_abs, command_name, command_path, cfg.npm_module_minimum_age, cfg.npm_registry_fallback, parsed_args.forwarded) catch |err| blk: {
         std.debug.print("proxy failed to run {s}: {s}\n", .{ command_name, @errorName(err) });
@@ -92,6 +92,7 @@ fn enforcePackageManagerConstraint(
     version_source: []const u8,
     command_name: []const u8,
     node_bin: []const u8,
+    command_path: []const u8,
 ) !bool {
     if (!nodeversion.shouldCheckPackageManagerMismatch(version_source, cfg.package_manager_mismatch_action)) {
         return true;
@@ -118,7 +119,7 @@ fn enforcePackageManagerConstraint(
         return handlePackageManagerMismatchAction(allocator, cfg.package_manager_mismatch_action, name_mismatch_message);
     }
 
-    const current_version = try nodeversion.resolvePackageManagerVersion(allocator, node_bin, command_name);
+    const current_version = try nodeversion.resolvePackageManagerVersion(allocator, node_bin, command_name, command_path);
     if (current_version == null) {
         return true;
     }
