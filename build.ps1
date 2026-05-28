@@ -18,6 +18,8 @@ $outputDir = if ([System.IO.Path]::IsPathRooted($OutputDir)) {
 }
 $binDir = Join-Path $outputDir "utils"
 $repoLocalZigCacheDir = Join-Path $scriptRoot ".zig-cache"
+$generatedDir = Join-Path $scriptRoot ".generated"
+$stagedRegistryOverride = $null
 
 Write-Host "Building all shims -> $outputDir"
 
@@ -87,7 +89,19 @@ if ($Version) {
 	$commonArgs.Version = $Version
 }
 if ($RegistryOverride) {
-	$commonArgs.RegistryOverride = $RegistryOverride
+	$sourceRegistryOverride = if ([System.IO.Path]::IsPathRooted($RegistryOverride)) {
+		[System.IO.Path]::GetFullPath($RegistryOverride)
+	} else {
+		[System.IO.Path]::GetFullPath((Join-Path $scriptRoot $RegistryOverride))
+	}
+	if (!(Test-Path $sourceRegistryOverride -PathType Leaf)) {
+		throw "registry override not found at $sourceRegistryOverride"
+	}
+
+	New-Item -ItemType Directory -Force -Path $generatedDir | Out-Null
+	$stagedRegistryOverride = Join-Path $generatedDir "registry.override.zig"
+	Copy-Item -LiteralPath $sourceRegistryOverride -Destination $stagedRegistryOverride -Force
+	$commonArgs.RegistryOverride = $stagedRegistryOverride
 }
 if ($Architecture) {
 	$commonArgs.Architecture = $Architecture
@@ -124,7 +138,14 @@ $statuses | Format-Table -AutoSize Component, Status, Seconds, Size, Output
 if ($failed) {
 	$failedComponents = @($statuses | Where-Object { $_.Status -eq "FAILED" } | Select-Object -ExpandProperty Component)
 	Write-Host "Overall Status: FAILED ($([string]::Join(', ', $failedComponents)))" -ForegroundColor Red
+	if ($stagedRegistryOverride -and (Test-Path $stagedRegistryOverride -PathType Leaf)) {
+		Remove-Item -LiteralPath $stagedRegistryOverride -Force
+	}
 	exit 1
 }
 
 Write-Host "Overall Status: OK" -ForegroundColor Green
+
+if ($stagedRegistryOverride -and (Test-Path $stagedRegistryOverride -PathType Leaf)) {
+	Remove-Item -LiteralPath $stagedRegistryOverride -Force
+}

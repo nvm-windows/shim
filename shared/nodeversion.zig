@@ -14,6 +14,7 @@ const reg_value_aliases = config.reg_value_aliases;
 const reg_value_log_executions = config.reg_value_log_executions;
 const reg_value_package_manager_mismatch_action = config.reg_value_package_manager_mismatch_action;
 const reg_value_npm_module_minimum_age = config.reg_value_npm_module_minimum_age;
+const reg_value_npm_mirror = config.reg_value_npm_mirror;
 const reg_nvm_cmd_path = config.reg_nvm_cmd_path;
 const default_root = config.default_install_root;
 const default_auto_detect = config.default_auto_detect;
@@ -35,6 +36,7 @@ pub const ShimConfig = struct {
     log_executions: bool,
     package_manager_mismatch_action: PackageManagerMismatchAction,
     npm_module_minimum_age: ?u64,
+    npm_registry_fallback: ?[]u8,
 };
 
 pub const PackageManagerConstraint = struct {
@@ -98,6 +100,7 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
     const aliases = (try registry.queryMultiStringOptionalWithFallback(allocator, config_hives, reg_path, reg_value_aliases)) orelse
         try allocator.alloc([]const u8, 0);
     const log_executions = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_log_executions)) orelse 0;
+    const npm_registry_fallback = try loadFirstConfiguredRegistryValue(allocator, config_hives, reg_path, reg_value_npm_mirror);
     const npm_module_minimum_age = age: {
         if (try registry.queryQwordOptionalWithFallback(config_hives, reg_path, reg_value_npm_module_minimum_age)) |value| {
             break :age value;
@@ -131,6 +134,7 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
         .log_executions = log_executions != 0,
         .package_manager_mismatch_action = package_manager_mismatch_action,
         .npm_module_minimum_age = npm_module_minimum_age,
+        .npm_registry_fallback = npm_registry_fallback,
     };
 }
 
@@ -141,6 +145,7 @@ pub fn deinitConfig(allocator: std.mem.Allocator, cfg: ShimConfig) void {
     allocator.free(cfg.auto_detect);
     for (cfg.aliases) |value| allocator.free(value);
     allocator.free(cfg.aliases);
+    if (cfg.npm_registry_fallback) |value| allocator.free(value);
 }
 
 pub fn resolveConfiguredNode(allocator: std.mem.Allocator, cfg: ShimConfig, override_version: ?[]const u8) !ResolvedNode {
@@ -510,6 +515,35 @@ fn parseCsvList(allocator: std.mem.Allocator, raw: []const u8) ![]const []const 
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+fn loadFirstConfiguredRegistryValue(allocator: std.mem.Allocator, hives: anytype, sub_key: []const u8, value_name: []const u8) !?[]u8 {
+    if (try registry.queryMultiStringOptionalWithFallback(allocator, hives, sub_key, value_name)) |configured| {
+        defer freeStringList(allocator, configured);
+
+        for (configured) |item| {
+            const trimmed = std.mem.trim(u8, item, " \t\r\n");
+            if (trimmed.len == 0) continue;
+            return try allocator.dupe(u8, trimmed);
+        }
+    }
+
+    const raw = registry.queryStringWithFallback(allocator, hives, sub_key, value_name) catch return null;
+    defer allocator.free(raw);
+
+    var it = std.mem.tokenizeScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        return try allocator.dupe(u8, trimmed);
+    }
+
+    return null;
+}
+
+fn freeStringList(allocator: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |item| allocator.free(item);
+    allocator.free(values);
 }
 
 fn expandEnv(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
