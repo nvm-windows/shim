@@ -68,7 +68,8 @@ if ($RegistryOverride) {
 	}
 
 	$registryOverridePath = [System.IO.Path]::GetFullPath($RegistryOverride)
-	$zigArgs += "-Dregistry_path=$registryOverridePath"
+	$registryOverrideRelativePath = [System.IO.Path]::GetRelativePath($shimRoot, $registryOverridePath).Replace('\', '/')
+	$zigArgs += "-Dregistry_path=$registryOverrideRelativePath"
 }
 
 Push-Location $scriptRoot
