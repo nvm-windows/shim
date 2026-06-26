@@ -1,5 +1,4 @@
 const std = @import("std");
-const command_line = @import("cli.zig");
 const build_options = @import("build_options");
 const registry = @import("registry");
 const nodeversion = @import("nodeversion");
@@ -16,6 +15,7 @@ const ParsedArgs = struct {
 };
 
 const nodeNotFound = errors.nodeNotFound;
+const noActiveVersionConfigured = errors.noActiveVersionConfigured;
 
 fn operationCancelled() noreturn {
     std.debug.print("operation cancelled\n", .{});
@@ -29,9 +29,6 @@ pub fn main() !void {
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
-
-    const original_invocation = try command_line.rawInvocation(allocator);
-    defer allocator.free(original_invocation);
 
     const parsed_args = try parseArgs(allocator, args[1..]);
     defer allocator.free(parsed_args.forwarded);
@@ -48,7 +45,10 @@ pub fn main() !void {
     const cfg = try nodeversion.loadConfig(allocator);
     defer nodeversion.deinitConfig(allocator, cfg);
 
-    var resolved = try nodeversion.resolveConfiguredNode(allocator, cfg, parsed_args.override_version);
+    var resolved = nodeversion.resolveConfiguredNode(allocator, cfg, parsed_args.override_version) catch |err| switch (err) {
+        error.NoActiveVersion => noActiveVersionConfigured(),
+        else => return err,
+    };
     defer resolved.deinit(allocator);
 
     if (resolved.resolved_version == null) {
@@ -81,11 +81,23 @@ pub fn main() !void {
     }
 
     if (cfg.log_executions) {
-        const translated_invocation = try command_line.translatedInvocation(allocator, resolved.node_bin.?, parsed_args.forwarded);
-        defer allocator.free(translated_invocation);
-        const msg = try command_line.formatLogMessage(allocator, original_invocation, translated_invocation);
-        defer allocator.free(msg);
-        eventlog.write(allocator, msg);
+        const requested_command = std.fs.path.stem(std.fs.path.basename(args[0]));
+        const arguments = if (parsed_args.forwarded.len == 0)
+            try allocator.dupe(u8, "")
+        else
+            try std.mem.join(allocator, " ", parsed_args.forwarded);
+        defer allocator.free(arguments);
+
+        const working_directory = std.process.getCwdAlloc(allocator) catch try allocator.dupe(u8, "");
+        defer allocator.free(working_directory);
+
+        eventlog.writeStructuredInfo(allocator, "node-shim", "nodejs.executed", .{
+            .RequestedCommand = requested_command,
+            .ResolvedPath = resolved.node_bin.?,
+            .NodeVersion = resolved.resolved_version.?,
+            .Arguments = arguments,
+            .WorkingDirectory = working_directory,
+        });
     }
 
     if (parsed_args.forwarded.len == 0) {

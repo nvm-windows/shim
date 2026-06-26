@@ -20,12 +20,22 @@ if ([string]::IsNullOrWhiteSpace($Architecture)) {
 
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $shimRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptRoot ".."))
+$cliManifestPath = [System.IO.Path]::GetFullPath((Join-Path $shimRoot "..\cli\src\manifest.json"))
 $outputPath = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($scriptRoot, $OutputExe))
 $outputDir = Split-Path -Parent $outputPath
 $localCacheDir = Join-Path $env:LOCALAPPDATA "nvm-windows\zig-cache"
 $localPrefixDir = Join-Path $env:LOCALAPPDATA "nvm-windows\zig-prefix\reshim"
 
 if (-not $Version) {
+	if (Test-Path $cliManifestPath -PathType Leaf) {
+		$cliManifest = Get-Content -LiteralPath $cliManifestPath -Raw | ConvertFrom-Json
+		$manifestVersion = [string]$cliManifest.version
+		if (-not [string]::IsNullOrWhiteSpace($manifestVersion)) {
+			$Version = $manifestVersion
+		}
+	}
+
+	if (-not $Version) {
 	$winresPath = Join-Path $scriptRoot "winres\winres.json"
 	if (Test-Path $winresPath) {
 		$winres = Get-Content $winresPath -Raw | ConvertFrom-Json
@@ -33,6 +43,7 @@ if (-not $Version) {
 		if ($versionFromInfo) {
 			$Version = [string]$versionFromInfo
 		}
+	}
 	}
 }
 

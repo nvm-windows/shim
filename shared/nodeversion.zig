@@ -72,14 +72,14 @@ pub const ResolvedNode = struct {
 pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
     const config_hives = registry.preferenceHives();
 
-    const raw_version = try registry.queryStringWithFallback(allocator, config_hives, reg_path, reg_value_version);
+    const raw_version = registry.queryStringWithFallback(allocator, config_hives, reg_path, reg_value_version) catch |err| switch (err) {
+        error.RegistryValueNotFound => try allocator.dupe(u8, ""),
+        else => return err,
+    };
     const version = try resolver.normalizeVersionSpec(allocator, raw_version);
     allocator.free(raw_version);
 
-    const raw_root = registry.queryStringWithFallback(allocator, config_hives, reg_path, reg_value_root) catch
-        try allocator.dupe(u8, default_root);
-    const root = try expandEnv(allocator, raw_root);
-    allocator.free(raw_root);
+    const root = try loadInstallRoot(allocator);
 
     const auto_use = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_auto_use)) orelse 1;
     const auto_install = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_auto_install)) orelse 1;
@@ -136,6 +136,15 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
         .npm_module_minimum_age = npm_module_minimum_age,
         .npm_registry_fallback = npm_registry_fallback,
     };
+}
+
+pub fn loadInstallRoot(allocator: std.mem.Allocator) ![]u8 {
+    const config_hives = registry.preferenceHives();
+    const raw_root = registry.queryStringWithFallback(allocator, config_hives, reg_path, reg_value_root) catch
+        try allocator.dupe(u8, default_root);
+    defer allocator.free(raw_root);
+
+    return expandEnv(allocator, raw_root);
 }
 
 pub fn deinitConfig(allocator: std.mem.Allocator, cfg: ShimConfig) void {

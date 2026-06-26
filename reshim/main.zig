@@ -3,6 +3,7 @@ const build_options = @import("build_options");
 const windows = std.os.windows;
 const registry = @import("registry");
 const config = @import("config");
+const nodeversion = @import("nodeversion");
 const eventlog = @import("eventlog");
 
 const shim_version = build_options.version;
@@ -11,6 +12,12 @@ extern "kernel32" fn CreateHardLinkW(
     lpFileName: [*:0]const u16,
     lpExistingFileName: [*:0]const u16,
     lpSecurityAttributes: ?*anyopaque,
+) callconv(.winapi) windows.BOOL;
+
+extern "kernel32" fn CopyFileW(
+    lpExistingFileName: [*:0]const u16,
+    lpNewFileName: [*:0]const u16,
+    bFailIfExists: windows.BOOL,
 ) callconv(.winapi) windows.BOOL;
 
 pub fn main() !void {
@@ -22,6 +29,7 @@ pub fn main() !void {
 
     var force = false;
     var dry_run = false;
+    var silent = false;
     var target_version_dir: ?[]const u8 = null;
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
@@ -44,26 +52,25 @@ pub fn main() !void {
             continue;
         }
 
+        if (std.mem.eql(u8, arg, "--silent")) {
+            silent = true;
+            continue;
+        }
+
         if (target_version_dir == null) {
             target_version_dir = arg;
             continue;
         }
 
-        std.debug.print("Unknown argument: {s}\n", .{arg});
-        std.debug.print("Usage: reshim [--force] [--dry-run] [node_install_dir]\n", .{});
+        if (!silent) {
+            std.debug.print("Unknown argument: {s}\n", .{arg});
+            std.debug.print("Usage: reshim [--force] [--dry-run] [--silent] [node_install_dir]\n", .{});
+        }
         return;
     }
 
     const install_root = if (target_version_dir == null)
-        registry.queryStringWithFallback(
-            allocator,
-            registry.preferenceHives(),
-            config.preference_registry_root,
-            config.reg_value_root,
-        ) catch {
-            std.debug.print("InstallRoot=<not found>\n", .{});
-            return;
-        }
+        try nodeversion.loadInstallRoot(allocator)
     else
         try allocator.dupe(u8, std.fs.path.dirname(target_version_dir.?) orelse ".");
     defer allocator.free(install_root);
@@ -105,17 +112,26 @@ pub fn main() !void {
 
     if (cmd_names.len == 0) {
         prewarmShims(allocator, shim_dir);
-        try writeStdoutf(allocator, "All shims up to date.\n", .{});
+        try writeStdoutf(allocator, silent, "All shims up to date.\n", .{});
         return;
     }
 
-    const proxy_path = try std.fs.path.resolve(allocator, &.{ install_root, "..", "utils", "proxy.exe" });
+    const proxy_path = try std.fs.path.resolve(allocator, &.{ install_root, "..", "proxy.exe" });
     defer allocator.free(proxy_path);
 
     std.fs.accessAbsolute(proxy_path, .{}) catch {
-        prewarmShims(allocator, shim_dir);
-        std.debug.print("proxy.exe not found at {s}, cannot create shims.\n", .{proxy_path});
-        return;
+        const program_proxy_path = resolveSiblingProgramProxyPath(allocator) catch {
+            prewarmShims(allocator, shim_dir);
+            std.debug.print("proxy.exe not found at {s}, cannot create shims.\n", .{proxy_path});
+            return;
+        };
+        defer allocator.free(program_proxy_path);
+
+        copyFile(allocator, program_proxy_path, proxy_path) catch {
+            prewarmShims(allocator, shim_dir);
+            std.debug.print("proxy.exe not found at {s}, cannot create shims.\n", .{proxy_path});
+            return;
+        };
     };
 
     var linked: usize = 0;
@@ -136,23 +152,23 @@ pub fn main() !void {
                 const removed_msg = std.fmt.allocPrint(allocator, "Global module '{s}' was removed in shim mode.", .{name}) catch null;
                 if (removed_msg) |msg| {
                     defer allocator.free(msg);
-                    eventlog.write(allocator, msg);
+                    eventlog.writeInfo(allocator, "reshim", msg);
                 }
             }
             continue;
         };
-        try writeStdoutf(allocator, "  linked: {s}\n", .{link_name});
+        try writeStdoutf(allocator, silent, "  linked: {s}\n", .{link_name});
         if (!existed_before_force and shouldLogModuleEvent(name)) {
             const created_msg = std.fmt.allocPrint(allocator, "Global module '{s}' was made available in shim mode.", .{name}) catch null;
             if (created_msg) |msg| {
                 defer allocator.free(msg);
-                eventlog.write(allocator, msg);
+                eventlog.writeInfo(allocator, "reshim", msg);
             }
         }
         linked += 1;
     }
 
-    try writeStdoutf(allocator, "\nCreated {d} shim(s).\n", .{linked});
+    try writeStdoutf(allocator, silent, "\nCreated {d} shim(s).\n", .{linked});
     prewarmShims(allocator, shim_dir);
 }
 
@@ -186,13 +202,65 @@ fn createHardLink(allocator: std.mem.Allocator, link_path: []const u8, existing_
     defer allocator.free(existing_w);
 
     if (CreateHardLinkW(link_w, existing_w, null) == 0) {
-        return error.CreateHardLinkFailed;
+        if (CopyFileW(existing_w, link_w, 0) == 0) {
+            if (filesHaveSameContents(existing_path, link_path)) {
+                return;
+            }
+            return error.CreateHardLinkFailed;
+        }
+    }
+}
+
+fn filesHaveSameContents(left_path: []const u8, right_path: []const u8) bool {
+    var left = std.fs.openFileAbsolute(left_path, .{ .mode = .read_only }) catch return false;
+    defer left.close();
+
+    var right = std.fs.openFileAbsolute(right_path, .{ .mode = .read_only }) catch return false;
+    defer right.close();
+
+    const left_size = left.getEndPos() catch return false;
+    const right_size = right.getEndPos() catch return false;
+    if (left_size != right_size) return false;
+
+    var left_buf: [8192]u8 = undefined;
+    var right_buf: [8192]u8 = undefined;
+
+    while (true) {
+        const left_n = left.read(&left_buf) catch return false;
+        const right_n = right.read(&right_buf) catch return false;
+
+        if (left_n != right_n) return false;
+        if (left_n == 0) return true;
+        if (!std.mem.eql(u8, left_buf[0..left_n], right_buf[0..right_n])) return false;
+    }
+}
+
+fn resolveSiblingProgramProxyPath(allocator: std.mem.Allocator) ![]u8 {
+    const self_path = try std.fs.selfExePathAlloc(allocator);
+    defer allocator.free(self_path);
+
+    const self_dir = std.fs.path.dirname(self_path) orelse return error.ProxyExecutableNotFound;
+    const proxy_path = try std.fs.path.join(allocator, &.{ self_dir, "proxy.exe" });
+    errdefer allocator.free(proxy_path);
+
+    std.fs.accessAbsolute(proxy_path, .{}) catch return error.ProxyExecutableNotFound;
+
+    return proxy_path;
+}
+
+fn copyFile(allocator: std.mem.Allocator, source_path: []const u8, target_path: []const u8) !void {
+    const source_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, source_path);
+    defer allocator.free(source_w);
+    const target_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, target_path);
+    defer allocator.free(target_w);
+
+    if (CopyFileW(source_w, target_w, 0) == 0) {
+        return error.CopyFileFailed;
     }
 }
 
 fn deleteFileWithRetries(abs_path: []const u8) !void {
     const max_attempts: usize = 5000;
-
     var attempt: usize = 0;
     while (attempt < max_attempts) : (attempt += 1) {
         std.fs.deleteFileAbsolute(abs_path) catch |err| {
@@ -230,7 +298,8 @@ fn writeDryRunJson(allocator: std.mem.Allocator, create_names: []const []const u
     try std.fs.File.stdout().writeAll("\n");
 }
 
-fn writeStdoutf(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+fn writeStdoutf(allocator: std.mem.Allocator, silent: bool, comptime fmt: []const u8, args: anytype) !void {
+    if (silent) return;
     const msg = try std.fmt.allocPrint(allocator, fmt, args);
     defer allocator.free(msg);
     try std.fs.File.stdout().writeAll(msg);
@@ -365,7 +434,7 @@ fn reconcileShimExecutables(
             const removed_msg = std.fmt.allocPrint(allocator, "Global module '{s}' was removed in shim mode.", .{base_name}) catch null;
             if (removed_msg) |msg| {
                 defer allocator.free(msg);
-                eventlog.write(allocator, msg);
+                eventlog.writeInfo(allocator, "reshim", msg);
             }
         }
     }

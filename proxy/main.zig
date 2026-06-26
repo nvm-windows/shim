@@ -12,6 +12,7 @@ const ParsedArgs = struct {
 };
 
 const nodeNotFound = errors.nodeNotFound;
+const noActiveVersionConfigured = errors.noActiveVersionConfigured;
 const shim_version = build_options.version;
 
 pub fn main() !void {
@@ -45,7 +46,10 @@ pub fn main() !void {
     const cfg = try nodeversion.loadConfig(allocator);
     defer nodeversion.deinitConfig(allocator, cfg);
 
-    const resolved = try nodeversion.resolveConfiguredNode(allocator, cfg, parsed_args.override_version);
+    const resolved = nodeversion.resolveConfiguredNode(allocator, cfg, parsed_args.override_version) catch |err| switch (err) {
+        error.NoActiveVersion => noActiveVersionConfigured(),
+        else => return err,
+    };
     defer resolved.deinit(allocator);
 
     if (resolved.resolved_version == null) nodeNotFound(resolved.effective_version);
@@ -79,7 +83,7 @@ pub fn main() !void {
     // std.debug.print("{s}\n", .{node_install_dir});
 
     if (needs_reshim) {
-        eventlog.write(allocator, "reshim scheduled");
+        eventlog.writeInfo(allocator, "proxy", "reshim scheduled");
         runReshim(allocator, cfg.root, node_install_dir_abs);
     }
 
@@ -152,9 +156,7 @@ fn handlePackageManagerMismatchAction(
             var stderr_writer = stderr_file.writer(&stderr_buf);
             try stderr_writer.interface.print("warning: {s}\n", .{message});
             try stderr_writer.interface.flush();
-            const log_msg = try std.fmt.allocPrint(allocator, "warning: {s}", .{message});
-            defer allocator.free(log_msg);
-            eventlog.write(allocator, log_msg);
+            eventlog.writeWarning(allocator, "proxy", message);
             return true;
         },
         .@"error" => {
@@ -163,9 +165,7 @@ fn handlePackageManagerMismatchAction(
             var stderr_writer = stderr_file.writer(&stderr_buf);
             try stderr_writer.interface.print("error: {s}\n", .{message});
             try stderr_writer.interface.flush();
-            const log_msg = try std.fmt.allocPrint(allocator, "error: {s}", .{message});
-            defer allocator.free(log_msg);
-            eventlog.write(allocator, log_msg);
+            eventlog.writeError(allocator, "proxy", message);
             return false;
         },
         .ignore => return true,

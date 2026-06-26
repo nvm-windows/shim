@@ -13,3 +13,8 @@ pub fn nodeNotFound(ver: []const u8) noreturn {
     std.debug.print("Node.js v{s} is not installed or cannot be found.\n", .{display});
     std.process.exit(1);
 }
+
+pub fn noActiveVersionConfigured() noreturn {
+    std.debug.print("Please install or specify (use) a version to run.\n", .{});
+    std.process.exit(1);
+}

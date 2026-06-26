@@ -11,6 +11,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$cliManifestPath = [System.IO.Path]::GetFullPath((Join-Path $scriptRoot "..\cli\src\manifest.json"))
 $outputDir = if ([System.IO.Path]::IsPathRooted($OutputDir)) {
 	[System.IO.Path]::GetFullPath($OutputDir)
 } else {
@@ -81,6 +82,13 @@ if (Test-Path $repoLocalZigCacheDir) {
 	}
 	catch {
 		Write-Warning "Unable to remove stale local Zig cache at ${repoLocalZigCacheDir}: $($_.Exception.Message)"
+	}
+}
+
+if (-not $Version -and (Test-Path $cliManifestPath -PathType Leaf)) {
+	$cliManifest = Get-Content -LiteralPath $cliManifestPath -Raw | ConvertFrom-Json
+	if (-not [string]::IsNullOrWhiteSpace([string]$cliManifest.version)) {
+		$Version = [string]$cliManifest.version
 	}
 }
 
