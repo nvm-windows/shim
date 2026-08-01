@@ -24,6 +24,7 @@ function Get-TrimmedString {
 
 function Add-RcEditOption {
 	param(
+		[Parameter(Mandatory = $true)]
 		[System.Collections.Generic.List[string]]$Arguments,
 		[string]$Name,
 		[string]$Value
@@ -34,8 +35,24 @@ function Add-RcEditOption {
 		$Arguments.Add($Name)
 		$Arguments.Add($trimmed)
 	}
+}
 
-	return $Arguments
+function Get-WinresChild {
+	param(
+		[object]$Parent,
+		[Parameter(Mandatory = $true)]
+		[string]$Name
+	)
+
+	if ($null -eq $Parent) {
+		return $null
+	}
+
+	$prop = $Parent.PSObject.Properties[$Name]
+	if ($null -eq $prop) {
+		return $null
+	}
+	return $prop.Value
 }
 
 function Convert-ExecutionLevel {
@@ -57,7 +74,7 @@ function Convert-ExecutionLevel {
 
 function New-ApplicationManifest {
 	param(
-		[pscustomobject]$ManifestBlock,
+		[object]$ManifestBlock,
 		[string]$DestinationDir
 	)
 
@@ -65,12 +82,13 @@ function New-ApplicationManifest {
 		return $null
 	}
 
-	$identityName = Get-TrimmedString $ManifestBlock.identity.name
-	$identityVersion = Get-TrimmedString $ManifestBlock.identity.version
-	$description = Get-TrimmedString $ManifestBlock.description
-	$requestedExecutionLevel = Convert-ExecutionLevel $ManifestBlock.'execution-level'
-	$uiAccess = if ($ManifestBlock.'ui-access') { "true" } else { "false" }
-	$useCommonControls = [bool]$ManifestBlock.'use-common-controls-v6'
+	$identity = Get-WinresChild $ManifestBlock "identity"
+	$identityName = Get-TrimmedString (Get-WinresChild $identity "name")
+	$identityVersion = Get-TrimmedString (Get-WinresChild $identity "version")
+	$description = Get-TrimmedString (Get-WinresChild $ManifestBlock "description")
+	$requestedExecutionLevel = Convert-ExecutionLevel (Get-WinresChild $ManifestBlock "execution-level")
+	$uiAccess = if (Get-WinresChild $ManifestBlock "ui-access") { "true" } else { "false" }
+	$useCommonControls = [bool](Get-WinresChild $ManifestBlock "use-common-controls-v6")
 
 	if (-not $identityName -and -not $identityVersion -and -not $description -and -not $requestedExecutionLevel -and -not $useCommonControls) {
 		return $null
@@ -159,11 +177,13 @@ if (-not $resolvedRcEditPath) {
 }
 
 $winres = Get-Content -LiteralPath $resolvedWinresPath -Raw | ConvertFrom-Json
-$versionBlock = $winres.RT_VERSION.'#1'.'0000'
-$versionInfo = $versionBlock.info.'0409'
-$manifestBlock = $winres.RT_MANIFEST.'#1'.'0409'
-$iconRef = Get-TrimmedString $winres.RT_GROUP_ICON.'#1'.'0000'
-$requestedExecutionLevel = Convert-ExecutionLevel $manifestBlock.'execution-level'
+$versionBlock = Get-WinresChild (Get-WinresChild (Get-WinresChild $winres "RT_VERSION") "#1") "0000"
+$versionInfo = Get-WinresChild (Get-WinresChild $versionBlock "info") "0409"
+$manifestBlock = Get-WinresChild (Get-WinresChild (Get-WinresChild $winres "RT_MANIFEST") "#1") "0409"
+$iconRef = Get-TrimmedString (
+	Get-WinresChild (Get-WinresChild (Get-WinresChild $winres "RT_GROUP_ICON") "#1") "0000"
+)
+$requestedExecutionLevel = Convert-ExecutionLevel (Get-WinresChild $manifestBlock "execution-level")
 $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString("N"))
 
 New-Item -ItemType Directory -Path $workDir -Force | Out-Null
@@ -179,12 +199,13 @@ try {
 		}
 
 		if (Test-Path -LiteralPath $iconPath -PathType Leaf) {
-			$rcEditArgs = Add-RcEditOption -Arguments $rcEditArgs -Name "--set-icon" -Value $iconPath
+			Add-RcEditOption -Arguments $rcEditArgs -Name "--set-icon" -Value $iconPath
 		}
 	}
 
-	$rcEditArgs = Add-RcEditOption -Arguments $rcEditArgs -Name "--set-file-version" -Value (Get-TrimmedString $versionBlock.fixed.file_version)
-	$rcEditArgs = Add-RcEditOption -Arguments $rcEditArgs -Name "--set-product-version" -Value (Get-TrimmedString $versionBlock.fixed.product_version)
+	$fixed = Get-WinresChild $versionBlock "fixed"
+	Add-RcEditOption -Arguments $rcEditArgs -Name "--set-file-version" -Value (Get-TrimmedString (Get-WinresChild $fixed "file_version"))
+	Add-RcEditOption -Arguments $rcEditArgs -Name "--set-product-version" -Value (Get-TrimmedString (Get-WinresChild $fixed "product_version"))
 
 	if ($versionInfo) {
 		foreach ($property in $versionInfo.PSObject.Properties) {
@@ -200,12 +221,12 @@ try {
 	}
 
 	if ($requestedExecutionLevel) {
-		$rcEditArgs = Add-RcEditOption -Arguments $rcEditArgs -Name "--set-requested-execution-level" -Value $requestedExecutionLevel
+		Add-RcEditOption -Arguments $rcEditArgs -Name "--set-requested-execution-level" -Value $requestedExecutionLevel
 	}
 
 	$manifestPath = New-ApplicationManifest -ManifestBlock $manifestBlock -DestinationDir $workDir
 	if ($manifestPath) {
-		$rcEditArgs = Add-RcEditOption -Arguments $rcEditArgs -Name "--application-manifest" -Value $manifestPath
+		Add-RcEditOption -Arguments $rcEditArgs -Name "--application-manifest" -Value $manifestPath
 	}
 
 	& $resolvedRcEditPath @rcEditArgs
