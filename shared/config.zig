@@ -1,4 +1,6 @@
 pub const preference_registry_root = "Software\\Author Software\\Preferences\\nvm";
+pub const policy_registry_root = "Software\\Policies\\Author Software\\nvm";
+pub const reg_value_allowed_signers = "AllowedSigners";
 pub const reg_value_version = "ActiveVersion";
 pub const reg_value_root = "InstallRoot";
 pub const reg_value_auto_use = "AutoUse";
@@ -18,3 +20,14 @@ pub const reg_type_expand_sz: u32 = 2;
 pub const reg_type_dword: u32 = 4;
 pub const reg_type_multi_sz: u32 = 7;
 pub const reg_type_qword: u32 = 11;
+pub const reg_type_binary: u32 = 3;
+pub const verify_cache_subkey = "VerifyCache";
+pub const verify_dir_name = ".verify";
+pub const verify_pubkey_file = "pubkey.cer";
+pub const verify_cache_schema_version: u32 = 1;
+
+pub const default_allowed_signers = [_][]const u8{
+    "Author Software Inc.",
+    "OpenJS Foundation",
+    "Node.js Foundation",
+};

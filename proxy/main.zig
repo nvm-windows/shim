@@ -4,6 +4,8 @@ const nodeversion = @import("nodeversion");
 const resolver = @import("resolver");
 const eventlog = @import("eventlog");
 const errors = @import("errors");
+const shimintegrity = @import("shimintegrity");
+const verifycache = @import("verifycache");
 
 const ParsedArgs = struct {
     override_version: ?[]const u8,
@@ -13,6 +15,7 @@ const ParsedArgs = struct {
 
 const nodeNotFound = errors.nodeNotFound;
 const noActiveVersionConfigured = errors.noActiveVersionConfigured;
+const nodeVerifyFailed = errors.nodeVerifyFailed;
 const shim_version = build_options.version;
 
 pub fn main() !void {
@@ -38,6 +41,11 @@ pub fn main() !void {
 
     const parsed_args = try parseArgs(allocator, argv[1..]);
     defer allocator.free(parsed_args.forwarded);
+
+    shimintegrity.verifySelfIfInvokedFromShim(allocator) catch {
+        std.debug.print("shim integrity check failed\n", .{});
+        std.process.exit(1);
+    };
 
     const invoked = std.fs.path.basename(argv[0]);
     const command_name = std.fs.path.stem(invoked);
@@ -71,6 +79,20 @@ pub fn main() !void {
 
     if (!try enforcePackageManagerConstraint(allocator, cfg, resolved.version_source, command_name, resolved.node_bin.?, command_path)) {
         std.process.exit(1);
+    }
+
+    const verify_outcome = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, resolved.node_bin.?);
+    switch (verify_outcome.result) {
+        .trusted_cache, .verified_full => {},
+        .failed => {
+            const message = if (verify_outcome.reason.len == 0)
+                try std.fmt.allocPrint(allocator, "Node.js executable failed trust verification: {s}", .{resolved.node_bin.?})
+            else
+                try std.fmt.allocPrint(allocator, "Node.js trust verification failed for {s}: {s}", .{ resolved.node_bin.?, verify_outcome.reason });
+            defer allocator.free(message);
+            eventlog.writeError(allocator, "proxy", message);
+            nodeVerifyFailed(resolved.node_bin.?, verify_outcome.reason);
+        },
     }
 
     const needs_reshim = detectReshimNeeded(command_name, parsed_args.forwarded);

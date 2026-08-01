@@ -22,6 +22,9 @@ pub fn build(b: *std.Build) void {
     const errors_path = b.option([]const u8, "errors_path", "Path to errors module") orelse "shared/errors.zig";
     const resolver_path = b.option([]const u8, "resolver_path", "Path to version resolver module") orelse "shared/resolver.zig";
     const nodeversion_path = b.option([]const u8, "nodeversion_path", "Path to node version module") orelse "shared/nodeversion.zig";
+    const shimintegrity_path = b.option([]const u8, "shimintegrity_path", "Path to shim integrity module") orelse "shared/shimintegrity.zig";
+    const wintrust_path = b.option([]const u8, "wintrust_path", "Path to wintrust module") orelse "shared/wintrust.zig";
+    const verifycache_path = b.option([]const u8, "verifycache_path", "Path to verify cache module") orelse "shared/verifycache.zig";
 
     const config_module = b.createModule(.{
         .root_source_file = b.path(config_path),
@@ -51,6 +54,40 @@ pub fn build(b: *std.Build) void {
     nodeversion_module.addImport("registry", registry_module);
     nodeversion_module.addImport("resolver", resolver_module);
 
+    const shimintegrity_module = b.createModule(.{
+        .root_source_file = b.path(shimintegrity_path),
+        .target = target,
+        .optimize = optimize,
+    });
+    shimintegrity_module.addImport("nodeversion", nodeversion_module);
+
+    const wintrust_module = b.createModule(.{
+        .root_source_file = b.path(wintrust_path),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const verifycache_module = b.createModule(.{
+        .root_source_file = b.path(verifycache_path),
+        .target = target,
+        .optimize = optimize,
+    });
+    verifycache_module.addImport("config", config_module);
+    verifycache_module.addImport("registry", registry_module);
+    verifycache_module.addImport("wintrust", wintrust_module);
+
+    const verifycache_tests = b.addTest(.{
+        .root_module = verifycache_module,
+    });
+    verifycache_tests.root_module.linkSystemLibrary("bcrypt", .{});
+    verifycache_tests.root_module.linkSystemLibrary("kernel32", .{});
+    verifycache_tests.root_module.linkSystemLibrary("advapi32", .{});
+    verifycache_tests.root_module.linkSystemLibrary("crypt32", .{});
+    verifycache_tests.root_module.linkSystemLibrary("wintrust", .{});
+    const run_verifycache_tests = b.addRunArtifact(verifycache_tests);
+    const test_step = b.step("test", "Run verify cache unit tests");
+    test_step.dependOn(&run_verifycache_tests.step);
+
     const exe = b.addExecutable(.{
         .name = app,
         .root_module = b.createModule(.{
@@ -69,6 +106,16 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("config", config_module);
     exe.root_module.addImport("resolver", resolver_module);
     exe.root_module.addImport("nodeversion", nodeversion_module);
+    exe.root_module.addImport("shimintegrity", shimintegrity_module);
+
+    if (std.mem.eql(u8, app, "node") or std.mem.eql(u8, app, "proxy")) {
+        exe.root_module.addImport("verifycache", verifycache_module);
+        exe.root_module.linkSystemLibrary("bcrypt", .{});
+        exe.root_module.linkSystemLibrary("kernel32", .{});
+        exe.root_module.linkSystemLibrary("advapi32", .{});
+        exe.root_module.linkSystemLibrary("crypt32", .{});
+        exe.root_module.linkSystemLibrary("wintrust", .{});
+    }
 
     exe.root_module.addImport("errors", b.createModule(.{
         .root_source_file = b.path(errors_path),

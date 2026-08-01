@@ -1,0 +1,5 @@
+v1
+c:\nvm\installs\v22\node.exe
+12345
+9876543210
+ABCD1234

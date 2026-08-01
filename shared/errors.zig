@@ -18,3 +18,12 @@ pub fn noActiveVersionConfigured() noreturn {
     std.debug.print("Please install or specify (use) a version to run.\n", .{});
     std.process.exit(1);
 }
+
+pub fn nodeVerifyFailed(node_bin: []const u8, reason: []const u8) noreturn {
+    if (reason.len == 0) {
+        std.debug.print("Node.js executable failed trust verification: {s}\n", .{node_bin});
+    } else {
+        std.debug.print("Node.js executable failed trust verification: {s} ({s})\n", .{ node_bin, reason });
+    }
+    std.process.exit(1);
+}

@@ -4,6 +4,8 @@ const registry = @import("registry");
 const nodeversion = @import("nodeversion");
 const eventlog = @import("eventlog");
 const errors = @import("errors");
+const shimintegrity = @import("shimintegrity");
+const verifycache = @import("verifycache");
 
 const shim_version = build_options.version;
 
@@ -16,6 +18,7 @@ const ParsedArgs = struct {
 
 const nodeNotFound = errors.nodeNotFound;
 const noActiveVersionConfigured = errors.noActiveVersionConfigured;
+const nodeVerifyFailed = errors.nodeVerifyFailed;
 
 fn operationCancelled() noreturn {
     std.debug.print("operation cancelled\n", .{});
@@ -32,6 +35,11 @@ pub fn main() !void {
 
     const parsed_args = try parseArgs(allocator, args[1..]);
     defer allocator.free(parsed_args.forwarded);
+
+    shimintegrity.verifySelfIfInvokedFromShim(allocator) catch {
+        std.debug.print("shim integrity check failed\n", .{});
+        std.process.exit(1);
+    };
 
     if (parsed_args.show_shim_version) {
         var stdout_file = std.fs.File.stdout();
@@ -98,6 +106,20 @@ pub fn main() !void {
             .Arguments = arguments,
             .WorkingDirectory = working_directory,
         });
+    }
+
+    const verify_outcome = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, resolved.node_bin.?);
+    switch (verify_outcome.result) {
+        .trusted_cache, .verified_full => {},
+        .failed => {
+            const message = if (verify_outcome.reason.len == 0)
+                try std.fmt.allocPrint(allocator, "Node.js executable failed trust verification: {s}", .{resolved.node_bin.?})
+            else
+                try std.fmt.allocPrint(allocator, "Node.js trust verification failed for {s}: {s}", .{ resolved.node_bin.?, verify_outcome.reason });
+            defer allocator.free(message);
+            eventlog.writeError(allocator, "node-shim", message);
+            nodeVerifyFailed(resolved.node_bin.?, verify_outcome.reason);
+        },
     }
 
     if (parsed_args.forwarded.len == 0) {
@@ -249,6 +271,16 @@ test "parseMultiStringUtf16 returns trimmed string entries" {
     try std.testing.expectEqual(@as(usize, 2), values.len);
     try std.testing.expectEqualStrings("stable=24.9.0", values[0]);
     try std.testing.expectEqualStrings("nightly=25.0.0", values[1]);
+}
+
+test "parseArgs accepts nvm-which after forwarded args" {
+    const allocator = std.testing.allocator;
+    const parsed = try parseArgs(allocator, &.{ "--version", "--nvm-which" });
+    defer allocator.free(parsed.forwarded);
+
+    try std.testing.expect(parsed.nvm_use_debug);
+    try std.testing.expectEqual(@as(usize, 1), parsed.forwarded.len);
+    try std.testing.expectEqualStrings("--version", parsed.forwarded[0]);
 }
 
 test "parseArgs detects nvm shim version flag" {

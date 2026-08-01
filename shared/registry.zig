@@ -178,6 +178,47 @@ pub fn queryDwordOptional(hive: windows.HKEY, sub_key: []const u8, value_name: [
     return value;
 }
 
+pub fn queryBinaryOptional(allocator: std.mem.Allocator, hive: windows.HKEY, sub_key: []const u8, value_name: []const u8) !?[]u8 {
+    const sub_key_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, sub_key);
+    defer allocator.free(sub_key_w);
+    const value_name_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, value_name);
+    defer allocator.free(value_name_w);
+
+    var hkey: windows.HKEY = undefined;
+    const rc_open = windows.advapi32.RegOpenKeyExW(hive, sub_key_w, 0, windows.KEY_QUERY_VALUE, &hkey);
+    if (rc_open != 0) return null;
+    defer _ = windows.advapi32.RegCloseKey(hkey);
+
+    var data_type: windows.DWORD = 0;
+    var buf_len: windows.DWORD = 0;
+
+    const rc_size = windows.advapi32.RegQueryValueExW(
+        hkey,
+        value_name_w,
+        null,
+        &data_type,
+        null,
+        &buf_len,
+    );
+    if (rc_size != 0 or data_type != config.reg_type_binary) return null;
+    if (buf_len == 0) return try allocator.alloc(u8, 0);
+
+    const buf = try allocator.alloc(u8, buf_len);
+    errdefer allocator.free(buf);
+
+    const rc_query = windows.advapi32.RegQueryValueExW(
+        hkey,
+        value_name_w,
+        null,
+        &data_type,
+        @ptrCast(buf.ptr),
+        &buf_len,
+    );
+    if (rc_query != 0 or data_type != config.reg_type_binary) return null;
+
+    return buf[0..buf_len];
+}
+
 pub fn queryQwordOptional(hive: windows.HKEY, sub_key: []const u8, value_name: []const u8) !?u64 {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

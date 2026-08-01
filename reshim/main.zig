@@ -5,6 +5,7 @@ const registry = @import("registry");
 const config = @import("config");
 const nodeversion = @import("nodeversion");
 const eventlog = @import("eventlog");
+const shimintegrity = @import("shimintegrity");
 
 const shim_version = build_options.version;
 
@@ -99,7 +100,13 @@ pub fn main() !void {
         planned_removals.deinit(allocator);
     }
 
-    cmd_names = try reconcileShimExecutables(allocator, shim_dir, cmd_names, force, dry_run, &planned_removals);
+    const proxy_path = try std.fs.path.resolve(allocator, &.{ install_root, "..", "proxy.exe" });
+    defer allocator.free(proxy_path);
+
+    const program_node_shim = shimintegrity.resolveProgramNodeShimPath(allocator) catch null;
+    defer if (program_node_shim) |path| allocator.free(path);
+
+    cmd_names = try reconcileShimExecutables(allocator, shim_dir, proxy_path, program_node_shim, cmd_names, force, dry_run, &planned_removals);
     defer freeNameList(allocator, cmd_names);
 
     if (dry_run) {
@@ -115,9 +122,6 @@ pub fn main() !void {
         try writeStdoutf(allocator, silent, "All shims up to date.\n", .{});
         return;
     }
-
-    const proxy_path = try std.fs.path.resolve(allocator, &.{ install_root, "..", "proxy.exe" });
-    defer allocator.free(proxy_path);
 
     std.fs.accessAbsolute(proxy_path, .{}) catch {
         const program_proxy_path = resolveSiblingProgramProxyPath(allocator) catch {
@@ -203,35 +207,11 @@ fn createHardLink(allocator: std.mem.Allocator, link_path: []const u8, existing_
 
     if (CreateHardLinkW(link_w, existing_w, null) == 0) {
         if (CopyFileW(existing_w, link_w, 0) == 0) {
-            if (filesHaveSameContents(existing_path, link_path)) {
+            if (shimintegrity.filesHaveSameContents(existing_path, link_path)) {
                 return;
             }
             return error.CreateHardLinkFailed;
         }
-    }
-}
-
-fn filesHaveSameContents(left_path: []const u8, right_path: []const u8) bool {
-    var left = std.fs.openFileAbsolute(left_path, .{ .mode = .read_only }) catch return false;
-    defer left.close();
-
-    var right = std.fs.openFileAbsolute(right_path, .{ .mode = .read_only }) catch return false;
-    defer right.close();
-
-    const left_size = left.getEndPos() catch return false;
-    const right_size = right.getEndPos() catch return false;
-    if (left_size != right_size) return false;
-
-    var left_buf: [8192]u8 = undefined;
-    var right_buf: [8192]u8 = undefined;
-
-    while (true) {
-        const left_n = left.read(&left_buf) catch return false;
-        const right_n = right.read(&right_buf) catch return false;
-
-        if (left_n != right_n) return false;
-        if (left_n == 0) return true;
-        if (!std.mem.eql(u8, left_buf[0..left_n], right_buf[0..right_n])) return false;
     }
 }
 
@@ -329,6 +309,8 @@ fn appendJsonEscaped(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(
 fn reconcileShimExecutables(
     allocator: std.mem.Allocator,
     shim_dir: []const u8,
+    proxy_path: []const u8,
+    program_node_shim: ?[]const u8,
     cmd_names: []const []const u8,
     force: bool,
     dry_run: bool,
@@ -360,6 +342,19 @@ fn reconcileShimExecutables(
     defer {
         for (removals.items) |candidate| allocator.free(candidate.file_name);
         removals.deinit(allocator);
+    }
+
+    const node_shim_path = try std.fs.path.join(allocator, &.{ shim_dir, "node.exe" });
+    defer allocator.free(node_shim_path);
+    if (program_node_shim) |canonical_node| {
+        if (std.fs.accessAbsolute(node_shim_path, .{})) {
+            if (!shimintegrity.filesHaveSameContents(node_shim_path, canonical_node)) {
+                try removals.append(allocator, .{
+                    .file_name = try allocator.dupe(u8, "node.exe"),
+                    .log_module_removed = false,
+                });
+            }
+        } else |_| {}
     }
 
     for (cmd_names) |name| {
@@ -397,10 +392,21 @@ fn reconcileShimExecutables(
         _ = std.ascii.lowerString(key, key);
 
         if (live.contains(key)) {
-            if (force) {
+            const shim_path = try std.fs.path.join(allocator, &.{ shim_dir, entry.name });
+            defer allocator.free(shim_path);
+
+            if (force or !shimintegrity.filesHaveSameContents(shim_path, proxy_path)) {
+                if (force) {
+                    try removals.append(allocator, .{
+                        .file_name = try allocator.dupe(u8, entry.name),
+                        .log_module_removed = false,
+                    });
+                    continue;
+                }
+
                 try removals.append(allocator, .{
                     .file_name = try allocator.dupe(u8, entry.name),
-                    .log_module_removed = false,
+                    .log_module_removed = shouldLogModuleEvent(base_name),
                 });
                 continue;
             }
