@@ -11,4 +11,5 @@ zig-out
 *.ps1
 !build.ps1
 !scripts/apply-winres.ps1
+!scripts/Export-ZigBuildSbom.ps1
 bin

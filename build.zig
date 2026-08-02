@@ -1,4 +1,5 @@
 const std = @import("std");
+const zig_build_sbom = @import("zig_build_sbom");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -130,4 +131,23 @@ pub fn build(b: *std.Build) void {
     }));
 
     b.installArtifact(exe);
+
+    // CycloneDX 1.6 via zig-build-sbom (compile graph + build.zig.zon).
+    // Reachable with `zig build sbom` (does not block default install).
+    // Note: zig-build-sbom 0.1.0 can emit invalid UTF-8 in source_url on Windows
+    // (https://github.com/OrlovEvgeny/zig-build-sbom/issues/1);
+    // shim/scripts/Export-ZigBuildSbom.ps1 sanitizes + finishes export.
+    _ = zig_build_sbom.addSbomStep(b, exe, .{
+        .format = .cyclonedx_json,
+        .output_path = b.fmt("{s}.cdx.json", .{app}),
+        .version = version,
+        .manufacturer = .{
+            .name = "Author Software Inc.",
+            .url = "https://author.io",
+        },
+        .include_c_sources = true,
+        .include_transitive = true,
+        .infer_licenses = true,
+        .strict_purl = true,
+    });
 }

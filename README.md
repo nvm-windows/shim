@@ -12,12 +12,18 @@ This repo contains several required executables for full Node.js verison managem
 
 # Building from Source
 
-This application uses a custom build.zig file shared across the shim directories.
+This application uses a custom build.zig file shared across the shim directories, plus `build.zig.zon` (package identity; **no remote product deps** — first-party modules + Zig std + Windows system libs). Build-tool dep: [zig-build-sbom](https://github.com/OrlovEvgeny/zig-build-sbom) for CycloneDX (`zig build sbom`; see `scripts/Export-ZigBuildSbom.ps1`).
 
 **Build All**
 
 ```powershell
 .\build.ps1 -Architecture amd64/arm64
+```
+
+**Export shim SBOM (CycloneDX)**
+
+```powershell
+.\scripts\Export-ZigBuildSbom.ps1 -App node -OutputPath .\node.cdx.json -Version 2.0.0-alpha.1
 ```
 
 **Build Node Shim**
