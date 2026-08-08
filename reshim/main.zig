@@ -9,6 +9,9 @@ const shimintegrity = @import("shimintegrity");
 
 const shim_version = build_options.version;
 
+// Marks shim names parked aside because the running image blocked deletion.
+const stale_shim_marker = ".nvm-retired-";
+
 extern "kernel32" fn CreateHardLinkW(
     lpFileName: [*:0]const u16,
     lpExistingFileName: [*:0]const u16,
@@ -86,6 +89,10 @@ pub fn main() !void {
         existing_before_force.deinit();
     }
 
+    if (!dry_run) {
+        sweepRetiredShims(allocator, shim_dir);
+    }
+
     if (force) {
         try collectExistingShimNames(allocator, shim_dir, &existing_before_force);
     }
@@ -151,7 +158,11 @@ pub fn main() !void {
         defer allocator.free(link_path);
 
         createHardLink(allocator, link_path, proxy_path) catch |err| {
-            std.debug.print("  failed {s}: {}\n", .{ link_name, err });
+            if (err == error.ShimFileInUse) {
+                std.debug.print("  failed {s}: in use by a running process (close it, then run 'nvm reshim --force')\n", .{link_name});
+            } else {
+                std.debug.print("  failed {s}: {}\n", .{ link_name, err });
+            }
             if (existed_before_force) {
                 const removed_msg = std.fmt.allocPrint(allocator, "Global module '{s}' was removed in shim mode.", .{name}) catch null;
                 if (removed_msg) |msg| {
@@ -207,10 +218,14 @@ fn createHardLink(allocator: std.mem.Allocator, link_path: []const u8, existing_
 
     if (CreateHardLinkW(link_w, existing_w, null) == 0) {
         if (CopyFileW(existing_w, link_w, 0) == 0) {
+            const copy_error = windows.GetLastError();
             if (shimintegrity.filesHaveSameContents(existing_path, link_path)) {
                 return;
             }
-            return error.CreateHardLinkFailed;
+            return switch (copy_error) {
+                .SHARING_VIOLATION, .ACCESS_DENIED, .USER_MAPPED_FILE => error.ShimFileInUse,
+                else => error.CreateHardLinkFailed,
+            };
         }
     }
 }
@@ -240,16 +255,60 @@ fn copyFile(allocator: std.mem.Allocator, source_path: []const u8, target_path: 
 }
 
 fn deleteFileWithRetries(abs_path: []const u8) !void {
-    const max_attempts: usize = 5000;
+    const max_attempts: usize = 50;
     var attempt: usize = 0;
     while (attempt < max_attempts) : (attempt += 1) {
         std.fs.deleteFileAbsolute(abs_path) catch |err| {
             if (err == error.AccessDenied and attempt + 1 < max_attempts) {
+                std.Thread.sleep(5 * std.time.ns_per_ms);
                 continue;
             }
             return err;
         };
         return;
+    }
+}
+
+// Windows refuses to delete the last remaining hardlink to an image mapped by a
+// running process, so a stale shim left over from a proxy upgrade can never be
+// replaced while anything launched through it is alive. Renaming is still
+// allowed, so park the name aside and sweep it on a later run.
+fn retireStaleShim(allocator: std.mem.Allocator, shim_dir: []const u8, file_name: []const u8) !void {
+    const stamp: u64 = @intCast(std.time.nanoTimestamp() & 0xFFFFFFFFFFFF);
+    const retired_name = try std.fmt.allocPrint(allocator, "{s}{s}{x}", .{
+        file_name,
+        stale_shim_marker,
+        stamp,
+    });
+    defer allocator.free(retired_name);
+
+    const from_path = try std.fs.path.join(allocator, &.{ shim_dir, file_name });
+    defer allocator.free(from_path);
+    const to_path = try std.fs.path.join(allocator, &.{ shim_dir, retired_name });
+    defer allocator.free(to_path);
+
+    try std.fs.renameAbsolute(from_path, to_path);
+}
+
+fn sweepRetiredShims(allocator: std.mem.Allocator, shim_dir: []const u8) void {
+    var shim = std.fs.openDirAbsolute(shim_dir, .{ .iterate = true }) catch return;
+    defer shim.close();
+
+    var retired = std.ArrayListUnmanaged([]const u8){};
+    defer {
+        for (retired.items) |name| allocator.free(name);
+        retired.deinit(allocator);
+    }
+
+    var iter = shim.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.indexOf(u8, entry.name, stale_shim_marker) == null) continue;
+        retired.append(allocator, allocator.dupe(u8, entry.name) catch continue) catch continue;
+    }
+
+    for (retired.items) |name| {
+        shim.deleteFile(name) catch continue;
     }
 }
 
@@ -382,6 +441,7 @@ fn reconcileShimExecutables(
     var iter = shim.iterate();
     while (try iter.next()) |entry| {
         if (entry.kind != .file) continue;
+        if (std.mem.indexOf(u8, entry.name, stale_shim_marker) != null) continue;
         if (!std.ascii.endsWithIgnoreCase(entry.name, ".exe")) continue;
         if (std.ascii.eqlIgnoreCase(entry.name, "node.exe")) continue;
         if (entry.name.len <= 4) continue;
@@ -432,7 +492,10 @@ fn reconcileShimExecutables(
         defer allocator.free(remove_path);
 
         deleteFileWithRetries(remove_path) catch {
-            continue;
+            retireStaleShim(allocator, shim_dir, candidate.file_name) catch |err| {
+                std.debug.print("  failed to replace {s}: {}\n", .{ candidate.file_name, err });
+                continue;
+            };
         };
 
         if (candidate.log_module_removed and candidate.file_name.len > 4) {
@@ -611,6 +674,7 @@ fn collectExistingShimNames(allocator: std.mem.Allocator, shim_dir: []const u8, 
     var iter = shim.iterate();
     while (try iter.next()) |entry| {
         if (entry.kind != .file) continue;
+        if (std.mem.indexOf(u8, entry.name, stale_shim_marker) != null) continue;
         if (!std.ascii.endsWithIgnoreCase(entry.name, ".exe")) continue;
         if (std.ascii.eqlIgnoreCase(entry.name, "node.exe")) continue;
         if (entry.name.len <= 4) continue;
