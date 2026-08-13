@@ -1,9 +1,11 @@
 const std = @import("std");
+const windows = std.os.windows;
 const registry = @import("registry");
 const config = @import("config");
 const resolver = @import("resolver");
 
 const reg_path = config.preference_registry_root;
+const policy_path = config.policy_registry_root;
 const reg_value_version = config.reg_value_version;
 const reg_value_root = config.reg_value_root;
 const reg_value_auto_use = config.reg_value_auto_use;
@@ -12,12 +14,17 @@ const reg_value_auto_install_prompt = config.reg_value_auto_install_prompt;
 const reg_value_auto_detect = config.reg_value_auto_detect;
 const reg_value_aliases = config.reg_value_aliases;
 const reg_value_log_executions = config.reg_value_log_executions;
+const reg_value_enforce_permission_model = config.reg_value_enforce_permission_model;
 const reg_value_package_manager_mismatch_action = config.reg_value_package_manager_mismatch_action;
 const reg_value_npm_module_minimum_age = config.reg_value_npm_module_minimum_age;
 const reg_value_npm_mirror = config.reg_value_npm_mirror;
 const reg_nvm_cmd_path = config.reg_nvm_cmd_path;
 const default_root = config.default_install_root;
 const default_auto_detect = config.default_auto_detect;
+
+const policy_hives = [_]windows.HKEY{
+    windows.HKEY_LOCAL_MACHINE,
+};
 
 pub const PackageManagerMismatchAction = enum {
     ignore,
@@ -34,6 +41,7 @@ pub const ShimConfig = struct {
     auto_detect: []const []const u8,
     aliases: []const []const u8,
     log_executions: bool,
+    enforce_permission_model: bool,
     package_manager_mismatch_action: PackageManagerMismatchAction,
     npm_module_minimum_age: ?u64,
     npm_registry_fallback: ?[]u8,
@@ -100,6 +108,7 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
     const aliases = (try registry.queryMultiStringOptionalWithFallback(allocator, config_hives, reg_path, reg_value_aliases)) orelse
         try allocator.alloc([]const u8, 0);
     const log_executions = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_log_executions)) orelse 0;
+    const enforce_permission_model = try loadEnforcePermissionModel(config_hives);
     const npm_registry_fallback = try loadFirstConfiguredRegistryValue(allocator, config_hives, reg_path, reg_value_npm_mirror);
     const npm_module_minimum_age = age: {
         if (try registry.queryQwordOptionalWithFallback(config_hives, reg_path, reg_value_npm_module_minimum_age)) |value| {
@@ -132,10 +141,22 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
         .auto_detect = auto_detect,
         .aliases = aliases,
         .log_executions = log_executions != 0,
+        .enforce_permission_model = enforce_permission_model,
         .package_manager_mismatch_action = package_manager_mismatch_action,
         .npm_module_minimum_age = npm_module_minimum_age,
         .npm_registry_fallback = npm_registry_fallback,
     };
+}
+
+fn loadEnforcePermissionModel(config_hives: []const windows.HKEY) !bool {
+    // HKLM policy wins (ADMX); then machine/user preferences (nvm config).
+    if (try registry.queryDwordOptionalWithFallback(&policy_hives, policy_path, reg_value_enforce_permission_model)) |value| {
+        return value != 0;
+    }
+    if (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_enforce_permission_model)) |value| {
+        return value != 0;
+    }
+    return false;
 }
 
 pub fn loadInstallRoot(allocator: std.mem.Allocator) ![]u8 {

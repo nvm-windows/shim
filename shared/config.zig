@@ -9,6 +9,7 @@ pub const reg_value_auto_install_prompt = "AutoInstallPrompt";
 pub const reg_value_auto_detect = "AutoDetect";
 pub const reg_value_aliases = "Aliases";
 pub const reg_value_log_executions = "LogExecutions";
+pub const reg_value_enforce_permission_model = "EnforcePermissionModel";
 pub const reg_value_package_manager_mismatch_action = "PackageManagerMismatchAction";
 pub const reg_value_npm_module_minimum_age = "NpmModuleMinimumAge";
 pub const reg_value_npm_mirror = "MirrorNpm";
