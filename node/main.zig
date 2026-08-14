@@ -123,11 +123,11 @@ pub fn main() !void {
     }
 
     if (parsed_args.forwarded.len == 0) {
-        try runNode(allocator, resolved.node_bin.?, resolved.resolved_version.?, cfg.enforce_permission_model, &.{}, true);
+        try runNode(allocator, resolved.node_bin.?, resolved.resolved_version.?, cfg, &.{}, true);
         return;
     }
 
-    try runNode(allocator, resolved.node_bin.?, resolved.resolved_version.?, cfg.enforce_permission_model, parsed_args.forwarded, false);
+    try runNode(allocator, resolved.node_bin.?, resolved.resolved_version.?, cfg, parsed_args.forwarded, false);
 }
 
 fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs {
@@ -212,6 +212,13 @@ fn nodeMajorVersion(version: []const u8) u32 {
     return std.fmt.parseInt(u32, bare[0..dot], 10) catch 0;
 }
 
+fn forwardedHasExactFlag(forwarded: []const []const u8, flag: []const u8) bool {
+    for (forwarded) |arg| {
+        if (std.mem.eql(u8, arg, flag)) return true;
+    }
+    return false;
+}
+
 fn alreadyHasPermissionFlag(forwarded: []const []const u8) bool {
     for (forwarded) |arg| {
         if (std.mem.eql(u8, arg, "--permission") or
@@ -238,11 +245,42 @@ fn permissionFlag(version: []const u8, enforce: bool, forwarded: []const []const
     return "--experimental-permission";
 }
 
+fn collectSecurityFlags(
+    allocator: std.mem.Allocator,
+    version: []const u8,
+    cfg: nodeversion.ShimConfig,
+    forwarded: []const []const u8,
+) ![]const []const u8 {
+    var flags = std.ArrayListUnmanaged([]const u8){};
+    errdefer flags.deinit(allocator);
+
+    if (permissionFlag(version, cfg.enforce_permission_model, forwarded)) |flag| {
+        try flags.append(allocator, flag);
+    }
+
+    // --frozen-intrinsics added in Node.js v11.12.0
+    if (cfg.freeze_v8_global_objects and
+        nodeMajorVersion(version) >= 12 and
+        !forwardedHasExactFlag(forwarded, "--frozen-intrinsics"))
+    {
+        try flags.append(allocator, "--frozen-intrinsics");
+    }
+
+    // --disallow-code-generation-from-strings added in Node.js v9.8.0 (always available for supported NVM versions)
+    if (cfg.disable_eval_and_string_execution and
+        !forwardedHasExactFlag(forwarded, "--disallow-code-generation-from-strings"))
+    {
+        try flags.append(allocator, "--disallow-code-generation-from-strings");
+    }
+
+    return try flags.toOwnedSlice(allocator);
+}
+
 fn runNode(
     allocator: std.mem.Allocator,
     node_bin: []const u8,
     version: []const u8,
-    enforce_permission_model: bool,
+    cfg: nodeversion.ShimConfig,
     forwarded: []const []const u8,
     force_repl_console: bool,
 ) !void {
@@ -257,14 +295,18 @@ fn runNode(
 
     try env_map.put("PATH", child_path);
 
-    const perm_flag = permissionFlag(version, enforce_permission_model, if (force_repl_console) &.{} else forwarded);
-    const extra: usize = if (perm_flag != null) 1 else 0;
+    const security_forwarded = if (force_repl_console) &.{} else forwarded;
+    const security_flags = try collectSecurityFlags(allocator, version, cfg, security_forwarded);
+    defer allocator.free(security_flags);
+    const extra = security_flags.len;
 
     if (force_repl_console) {
         var base_argv = try allocator.alloc([]const u8, 2 + extra);
         defer allocator.free(base_argv);
         base_argv[0] = node_bin;
-        if (perm_flag) |f| base_argv[1] = f;
+        for (security_flags, 0..) |f, i| {
+            base_argv[1 + i] = f;
+        }
         base_argv[1 + extra] = "-i";
         var child = std.process.Child.init(base_argv, allocator);
         child.stdin_behavior = .Inherit;
@@ -279,7 +321,9 @@ fn runNode(
     var argv = try allocator.alloc([]const u8, forwarded.len + 1 + extra);
     defer allocator.free(argv);
     argv[0] = node_bin;
-    if (perm_flag) |f| argv[1] = f;
+    for (security_flags, 0..) |f, i| {
+        argv[1 + i] = f;
+    }
     for (forwarded, 0..) |a, i| {
         argv[1 + extra + i] = a;
     }

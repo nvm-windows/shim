@@ -15,6 +15,8 @@ const reg_value_auto_detect = config.reg_value_auto_detect;
 const reg_value_aliases = config.reg_value_aliases;
 const reg_value_log_executions = config.reg_value_log_executions;
 const reg_value_enforce_permission_model = config.reg_value_enforce_permission_model;
+const reg_value_freeze_v8_global_objects = config.reg_value_freeze_v8_global_objects;
+const reg_value_disable_eval_and_string_execution = config.reg_value_disable_eval_and_string_execution;
 const reg_value_package_manager_mismatch_action = config.reg_value_package_manager_mismatch_action;
 const reg_value_npm_module_minimum_age = config.reg_value_npm_module_minimum_age;
 const reg_value_npm_mirror = config.reg_value_npm_mirror;
@@ -42,6 +44,8 @@ pub const ShimConfig = struct {
     aliases: []const []const u8,
     log_executions: bool,
     enforce_permission_model: bool,
+    freeze_v8_global_objects: bool,
+    disable_eval_and_string_execution: bool,
     package_manager_mismatch_action: PackageManagerMismatchAction,
     npm_module_minimum_age: ?u64,
     npm_registry_fallback: ?[]u8,
@@ -108,7 +112,9 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
     const aliases = (try registry.queryMultiStringOptionalWithFallback(allocator, config_hives, reg_path, reg_value_aliases)) orelse
         try allocator.alloc([]const u8, 0);
     const log_executions = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_log_executions)) orelse 0;
-    const enforce_permission_model = try loadEnforcePermissionModel(config_hives);
+    const enforce_permission_model = try loadPolicyOrPrefBool(config_hives, reg_value_enforce_permission_model);
+    const freeze_v8_global_objects = try loadPolicyOrPrefBool(config_hives, reg_value_freeze_v8_global_objects);
+    const disable_eval_and_string_execution = try loadPolicyOrPrefBool(config_hives, reg_value_disable_eval_and_string_execution);
     const npm_registry_fallback = try loadFirstConfiguredRegistryValue(allocator, config_hives, reg_path, reg_value_npm_mirror);
     const npm_module_minimum_age = age: {
         if (try registry.queryQwordOptionalWithFallback(config_hives, reg_path, reg_value_npm_module_minimum_age)) |value| {
@@ -142,18 +148,20 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
         .aliases = aliases,
         .log_executions = log_executions != 0,
         .enforce_permission_model = enforce_permission_model,
+        .freeze_v8_global_objects = freeze_v8_global_objects,
+        .disable_eval_and_string_execution = disable_eval_and_string_execution,
         .package_manager_mismatch_action = package_manager_mismatch_action,
         .npm_module_minimum_age = npm_module_minimum_age,
         .npm_registry_fallback = npm_registry_fallback,
     };
 }
 
-fn loadEnforcePermissionModel(config_hives: []const windows.HKEY) !bool {
+fn loadPolicyOrPrefBool(config_hives: []const windows.HKEY, value_name: []const u8) !bool {
     // HKLM policy wins (ADMX); then machine/user preferences (nvm config).
-    if (try registry.queryDwordOptionalWithFallback(&policy_hives, policy_path, reg_value_enforce_permission_model)) |value| {
+    if (try registry.queryDwordOptionalWithFallback(&policy_hives, policy_path, value_name)) |value| {
         return value != 0;
     }
-    if (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_enforce_permission_model)) |value| {
+    if (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, value_name)) |value| {
         return value != 0;
     }
     return false;
