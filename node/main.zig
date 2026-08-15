@@ -123,11 +123,11 @@ pub fn main() !void {
     }
 
     if (parsed_args.forwarded.len == 0) {
-        try runNode(allocator, resolved.node_bin.?, &.{}, true);
+        try runNode(allocator, resolved.node_bin.?, resolved.resolved_version.?, cfg, &.{}, true);
         return;
     }
 
-    try runNode(allocator, resolved.node_bin.?, parsed_args.forwarded, false);
+    try runNode(allocator, resolved.node_bin.?, resolved.resolved_version.?, cfg, parsed_args.forwarded, false);
 }
 
 fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs {
@@ -206,7 +206,84 @@ fn confirmAutoInstall(allocator: std.mem.Allocator, version: []const u8) !bool {
     return false;
 }
 
-fn runNode(allocator: std.mem.Allocator, node_bin: []const u8, forwarded: []const []const u8, force_repl_console: bool) !void {
+fn nodeMajorVersion(version: []const u8) u32 {
+    const bare = if (version.len > 0 and (version[0] == 'v' or version[0] == 'V')) version[1..] else version;
+    const dot = std.mem.indexOfScalar(u8, bare, '.') orelse bare.len;
+    return std.fmt.parseInt(u32, bare[0..dot], 10) catch 0;
+}
+
+fn forwardedHasExactFlag(forwarded: []const []const u8, flag: []const u8) bool {
+    for (forwarded) |arg| {
+        if (std.mem.eql(u8, arg, flag)) return true;
+    }
+    return false;
+}
+
+fn alreadyHasPermissionFlag(forwarded: []const []const u8) bool {
+    for (forwarded) |arg| {
+        if (std.mem.eql(u8, arg, "--permission") or
+            std.mem.eql(u8, arg, "--experimental-permission") or
+            std.mem.eql(u8, arg, "--permission-audit") or
+            std.mem.startsWith(u8, arg, "--permission=") or
+            std.mem.startsWith(u8, arg, "--experimental-permission="))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Returns the Node permission-model enable flag for this runtime version, or null.
+/// Node < 20: unsupported. 20–22: experimental. 23+: stable `--permission`.
+fn permissionFlag(version: []const u8, enforce: bool, forwarded: []const []const u8) ?[]const u8 {
+    if (!enforce) return null;
+    if (alreadyHasPermissionFlag(forwarded)) return null;
+
+    const major = nodeMajorVersion(version);
+    if (major < 20) return null;
+    if (major >= 23) return "--permission";
+    return "--experimental-permission";
+}
+
+fn collectSecurityFlags(
+    allocator: std.mem.Allocator,
+    version: []const u8,
+    cfg: nodeversion.ShimConfig,
+    forwarded: []const []const u8,
+) ![]const []const u8 {
+    var flags = std.ArrayListUnmanaged([]const u8){};
+    errdefer flags.deinit(allocator);
+
+    if (permissionFlag(version, cfg.enforce_permission_model, forwarded)) |flag| {
+        try flags.append(allocator, flag);
+    }
+
+    // --frozen-intrinsics added in Node.js v11.12.0
+    if (cfg.freeze_v8_global_objects and
+        nodeMajorVersion(version) >= 12 and
+        !forwardedHasExactFlag(forwarded, "--frozen-intrinsics"))
+    {
+        try flags.append(allocator, "--frozen-intrinsics");
+    }
+
+    // --disallow-code-generation-from-strings added in Node.js v9.8.0 (always available for supported NVM versions)
+    if (cfg.disable_eval_and_string_execution and
+        !forwardedHasExactFlag(forwarded, "--disallow-code-generation-from-strings"))
+    {
+        try flags.append(allocator, "--disallow-code-generation-from-strings");
+    }
+
+    return try flags.toOwnedSlice(allocator);
+}
+
+fn runNode(
+    allocator: std.mem.Allocator,
+    node_bin: []const u8,
+    version: []const u8,
+    cfg: nodeversion.ShimConfig,
+    forwarded: []const []const u8,
+    force_repl_console: bool,
+) !void {
     const node_dir = std.fs.path.dirname(node_bin) orelse ".";
 
     var env_map = try std.process.getEnvMap(allocator);
@@ -217,8 +294,21 @@ fn runNode(allocator: std.mem.Allocator, node_bin: []const u8, forwarded: []cons
     defer allocator.free(child_path);
 
     try env_map.put("PATH", child_path);
+
+    const security_forwarded = if (force_repl_console) &.{} else forwarded;
+    const security_flags = try collectSecurityFlags(allocator, version, cfg, security_forwarded);
+    defer allocator.free(security_flags);
+    const extra = security_flags.len;
+
     if (force_repl_console) {
-        var child = std.process.Child.init(&.{ node_bin, "-i" }, allocator);
+        var base_argv = try allocator.alloc([]const u8, 2 + extra);
+        defer allocator.free(base_argv);
+        base_argv[0] = node_bin;
+        for (security_flags, 0..) |f, i| {
+            base_argv[1 + i] = f;
+        }
+        base_argv[1 + extra] = "-i";
+        var child = std.process.Child.init(base_argv, allocator);
         child.stdin_behavior = .Inherit;
         child.stdout_behavior = .Inherit;
         child.stderr_behavior = .Inherit;
@@ -228,11 +318,14 @@ fn runNode(allocator: std.mem.Allocator, node_bin: []const u8, forwarded: []cons
         return;
     }
 
-    var argv = try allocator.alloc([]const u8, forwarded.len + 1);
+    var argv = try allocator.alloc([]const u8, forwarded.len + 1 + extra);
     defer allocator.free(argv);
     argv[0] = node_bin;
+    for (security_flags, 0..) |f, i| {
+        argv[1 + i] = f;
+    }
     for (forwarded, 0..) |a, i| {
-        argv[i + 1] = a;
+        argv[1 + extra + i] = a;
     }
 
     var child = std.process.Child.init(argv, allocator);
