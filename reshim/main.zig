@@ -6,6 +6,7 @@ const config = @import("config");
 const nodeversion = @import("nodeversion");
 const eventlog = @import("eventlog");
 const shimintegrity = @import("shimintegrity");
+const jobobject = @import("jobobject");
 
 const shim_version = build_options.version;
 
@@ -26,6 +27,7 @@ extern "kernel32" fn CopyFileW(
 
 pub fn main() !void {
     _ = eventlog;
+    jobobject.bindKillOnCloseJob();
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

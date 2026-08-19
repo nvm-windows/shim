@@ -650,6 +650,9 @@ fn runReshim(allocator: std.mem.Allocator, install_root: []const u8, node_instal
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
 
+    // Detached on purpose: npm/yarn global install already finished; reshim
+    // must outlive proxy.exe. reshim.exe binds a kill-on-close job so its
+    // own children cannot leak after it exits.
     child.spawn() catch return;
 }
 

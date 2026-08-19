@@ -26,6 +26,7 @@ pub fn build(b: *std.Build) void {
     const shimintegrity_path = b.option([]const u8, "shimintegrity_path", "Path to shim integrity module") orelse "shared/shimintegrity.zig";
     const wintrust_path = b.option([]const u8, "wintrust_path", "Path to wintrust module") orelse "shared/wintrust.zig";
     const verifycache_path = b.option([]const u8, "verifycache_path", "Path to verify cache module") orelse "shared/verifycache.zig";
+    const jobobject_path = b.option([]const u8, "jobobject_path", "Path to job object module") orelse "shared/jobobject.zig";
 
     const config_module = b.createModule(.{
         .root_source_file = b.path(config_path),
@@ -108,6 +109,15 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("resolver", resolver_module);
     exe.root_module.addImport("nodeversion", nodeversion_module);
     exe.root_module.addImport("shimintegrity", shimintegrity_module);
+
+    if (std.mem.eql(u8, app, "reshim")) {
+        exe.root_module.addImport("jobobject", b.createModule(.{
+            .root_source_file = b.path(jobobject_path),
+            .target = target,
+            .optimize = optimize,
+        }));
+        exe.root_module.linkSystemLibrary("kernel32", .{});
+    }
 
     if (std.mem.eql(u8, app, "node") or std.mem.eql(u8, app, "proxy")) {
         exe.root_module.addImport("verifycache", verifycache_module);
