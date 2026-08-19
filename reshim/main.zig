@@ -125,21 +125,21 @@ pub fn main() !void {
     // std.debug.print("ShimDir={s}\n", .{shim_dir});
 
     if (cmd_names.len == 0) {
-        prewarmShims(allocator, shim_dir);
+        prewarmShims(allocator, shim_dir, silent);
         try writeStdoutf(allocator, silent, "All shims up to date.\n", .{});
         return;
     }
 
     std.fs.accessAbsolute(proxy_path, .{}) catch {
         const program_proxy_path = resolveSiblingProgramProxyPath(allocator) catch {
-            prewarmShims(allocator, shim_dir);
+            prewarmShims(allocator, shim_dir, silent);
             std.debug.print("proxy.exe not found at {s}, cannot create shims.\n", .{proxy_path});
             return;
         };
         defer allocator.free(program_proxy_path);
 
         copyFile(allocator, program_proxy_path, proxy_path) catch {
-            prewarmShims(allocator, shim_dir);
+            prewarmShims(allocator, shim_dir, silent);
             std.debug.print("proxy.exe not found at {s}, cannot create shims.\n", .{proxy_path});
             return;
         };
@@ -184,10 +184,15 @@ pub fn main() !void {
     }
 
     try writeStdoutf(allocator, silent, "\nCreated {d} shim(s).\n", .{linked});
-    prewarmShims(allocator, shim_dir);
+    prewarmShims(allocator, shim_dir, silent);
 }
 
-fn prewarmShims(allocator: std.mem.Allocator, shim_dir: []const u8) void {
+fn prewarmShims(allocator: std.mem.Allocator, shim_dir: []const u8, silent: bool) void {
+    // --silent is every nvm.exe bootstrap + nvm use. Spawning node -v without
+    // waiting leaves installs\vX\node.exe mapped, so nvm rm of the default
+    // version hits unlinkat Access is denied. Skip here; Go PrewarmVerifyCache
+    // still signs the HKCU verify cache after reshim.
+    if (silent) return;
     runPrewarmCommand(allocator, shim_dir, "npm");
     runPrewarmCommand(allocator, shim_dir, "node");
 }
@@ -206,8 +211,8 @@ fn runPrewarmCommand(allocator: std.mem.Allocator, shim_dir: []const u8, command
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
 
-    // Fire-and-forget: spawn but don't wait so nvm use returns immediately.
     child.spawn() catch return;
+    _ = child.wait() catch return;
 }
 
 fn createHardLink(allocator: std.mem.Allocator, link_path: []const u8, existing_path: []const u8) !void {
