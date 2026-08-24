@@ -343,6 +343,76 @@ pub fn autoInstallVersion(allocator: std.mem.Allocator, version: []const u8) !vo
     try runNvmCommand(allocator, &.{ "install", version });
 }
 
+pub const EnsureInstalledNodeError = error{
+    NodeNotFound,
+    AutoInstallCancelled,
+    AutoInstallFailed,
+};
+
+/// Prompt/auto-install when the resolved Node is missing (shim + proxy).
+/// Updates `resolved` in place. Caller maps NodeNotFound / AutoInstallCancelled to UI exits.
+pub fn ensureInstalledNode(
+    allocator: std.mem.Allocator,
+    cfg: ShimConfig,
+    override_version: ?[]const u8,
+    resolved: *ResolvedNode,
+) EnsureInstalledNodeError!void {
+    if (resolved.resolved_version == null) {
+        try autoInstallMissing(allocator, cfg, override_version, resolved, resolved.effective_version);
+        if (resolved.resolved_version == null) return error.NodeNotFound;
+    }
+
+    if (resolved.node_bin == null) {
+        const version = resolved.resolved_version orelse return error.NodeNotFound;
+        try autoInstallMissing(allocator, cfg, override_version, resolved, version);
+        if (resolved.node_bin == null) return error.NodeNotFound;
+    }
+}
+
+fn autoInstallMissing(
+    allocator: std.mem.Allocator,
+    cfg: ShimConfig,
+    override_version: ?[]const u8,
+    resolved: *ResolvedNode,
+    version: []const u8,
+) EnsureInstalledNodeError!void {
+    if (!cfg.auto_install or override_version != null) return error.NodeNotFound;
+    if (cfg.auto_install_prompt) {
+        const ok = confirmAutoInstall(allocator, version) catch return error.AutoInstallFailed;
+        if (!ok) return error.AutoInstallCancelled;
+    }
+
+    const install_version = allocator.dupe(u8, version) catch return error.AutoInstallFailed;
+    defer allocator.free(install_version);
+
+    autoInstallVersion(allocator, install_version) catch return error.AutoInstallFailed;
+    const next = resolveConfiguredNode(allocator, cfg, override_version) catch return error.AutoInstallFailed;
+    resolved.deinit(allocator);
+    resolved.* = next;
+}
+
+fn confirmAutoInstall(allocator: std.mem.Allocator, version: []const u8) !bool {
+    const prompt = try std.fmt.allocPrint(allocator, "Node.js v{s} is not installed. Install now? [Y/n]: ", .{version});
+    defer allocator.free(prompt);
+
+    std.debug.print("{s}", .{prompt});
+
+    var stdin_file = std.fs.File.stdin();
+    var read_buf: [256]u8 = undefined;
+    var reader = stdin_file.reader(&read_buf);
+    const raw_line: []const u8 = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+        error.EndOfStream => "",
+        else => return err,
+    };
+    const line = std.mem.trim(u8, raw_line, " \t\r\n");
+
+    if (line.len == 0) return true;
+    if (std.ascii.eqlIgnoreCase(line, "y") or std.ascii.eqlIgnoreCase(line, "yes")) return true;
+    if (std.ascii.eqlIgnoreCase(line, "n") or std.ascii.eqlIgnoreCase(line, "no")) return false;
+
+    return false;
+}
+
 pub fn shouldCheckPackageManagerMismatch(source: []const u8, action: PackageManagerMismatchAction) bool {
     if (action == .ignore) return false;
     return std.ascii.eqlIgnoreCase(source, "package.json") or std.ascii.eqlIgnoreCase(source, "package-lock.json");

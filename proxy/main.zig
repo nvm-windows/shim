@@ -54,14 +54,20 @@ pub fn main() !void {
     const cfg = try nodeversion.loadConfig(allocator);
     defer nodeversion.deinitConfig(allocator, cfg);
 
-    const resolved = nodeversion.resolveConfiguredNode(allocator, cfg, parsed_args.override_version) catch |err| switch (err) {
+    var resolved = nodeversion.resolveConfiguredNode(allocator, cfg, parsed_args.override_version) catch |err| switch (err) {
         error.NoActiveVersion => noActiveVersionConfigured(),
         else => return err,
     };
     defer resolved.deinit(allocator);
 
-    if (resolved.resolved_version == null) nodeNotFound(resolved.effective_version);
-    if (resolved.node_bin == null) nodeNotFound(resolved.resolved_version.?);
+    nodeversion.ensureInstalledNode(allocator, cfg, parsed_args.override_version, &resolved) catch |err| switch (err) {
+        error.NodeNotFound => nodeNotFound(resolved.resolved_version orelse resolved.effective_version),
+        error.AutoInstallCancelled => {
+            std.debug.print("operation cancelled\n", .{});
+            std.process.exit(1);
+        },
+        error.AutoInstallFailed => return err,
+    };
 
     if (parsed_args.nvm_use_debug) {
         std.debug.print(

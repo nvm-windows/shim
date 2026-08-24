@@ -59,27 +59,11 @@ pub fn main() !void {
     };
     defer resolved.deinit(allocator);
 
-    if (resolved.resolved_version == null) {
-        if (!cfg.auto_install or parsed_args.override_version != null) nodeNotFound(resolved.effective_version);
-        if (cfg.auto_install_prompt and !try confirmAutoInstall(allocator, resolved.effective_version)) operationCancelled();
-
-        const install_version = resolved.effective_version;
-        resolved.deinit(allocator);
-        try nodeversion.autoInstallVersion(allocator, install_version);
-        resolved = try nodeversion.resolveConfiguredNode(allocator, cfg, parsed_args.override_version);
-        if (resolved.resolved_version == null) nodeNotFound(resolved.effective_version);
-    }
-
-    if (resolved.node_bin == null) {
-        if (!cfg.auto_install or parsed_args.override_version != null) nodeNotFound(resolved.resolved_version.?);
-        if (cfg.auto_install_prompt and !try confirmAutoInstall(allocator, resolved.resolved_version.?)) operationCancelled();
-
-        const install_version = resolved.resolved_version.?;
-        resolved.deinit(allocator);
-        try nodeversion.autoInstallVersion(allocator, install_version);
-        resolved = try nodeversion.resolveConfiguredNode(allocator, cfg, parsed_args.override_version);
-        if (resolved.node_bin == null) nodeNotFound(resolved.resolved_version.?);
-    }
+    nodeversion.ensureInstalledNode(allocator, cfg, parsed_args.override_version, &resolved) catch |err| switch (err) {
+        error.NodeNotFound => nodeNotFound(resolved.resolved_version orelse resolved.effective_version),
+        error.AutoInstallCancelled => operationCancelled(),
+        error.AutoInstallFailed => return err,
+    };
 
     if (parsed_args.nvm_use_debug) {
         std.debug.print(
@@ -182,28 +166,6 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
         .show_shim_version = show_shim_version,
         .forwarded = try forwarded.toOwnedSlice(allocator),
     };
-}
-
-fn confirmAutoInstall(allocator: std.mem.Allocator, version: []const u8) !bool {
-    const prompt = try std.fmt.allocPrint(allocator, "Node.js v{s} is not installed. Install now? [Y/n]: ", .{version});
-    defer allocator.free(prompt);
-
-    std.debug.print("{s}", .{prompt});
-
-    var stdin_file = std.fs.File.stdin();
-    var read_buf: [256]u8 = undefined;
-    var reader = stdin_file.reader(&read_buf);
-    const raw_line: []const u8 = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
-        error.EndOfStream => "",
-        else => return err,
-    };
-    const line = std.mem.trim(u8, raw_line, " \t\r\n");
-
-    if (line.len == 0) return true;
-    if (std.ascii.eqlIgnoreCase(line, "y") or std.ascii.eqlIgnoreCase(line, "yes")) return true;
-    if (std.ascii.eqlIgnoreCase(line, "n") or std.ascii.eqlIgnoreCase(line, "no")) return false;
-
-    return false;
 }
 
 fn nodeMajorVersion(version: []const u8) u32 {

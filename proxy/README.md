@@ -1,6 +1,8 @@
 # Proxy Shim
 
-A lightweight proxy executable built in Zig. It forwards npm, npx, and other global module commands to the active Node.js install.
+A lightweight proxy executable built in Zig. It forwards npm, npx, yarn, pnpm, and other global module commands to the active Node.js install.
+
+When `auto_install` is enabled, missing auto-detected Node versions prompt/install the same way as `node.exe` (including `npm` / `npx` / `yarn` / `pnpm`).
 
 The proxy accepts the same shim flags as `node.exe` (`--nvm-use`, `--nvm-which`, `--nvm-shim-version`). See [node/README.md](../node/README.md) for details.
 
