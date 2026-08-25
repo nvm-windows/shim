@@ -19,6 +19,25 @@ const Win32FileAttributeData = extern struct {
     nFileSizeLow: windows.DWORD,
 };
 
+const ByHandleFileInformation = extern struct {
+    dwFileAttributes: windows.DWORD,
+    ftCreationTime: windows.FILETIME,
+    ftLastAccessTime: windows.FILETIME,
+    ftLastWriteTime: windows.FILETIME,
+    dwVolumeSerialNumber: windows.DWORD,
+    nFileSizeHigh: windows.DWORD,
+    nFileSizeLow: windows.DWORD,
+    nNumberOfLinks: windows.DWORD,
+    nFileIndexHigh: windows.DWORD,
+    nFileIndexLow: windows.DWORD,
+};
+
+const fsctl_read_file_usn_data: u32 = 0x000900eb;
+const ReadFileUsnData = extern struct {
+    min_major_version: u16,
+    max_major_version: u16,
+};
+
 const bcrypt = struct {
     pub extern "bcrypt" fn BCryptOpenAlgorithmProvider(
         phAlgorithm: *windows.HANDLE,
@@ -63,6 +82,22 @@ const kernel32 = struct {
         fInfoLevelId: u32,
         lpFileInformation: *Win32FileAttributeData,
     ) callconv(.winapi) windows.BOOL;
+
+    pub extern "kernel32" fn GetFileInformationByHandle(
+        hFile: windows.HANDLE,
+        lpFileInformation: *ByHandleFileInformation,
+    ) callconv(.winapi) windows.BOOL;
+
+    pub extern "kernel32" fn DeviceIoControl(
+        hDevice: windows.HANDLE,
+        dwIoControlCode: u32,
+        lpInBuffer: ?*const anyopaque,
+        nInBufferSize: u32,
+        lpOutBuffer: ?*anyopaque,
+        nOutBufferSize: u32,
+        lpBytesReturned: *u32,
+        lpOverlapped: ?*anyopaque,
+    ) callconv(.winapi) windows.BOOL;
 };
 
 pub const VerifyResult = enum {
@@ -71,9 +106,18 @@ pub const VerifyResult = enum {
     failed,
 };
 
+pub const CacheStatus = enum {
+    none,
+    path_changed,
+    metadata_changed,
+    identity_changed,
+    signature_invalid,
+};
+
 pub const VerifyOutcome = struct {
     result: VerifyResult,
     reason: []const u8 = "",
+    cache_status: CacheStatus = .none,
     reason_storage: [512]u8 = undefined,
 
     pub fn failedStatic(comptime message: []const u8) VerifyOutcome {
@@ -91,17 +135,28 @@ const NodeFileTimes = struct {
     mtime: u64,
 };
 
+const FileSecurityState = struct {
+    volume_serial: u32,
+    file_id: u64,
+    usn: u64,
+};
+
 const CacheEntry = struct {
     path: []u8,
     size: i64,
     mtime: u64,
     thumbprint: []u8,
+    digest: []u8,
+    volume_serial: u32,
+    file_id: u64,
+    usn: u64,
     sig: []u8,
     version: u32,
 
     pub fn deinit(self: CacheEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
         allocator.free(self.thumbprint);
+        allocator.free(self.digest);
         allocator.free(self.sig);
     }
 };
@@ -149,6 +204,73 @@ fn duplicateAllowedSigners(allocator: std.mem.Allocator, signers: []const []cons
     return out;
 }
 
+fn queryConfigString(allocator: std.mem.Allocator, value_name: []const u8) ?[]u8 {
+    if (registry.queryStringWithFallback(allocator, policy_hives, config.policy_registry_root, value_name)) |value| {
+        return value;
+    } else |_| {}
+    if (registry.queryStringWithFallback(allocator, registry.preferenceHives(), config.preference_registry_root, value_name)) |value| {
+        return value;
+    } else |_| {}
+    return null;
+}
+
+fn isAirGapped() bool {
+    if (registry.queryDwordOptionalWithFallback(policy_hives, config.policy_registry_root, config.reg_value_air_gapped) catch null) |value| {
+        return value != 0;
+    }
+    if (registry.queryDwordOptionalWithFallback(registry.preferenceHives(), config.preference_registry_root, config.reg_value_air_gapped) catch null) |value| {
+        return value != 0;
+    }
+    return false;
+}
+
+/// Shim runtime revocation: never online (latency invariant). Default mirrors seed (online→cached).
+pub fn loadRuntimeRevocationMode(allocator: std.mem.Allocator) wintrust.RevocationMode {
+    var mode: wintrust.RevocationMode = .online;
+    if (queryConfigString(allocator, config.reg_value_authenticode_revocation)) |raw| {
+        defer allocator.free(raw);
+        mode = wintrust.parseRevocationMode(raw);
+    }
+    if (isAirGapped() and mode == .online) {
+        mode = .cached;
+    }
+    return wintrust.clampRuntimeRevocationMode(mode);
+}
+
+pub fn loadAllowedThumbprints(allocator: std.mem.Allocator) ![]const []const u8 {
+    if (registry.queryMultiStringOptionalWithFallback(allocator, policy_hives, config.policy_registry_root, config.reg_value_allowed_thumbprints) catch null) |pins| {
+        if (pins.len > 0) return try normalizeThumbprintList(allocator, pins);
+        freeAllowedSigners(allocator, pins);
+    }
+    if (registry.queryMultiStringOptionalWithFallback(allocator, registry.preferenceHives(), config.preference_registry_root, config.reg_value_allowed_thumbprints) catch null) |pins| {
+        if (pins.len > 0) return try normalizeThumbprintList(allocator, pins);
+        freeAllowedSigners(allocator, pins);
+    }
+    return try allocator.alloc([]const u8, 0);
+}
+
+fn normalizeThumbprintList(allocator: std.mem.Allocator, pins: []const []const u8) ![]const []const u8 {
+    defer freeAllowedSigners(allocator, pins);
+    var out = try allocator.alloc([]const u8, pins.len);
+    errdefer freeAllowedSigners(allocator, out);
+    var n: usize = 0;
+    for (pins) |pin| {
+        const normalized = try wintrust.normalizeThumbprint(allocator, pin);
+        if (normalized.len == 0) {
+            allocator.free(normalized);
+            continue;
+        }
+        out[n] = normalized;
+        n += 1;
+    }
+    if (n == out.len) return out;
+    return try allocator.realloc(out, n);
+}
+
+pub fn freeAllowedThumbprints(allocator: std.mem.Allocator, pins: []const []const u8) void {
+    freeAllowedSigners(allocator, pins);
+}
+
 pub fn ensureResolvedNodeTrusted(
     allocator: std.mem.Allocator,
     install_root: []const u8,
@@ -182,7 +304,7 @@ pub fn ensureNodeTrusted(
         else => return VerifyOutcome.failedStatic("unable to read Node.js executable metadata"),
     };
 
-    const pubkey = loadPublicKey(allocator, data_root) catch {
+    const pubkey = loadTrustedPublicKey(allocator, data_root) catch {
         return runFullVerify(allocator, node_exe_path, allowed_signers);
     };
     defer allocator.free(pubkey);
@@ -206,29 +328,48 @@ pub fn ensureNodeTrusted(
     defer allocator.free(normalized);
 
     if (!pathsEqual(normalized, entry.path)) {
-        return runFullVerify(allocator, node_exe_path, allowed_signers);
+        return runFullVerifyAfterCacheChange(allocator, node_exe_path, allowed_signers, .path_changed);
     }
     if (entry.size != stat.size or entry.mtime != stat.mtime) {
-        return runFullVerify(allocator, node_exe_path, allowed_signers);
+        return runFullVerifyAfterCacheChange(allocator, node_exe_path, allowed_signers, .metadata_changed);
     }
     if (entry.version != config.verify_cache_schema_version) {
         return runFullVerify(allocator, node_exe_path, allowed_signers);
     }
 
-    const payload = canonicalPayload(allocator, node_exe_path, stat.size, stat.mtime, entry.thumbprint) catch {
+    const live_state = nodeFileSecurityState(node_exe_path) catch {
+        return runFullVerify(allocator, node_exe_path, allowed_signers);
+    };
+    if (live_state.volume_serial != entry.volume_serial or
+        live_state.file_id != entry.file_id or
+        live_state.usn != entry.usn)
+    {
+        return runFullVerifyAfterCacheChange(allocator, node_exe_path, allowed_signers, .identity_changed);
+    }
+
+    const payload = canonicalPayload(
+        allocator,
+        node_exe_path,
+        stat.size,
+        stat.mtime,
+        entry.thumbprint,
+        entry.digest,
+        live_state,
+    ) catch {
         return VerifyOutcome.failedStatic("unable to build verify-cache payload");
     };
     defer allocator.free(payload);
 
     verifyCacheSignature(pubkey, payload, entry.sig) catch {
-        return runFullVerify(allocator, node_exe_path, allowed_signers);
+        return runFullVerifyAfterCacheChange(allocator, node_exe_path, allowed_signers, .signature_invalid);
     };
 
     return .{ .result = .trusted_cache };
 }
 
 fn runFullVerify(allocator: std.mem.Allocator, node_exe_path: []const u8, allowed_signers: ?[]const []const u8) VerifyOutcome {
-    wintrust.verifyAuthenticodeChain(node_exe_path) catch {
+    const mode = loadRuntimeRevocationMode(allocator);
+    wintrust.verifyAuthenticodeChain(node_exe_path, mode) catch {
         return VerifyOutcome.failedStatic("authenticode signature verification failed");
     };
 
@@ -251,7 +392,34 @@ fn runFullVerify(allocator: std.mem.Allocator, node_exe_path: []const u8, allowe
         return outcome;
     }
 
+    const pins = loadAllowedThumbprints(allocator) catch {
+        return VerifyOutcome.failedStatic("unable to load allowed thumbprints");
+    };
+    defer freeAllowedThumbprints(allocator, pins);
+    if (pins.len > 0) {
+        const thumb = wintrust.signerThumbprint(allocator, node_exe_path) catch null orelse {
+            return VerifyOutcome.failedStatic("unable to resolve signer thumbprint");
+        };
+        defer allocator.free(thumb);
+        if (!wintrust.isAllowedThumbprint(thumb, pins)) {
+            var outcome = VerifyOutcome{ .result = .failed };
+            outcome.setReason("signer thumbprint \"{s}\" is not pinned", .{thumb});
+            return outcome;
+        }
+    }
+
     return .{ .result = .verified_full };
+}
+
+fn runFullVerifyAfterCacheChange(
+    allocator: std.mem.Allocator,
+    node_exe_path: []const u8,
+    allowed_signers: ?[]const []const u8,
+    cache_status: CacheStatus,
+) VerifyOutcome {
+    var outcome = runFullVerify(allocator, node_exe_path, allowed_signers);
+    outcome.cache_status = cache_status;
+    return outcome;
 }
 
 fn formatAllowedSigners(allocator: std.mem.Allocator, allowed: []const []const u8) ![]u8 {
@@ -310,7 +478,15 @@ fn encodeHexLower(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     return out;
 }
 
-pub fn canonicalPayload(allocator: std.mem.Allocator, path: []const u8, size: i64, mtime: u64, thumbprint: []const u8) ![]u8 {
+pub fn canonicalPayload(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    size: i64,
+    mtime: u64,
+    thumbprint: []const u8,
+    digest: []const u8,
+    state: FileSecurityState,
+) ![]u8 {
     const normalized = try normalizeNodePath(allocator, path);
     defer allocator.free(normalized);
 
@@ -322,12 +498,37 @@ pub fn canonicalPayload(allocator: std.mem.Allocator, path: []const u8, size: i6
     defer allocator.free(upper_thumb_buf);
     for (upper_thumb_buf) |*c| c.* = std.ascii.toUpper(c.*);
 
-    return std.fmt.allocPrint(allocator, "v1\n{s}\n{d}\n{d}\n{s}", .{
+    const lower_digest_buf = try allocator.dupe(u8, std.mem.trim(u8, digest, " \t\r\n"));
+    defer allocator.free(lower_digest_buf);
+    for (lower_digest_buf) |*c| c.* = std.ascii.toLower(c.*);
+
+    return std.fmt.allocPrint(allocator, "v3\n{s}\n{d}\n{d}\n{s}\n{s}\n{d}\n{d}\n{d}", .{
         lower_buf,
         size,
         mtime,
         upper_thumb_buf,
+        lower_digest_buf,
+        state.volume_serial,
+        state.file_id,
+        state.usn,
     });
+}
+
+pub fn fileSha256Hex(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var file = try std.fs.openFileAbsolute(path, .{ .mode = .read_only });
+    defer file.close();
+
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const count = try file.read(&buffer);
+        if (count == 0) break;
+        hash.update(buffer[0..count]);
+    }
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hash.final(&digest);
+    return encodeHexLower(allocator, &digest);
 }
 
 pub fn verifyCacheSignature(public_key_blob: []const u8, payload: []const u8, signature: []const u8) !void {
@@ -385,6 +586,41 @@ pub fn nodeFileTimes(path: []const u8) !NodeFileTimes {
     return .{ .size = size, .mtime = mtime };
 }
 
+pub fn nodeFileSecurityState(path: []const u8) !FileSecurityState {
+    var file = try std.fs.openFileAbsolute(path, .{ .mode = .read_only });
+    defer file.close();
+
+    var info: ByHandleFileInformation = undefined;
+    if (kernel32.GetFileInformationByHandle(file.handle, &info) == 0) {
+        return error.FileSecurityStateUnavailable;
+    }
+
+    var output: [512]u64 = undefined;
+    const output_bytes = std.mem.asBytes(&output);
+    var returned: u32 = 0;
+    var input = ReadFileUsnData{ .min_major_version = 2, .max_major_version = 2 };
+    if (kernel32.DeviceIoControl(
+        file.handle,
+        fsctl_read_file_usn_data,
+        &input,
+        @sizeOf(ReadFileUsnData),
+        &output,
+        @sizeOf(@TypeOf(output)),
+        &returned,
+        null,
+    ) == 0 or returned < 32) {
+        return error.FileSecurityStateUnavailable;
+    }
+    const major_version = std.mem.readInt(u16, output_bytes[4..6], .little);
+    if (major_version != 2) return error.FileSecurityStateUnavailable;
+
+    return .{
+        .volume_serial = info.dwVolumeSerialNumber,
+        .file_id = std.mem.readInt(u64, output_bytes[8..16], .little),
+        .usn = std.mem.readInt(u64, output_bytes[24..32], .little),
+    };
+}
+
 pub fn loadPublicKey(allocator: std.mem.Allocator, data_root: []const u8) ![]u8 {
     const pubkey_path = try std.fs.path.join(allocator, &.{ data_root, config.verify_dir_name, config.verify_pubkey_file });
     defer allocator.free(pubkey_path);
@@ -403,6 +639,36 @@ pub fn loadPublicKey(allocator: std.mem.Allocator, data_root: []const u8) ![]u8 
     return blob;
 }
 
+/// DI-01 C: accept pubkey.cer only when SHA-256 matches pubkey.sha256 from NCrypt export.
+pub fn loadTrustedPublicKey(allocator: std.mem.Allocator, data_root: []const u8) ![]u8 {
+    const blob = try loadPublicKey(allocator, data_root);
+    errdefer allocator.free(blob);
+
+    const fp_path = try std.fs.path.join(allocator, &.{ data_root, config.verify_dir_name, config.verify_pubkey_fingerprint_file });
+    defer allocator.free(fp_path);
+
+    var fp_file = std.fs.openFileAbsolute(fp_path, .{}) catch {
+        return error.PublicKeyFingerprintMismatch;
+    };
+    defer fp_file.close();
+
+    const fp_raw = fp_file.readToEndAlloc(allocator, 128) catch {
+        return error.PublicKeyFingerprintMismatch;
+    };
+    defer allocator.free(fp_raw);
+
+    const want = std.mem.trim(u8, fp_raw, " \t\r\n");
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(blob, &digest, .{});
+    const got = try encodeHexLower(allocator, &digest);
+    defer allocator.free(got);
+
+    if (!std.ascii.eqlIgnoreCase(want, got)) {
+        return error.PublicKeyFingerprintMismatch;
+    }
+    return blob;
+}
+
 fn loadCacheEntry(allocator: std.mem.Allocator, cache_key: []const u8) !?CacheEntry {
     const sub_key = try std.fmt.allocPrint(allocator, "{s}\\{s}\\{s}", .{
         config.preference_registry_root,
@@ -410,7 +676,21 @@ fn loadCacheEntry(allocator: std.mem.Allocator, cache_key: []const u8) !?CacheEn
         cache_key,
     });
     defer allocator.free(sub_key);
+    return loadCacheEntryAt(allocator, sub_key, true);
+}
 
+fn loadScriptCacheEntry(allocator: std.mem.Allocator, cache_key: []const u8) !?CacheEntry {
+    const sub_key = try std.fmt.allocPrint(allocator, "{s}\\{s}\\{s}\\{s}", .{
+        config.preference_registry_root,
+        config.verify_cache_subkey,
+        config.verify_script_cache_subkey,
+        cache_key,
+    });
+    defer allocator.free(sub_key);
+    return loadCacheEntryAt(allocator, sub_key, false);
+}
+
+fn loadCacheEntryAt(allocator: std.mem.Allocator, sub_key: []const u8, require_thumbprint: bool) !?CacheEntry {
     const hive = windows.HKEY_CURRENT_USER;
 
     const path = registry.queryString(allocator, hive, sub_key, "Path") catch return null;
@@ -434,20 +714,51 @@ fn loadCacheEntry(allocator: std.mem.Allocator, cache_key: []const u8) !?CacheEn
         return null;
     };
 
-    const thumbprint = registry.queryString(allocator, hive, sub_key, "Thumbprint") catch {
+    const thumbprint = if (require_thumbprint)
+        registry.queryString(allocator, hive, sub_key, "Thumbprint") catch {
+            allocator.free(path);
+            return null;
+        }
+    else
+        try allocator.dupe(u8, "");
+    errdefer allocator.free(thumbprint);
+
+    const digest = registry.queryString(allocator, hive, sub_key, "Digest") catch {
         allocator.free(path);
+        allocator.free(thumbprint);
         return null;
     };
-    errdefer allocator.free(thumbprint);
+    errdefer allocator.free(digest);
+
+    const volume_serial = registry.queryDwordOptional(hive, sub_key, "VolumeSerial") catch null orelse {
+        allocator.free(path);
+        allocator.free(thumbprint);
+        allocator.free(digest);
+        return null;
+    };
+    const file_id = registry.queryQwordOptional(hive, sub_key, "FileID") catch null orelse {
+        allocator.free(path);
+        allocator.free(thumbprint);
+        allocator.free(digest);
+        return null;
+    };
+    const usn = registry.queryQwordOptional(hive, sub_key, "USN") catch null orelse {
+        allocator.free(path);
+        allocator.free(thumbprint);
+        allocator.free(digest);
+        return null;
+    };
 
     const sig = registry.queryBinaryOptional(allocator, hive, sub_key, "Sig") catch null orelse {
         allocator.free(path);
         allocator.free(thumbprint);
+        allocator.free(digest);
         return null;
     };
     if (sig.len == 0) {
         allocator.free(path);
         allocator.free(thumbprint);
+        allocator.free(digest);
         allocator.free(sig);
         return null;
     }
@@ -455,6 +766,7 @@ fn loadCacheEntry(allocator: std.mem.Allocator, cache_key: []const u8) !?CacheEn
     const version = registry.queryDwordOptional(hive, sub_key, "Version") catch null orelse {
         allocator.free(path);
         allocator.free(thumbprint);
+        allocator.free(digest);
         allocator.free(sig);
         return null;
     };
@@ -464,9 +776,120 @@ fn loadCacheEntry(allocator: std.mem.Allocator, cache_key: []const u8) !?CacheEn
         .size = size.?,
         .mtime = mtime,
         .thumbprint = thumbprint,
+        .digest = digest,
+        .volume_serial = volume_serial,
+        .file_id = file_id,
+        .usn = usn,
         .sig = sig,
         .version = version,
     };
+}
+
+pub fn canonicalScriptPayload(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    size: i64,
+    mtime: u64,
+    digest: []const u8,
+    state: FileSecurityState,
+) ![]u8 {
+    const normalized = try normalizeNodePath(allocator, path);
+    defer allocator.free(normalized);
+
+    const lower_buf = try allocator.dupe(u8, normalized);
+    defer allocator.free(lower_buf);
+    for (lower_buf) |*c| c.* = std.ascii.toLower(c.*);
+
+    const lower_digest_buf = try allocator.dupe(u8, std.mem.trim(u8, digest, " \t\r\n"));
+    defer allocator.free(lower_digest_buf);
+    for (lower_digest_buf) |*c| c.* = std.ascii.toLower(c.*);
+
+    return std.fmt.allocPrint(allocator, "v1-script\n{s}\n{d}\n{d}\n{s}\n{d}\n{d}\n{d}", .{
+        lower_buf,
+        size,
+        mtime,
+        lower_digest_buf,
+        state.volume_serial,
+        state.file_id,
+        state.usn,
+    });
+}
+
+/// Fail closed unless the .cmd/.bat launcher matches a TPM-signed trust entry.
+pub fn ensureDelegatedScriptTrusted(
+    allocator: std.mem.Allocator,
+    install_root: []const u8,
+    script_path: []const u8,
+) VerifyOutcome {
+    const data_root = resolveDataRoot(allocator, install_root) catch {
+        return VerifyOutcome.failedStatic("invalid install root configuration");
+    };
+    defer allocator.free(data_root);
+
+    const stat = nodeFileTimes(script_path) catch {
+        return VerifyOutcome.failedStatic("delegated script not found or inaccessible");
+    };
+    const live_state = nodeFileSecurityState(script_path) catch {
+        return VerifyOutcome.failedStatic("unable to read delegated script identity");
+    };
+    const digest = fileSha256Hex(allocator, script_path) catch {
+        return VerifyOutcome.failedStatic("unable to hash delegated script");
+    };
+    defer allocator.free(digest);
+
+    const pubkey = loadTrustedPublicKey(allocator, data_root) catch {
+        return VerifyOutcome.failedStatic("delegated script trust key unavailable");
+    };
+    defer allocator.free(pubkey);
+
+    const cache_key = cacheKeyForPath(allocator, script_path) catch {
+        return VerifyOutcome.failedStatic("unable to resolve delegated script cache key");
+    };
+    defer allocator.free(cache_key);
+
+    const entry_opt = loadScriptCacheEntry(allocator, cache_key) catch {
+        return VerifyOutcome.failedStatic("unable to read delegated script trust cache");
+    };
+    const entry = entry_opt orelse {
+        return VerifyOutcome.failedStatic("delegated script is not trusted (added after install/reshim)");
+    };
+    defer entry.deinit(allocator);
+
+    if (entry.version != config.script_cache_schema_version) {
+        return VerifyOutcome.failedStatic("delegated script trust cache schema mismatch");
+    }
+
+    const normalized = normalizeNodePath(allocator, script_path) catch {
+        return VerifyOutcome.failedStatic("unable to resolve delegated script path");
+    };
+    defer allocator.free(normalized);
+
+    if (!pathsEqual(normalized, entry.path)) {
+        return VerifyOutcome.failedStatic("delegated script path mismatch");
+    }
+    if (entry.size != stat.size or entry.mtime != stat.mtime) {
+        return VerifyOutcome.failedStatic("delegated script changed since it was trusted");
+    }
+    if (live_state.volume_serial != entry.volume_serial or
+        live_state.file_id != entry.file_id or
+        live_state.usn != entry.usn)
+    {
+        return VerifyOutcome.failedStatic("delegated script identity changed since it was trusted");
+    }
+    if (!std.ascii.eqlIgnoreCase(digest, entry.digest)) {
+        return VerifyOutcome.failedStatic("delegated script digest mismatch");
+    }
+
+    const payload = canonicalScriptPayload(allocator, script_path, stat.size, stat.mtime, digest, live_state) catch {
+        return VerifyOutcome.failedStatic("unable to build delegated script trust payload");
+    };
+    defer allocator.free(payload);
+
+    verifyCacheSignature(pubkey, payload, entry.sig) catch {
+        return VerifyOutcome.failedStatic("delegated script trust signature invalid");
+    };
+
+    return .{ .result = .trusted_cache };
 }
 
 fn pathsEqual(left: []const u8, right: []const u8) bool {
@@ -497,10 +920,45 @@ test "loadAllowedSigners falls back to defaults" {
 
 test "canonicalPayload regression" {
     const allocator = std.testing.allocator;
-    const payload = try canonicalPayload(allocator, "C:\\nvm\\installs\\v22\\node.exe", 12345, 9876543210, "ABCD1234");
+    const state = FileSecurityState{ .volume_serial = 42, .file_id = 123, .usn = 456 };
+    const payload = try canonicalPayload(allocator, "C:\\nvm\\installs\\v22\\node.exe", 12345, 9876543210, "ABCD1234", "AABBCCDD", state);
     defer allocator.free(payload);
 
-    try std.testing.expectEqualStrings("v1\nc:\\nvm\\installs\\v22\\node.exe\n12345\n9876543210\nABCD1234", payload);
+    try std.testing.expectEqualStrings("v3\nc:\\nvm\\installs\\v22\\node.exe\n12345\n9876543210\nABCD1234\naabbccdd\n42\n123\n456", payload);
+}
+
+test "fileSha256Hex changes with same-size content" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "node.exe", .data = "first" });
+    const path = try tmp.dir.realpathAlloc(allocator, "node.exe");
+    defer allocator.free(path);
+    const first = try fileSha256Hex(allocator, path);
+    defer allocator.free(first);
+
+    try tmp.dir.writeFile(.{ .sub_path = "node.exe", .data = "other" });
+    const second = try fileSha256Hex(allocator, path);
+    defer allocator.free(second);
+
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+}
+
+test "nodeFileSecurityState changes after write" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "node.exe", .data = "first" });
+    const path = try tmp.dir.realpathAlloc(allocator, "node.exe");
+    defer allocator.free(path);
+    const first = nodeFileSecurityState(path) catch return error.SkipZigTest;
+
+    try tmp.dir.writeFile(.{ .sub_path = "node.exe", .data = "other" });
+    const second = try nodeFileSecurityState(path);
+    try std.testing.expect(first.file_id != second.file_id or first.usn != second.usn);
 }
 
 test "cacheKeyForPath lowercases path component" {

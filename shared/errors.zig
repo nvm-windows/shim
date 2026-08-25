@@ -19,11 +19,16 @@ pub fn noActiveVersionConfigured() noreturn {
     std.process.exit(1);
 }
 
-pub fn nodeVerifyFailed(node_bin: []const u8, reason: []const u8) noreturn {
-    if (reason.len == 0) {
-        std.debug.print("Node.js executable failed trust verification: {s}\n", .{node_bin});
-    } else {
-        std.debug.print("Node.js executable failed trust verification: {s} ({s})\n", .{ node_bin, reason });
-    }
+pub fn nodeVerifyFailed(node_bin: []const u8, node_version: []const u8, reason: []const u8) noreturn {
+    std.debug.print(
+        \\NVM blocked Node.js execution because its integrity could not be verified.
+        \\
+        \\File: {s}
+        \\Reason: {s}
+        \\Action: Reinstall this version with `nvm install {s} --force`.
+        \\If this change was unexpected, contact your administrator and review NVM event logs.
+        \\Event code: NVM4301
+        \\
+    , .{ node_bin, if (reason.len == 0) "Trust verification failed." else reason, node_version });
     std.process.exit(1);
 }

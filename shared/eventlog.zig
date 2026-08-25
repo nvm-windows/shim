@@ -187,6 +187,54 @@ pub fn writeStructuredErrorCode(allocator: std.mem.Allocator, source: []const u8
     writeStructuredValue(allocator, structured_operational_error_descriptor, source, event_name, payload, code) catch {};
 }
 
+pub fn writeLicensedSecurityError(
+    allocator: std.mem.Allocator,
+    structured_logging: bool,
+    source: []const u8,
+    event_name: []const u8,
+    payload: anytype,
+    plaintext: []const u8,
+    code: u32,
+) void {
+    if (structured_logging) {
+        writeStructuredErrorCode(allocator, source, event_name, payload, code);
+    } else {
+        writeOperational(allocator, shim_operational_error_descriptor, source, plaintext, code) catch {};
+    }
+}
+
+pub fn writeLicensedSecurityWarning(
+    allocator: std.mem.Allocator,
+    structured_logging: bool,
+    source: []const u8,
+    event_name: []const u8,
+    payload: anytype,
+    plaintext: []const u8,
+    code: u32,
+) void {
+    if (structured_logging) {
+        writeStructuredWarningCode(allocator, source, event_name, payload, code);
+    } else {
+        writeOperational(allocator, shim_operational_warning_descriptor, source, plaintext, code) catch {};
+    }
+}
+
+pub fn writeLicensedSecurityInfo(
+    allocator: std.mem.Allocator,
+    structured_logging: bool,
+    source: []const u8,
+    event_name: []const u8,
+    payload: anytype,
+    plaintext: []const u8,
+    code: u32,
+) void {
+    if (structured_logging) {
+        writeStructuredInfoCode(allocator, source, event_name, payload, code);
+    } else {
+        writeOperational(allocator, shim_operational_info_descriptor, source, plaintext, code) catch {};
+    }
+}
+
 pub fn writeStructuredInfoJson(allocator: std.mem.Allocator, source: []const u8, event_name: []const u8, payload_json: []const u8, code: u32) void {
     writeStructuredJson(allocator, structured_operational_info_descriptor, source, event_name, payload_json, code) catch {};
 }

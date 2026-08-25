@@ -14,6 +14,7 @@ const reg_value_auto_install_prompt = config.reg_value_auto_install_prompt;
 const reg_value_auto_detect = config.reg_value_auto_detect;
 const reg_value_aliases = config.reg_value_aliases;
 const reg_value_log_executions = config.reg_value_log_executions;
+const reg_value_access_token = config.reg_value_access_token;
 const reg_value_enforce_permission_model = config.reg_value_enforce_permission_model;
 const reg_value_freeze_v8_global_objects = config.reg_value_freeze_v8_global_objects;
 const reg_value_disable_eval_and_string_execution = config.reg_value_disable_eval_and_string_execution;
@@ -43,6 +44,7 @@ pub const ShimConfig = struct {
     auto_detect: []const []const u8,
     aliases: []const []const u8,
     log_executions: bool,
+    structured_logging: bool,
     enforce_permission_model: bool,
     freeze_v8_global_objects: bool,
     disable_eval_and_string_execution: bool,
@@ -94,7 +96,8 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
     const root = try loadInstallRoot(allocator);
 
     const auto_use = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_auto_use)) orelse 1;
-    const auto_install = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_auto_install)) orelse 1;
+    // Match Go settings default (auto_install=false). Absent registry → off (DI-03).
+    const auto_install = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_auto_install)) orelse 0;
     const auto_install_prompt = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_auto_install_prompt)) orelse 1;
 
     const auto_detect = auto_detect: {
@@ -112,6 +115,7 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
     const aliases = (try registry.queryMultiStringOptionalWithFallback(allocator, config_hives, reg_path, reg_value_aliases)) orelse
         try allocator.alloc([]const u8, 0);
     const log_executions = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_log_executions)) orelse 0;
+    const structured_logging = allowsStructuredLogging(allocator, config_hives);
     const enforce_permission_model = try loadPolicyOrPrefBool(config_hives, reg_value_enforce_permission_model);
     const freeze_v8_global_objects = try loadPolicyOrPrefBool(config_hives, reg_value_freeze_v8_global_objects);
     const disable_eval_and_string_execution = try loadPolicyOrPrefBool(config_hives, reg_value_disable_eval_and_string_execution);
@@ -147,12 +151,78 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
         .auto_detect = auto_detect,
         .aliases = aliases,
         .log_executions = log_executions != 0,
+        .structured_logging = structured_logging,
         .enforce_permission_model = enforce_permission_model,
         .freeze_v8_global_objects = freeze_v8_global_objects,
         .disable_eval_and_string_execution = disable_eval_and_string_execution,
         .package_manager_mismatch_action = package_manager_mismatch_action,
         .npm_module_minimum_age = npm_module_minimum_age,
         .npm_registry_fallback = npm_registry_fallback,
+    };
+}
+
+fn allowsStructuredLogging(allocator: std.mem.Allocator, hives: []const windows.HKEY) bool {
+    for (hives) |hive| {
+        const token_optional = registry.queryBinaryOptional(allocator, hive, reg_path, reg_value_access_token) catch continue;
+        const token = token_optional orelse continue;
+        defer allocator.free(token);
+        return tokenAllowsStructuredLogging(allocator, token, std.time.timestamp());
+    }
+    return false;
+}
+
+pub fn tokenAllowsStructuredLogging(allocator: std.mem.Allocator, raw_token: []const u8, now: i64) bool {
+    var segments = std.mem.splitScalar(u8, std.mem.trim(u8, raw_token, " \t\r\n\x00"), '.');
+    _ = segments.next() orelse return false;
+    const encoded_payload = segments.next() orelse return false;
+    _ = segments.next() orelse return false;
+    if (segments.next() != null) return false;
+
+    const payload_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(encoded_payload) catch return false;
+    const payload = allocator.alloc(u8, payload_len) catch return false;
+    defer allocator.free(payload);
+    std.base64.url_safe_no_pad.Decoder.decode(payload, encoded_payload) catch return false;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch return false;
+    defer parsed.deinit();
+    const claims = switch (parsed.value) {
+        .object => |object| object,
+        else => return false,
+    };
+
+    if (claims.get("tmp")) |temporary| {
+        if (temporary != .bool or temporary.bool) return false;
+    }
+
+    var license_type: []const u8 = "";
+    if (claims.get("lic")) |license_value| {
+        if (license_value != .string) return false;
+        license_type = std.mem.trim(u8, license_value.string, " \t\r\n");
+    }
+    if (license_type.len == 0) {
+        const plan_value = claims.get("plan") orelse return false;
+        if (plan_value != .string) return false;
+        license_type = std.mem.trim(u8, plan_value.string, " \t\r\n");
+    }
+    if (!std.ascii.eqlIgnoreCase(license_type, "compliance") and
+        !std.ascii.eqlIgnoreCase(license_type, "governance"))
+    {
+        return false;
+    }
+
+    if (claims.get("nbf")) |not_before| {
+        const timestamp = jsonInteger(not_before) orelse return false;
+        if (timestamp > now) return false;
+    }
+    const expires = jsonInteger(claims.get("exp") orelse return false) orelse return false;
+    const grace_seconds: i64 = 7 * 24 * 60 * 60;
+    return now <= expires +| grace_seconds;
+}
+
+fn jsonInteger(value: std.json.Value) ?i64 {
+    return switch (value) {
+        .integer => |integer| integer,
+        else => null,
     };
 }
 
@@ -392,7 +462,7 @@ fn autoInstallMissing(
 }
 
 fn confirmAutoInstall(allocator: std.mem.Allocator, version: []const u8) !bool {
-    const prompt = try std.fmt.allocPrint(allocator, "Node.js v{s} is not installed. Install now? [Y/n]: ", .{version});
+    const prompt = try std.fmt.allocPrint(allocator, "Node.js v{s} is not installed. Install now? [y/N]: ", .{version});
     defer allocator.free(prompt);
 
     std.debug.print("{s}", .{prompt});
@@ -406,10 +476,8 @@ fn confirmAutoInstall(allocator: std.mem.Allocator, version: []const u8) !bool {
     };
     const line = std.mem.trim(u8, raw_line, " \t\r\n");
 
-    if (line.len == 0) return true;
+    // Explicit affirmative only (DI-03). Empty / unknown → no.
     if (std.ascii.eqlIgnoreCase(line, "y") or std.ascii.eqlIgnoreCase(line, "yes")) return true;
-    if (std.ascii.eqlIgnoreCase(line, "n") or std.ascii.eqlIgnoreCase(line, "no")) return false;
-
     return false;
 }
 
@@ -770,4 +838,21 @@ test "parseMinimumAgeMinutes saturates overflow and rejects invalid" {
     try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), parseMinimumAgeMinutes("10000000000000000000000000"));
     try std.testing.expect(parseMinimumAgeMinutes("not-a-number") == null);
     try std.testing.expect(parseMinimumAgeMinutes("   ") == null);
+}
+
+test "tokenAllowsStructuredLogging accepts eligible license in grace window" {
+    const token = "header.eyJsaWMiOiJjb21wbGlhbmNlIiwidG1wIjpmYWxzZSwibmJmIjoxMDAsImV4cCI6MjAwfQ.signature";
+    try std.testing.expect(tokenAllowsStructuredLogging(std.testing.allocator, token, 201));
+    try std.testing.expect(tokenAllowsStructuredLogging(std.testing.allocator, token, 200 + (7 * 24 * 60 * 60)));
+}
+
+test "tokenAllowsStructuredLogging rejects ineligible or invalid tokens" {
+    const professional = "header.eyJsaWMiOiJwcm9mZXNzaW9uYWwiLCJ0bXAiOmZhbHNlLCJleHAiOjIwMH0.signature";
+    const temporary = "header.eyJsaWMiOiJjb21wbGlhbmNlIiwidG1wIjp0cnVlLCJleHAiOjIwMH0.signature";
+    const expired = "header.eyJwbGFuIjoiZ292ZXJuYW5jZSIsInRtcCI6ZmFsc2UsImV4cCI6MjAwfQ.signature";
+
+    try std.testing.expect(!tokenAllowsStructuredLogging(std.testing.allocator, professional, 100));
+    try std.testing.expect(!tokenAllowsStructuredLogging(std.testing.allocator, temporary, 100));
+    try std.testing.expect(!tokenAllowsStructuredLogging(std.testing.allocator, expired, 201 + (7 * 24 * 60 * 60)));
+    try std.testing.expect(!tokenAllowsStructuredLogging(std.testing.allocator, "invalid", 100));
 }

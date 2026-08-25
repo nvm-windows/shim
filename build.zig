@@ -26,6 +26,7 @@ pub fn build(b: *std.Build) void {
     const shimintegrity_path = b.option([]const u8, "shimintegrity_path", "Path to shim integrity module") orelse "shared/shimintegrity.zig";
     const wintrust_path = b.option([]const u8, "wintrust_path", "Path to wintrust module") orelse "shared/wintrust.zig";
     const verifycache_path = b.option([]const u8, "verifycache_path", "Path to verify cache module") orelse "shared/verifycache.zig";
+    const install_safety_path = b.option([]const u8, "install_safety_path", "Path to install safety module") orelse "shared/install_safety.zig";
     const jobobject_path = b.option([]const u8, "jobobject_path", "Path to job object module") orelse "shared/jobobject.zig";
 
     const config_module = b.createModule(.{
@@ -68,6 +69,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    wintrust_module.addImport("config", config_module);
 
     const verifycache_module = b.createModule(.{
         .root_source_file = b.path(verifycache_path),
@@ -87,8 +89,28 @@ pub fn build(b: *std.Build) void {
     verifycache_tests.root_module.linkSystemLibrary("crypt32", .{});
     verifycache_tests.root_module.linkSystemLibrary("wintrust", .{});
     const run_verifycache_tests = b.addRunArtifact(verifycache_tests);
-    const test_step = b.step("test", "Run verify cache unit tests");
+    const test_step = b.step("test", "Run shim unit tests");
     test_step.dependOn(&run_verifycache_tests.step);
+
+    const nodeversion_tests = b.addTest(.{
+        .root_module = nodeversion_module,
+    });
+    nodeversion_tests.root_module.linkSystemLibrary("advapi32", .{});
+    const run_nodeversion_tests = b.addRunArtifact(nodeversion_tests);
+    test_step.dependOn(&run_nodeversion_tests.step);
+
+    const install_safety_module = b.createModule(.{
+        .root_source_file = b.path(install_safety_path),
+        .target = target,
+        .optimize = optimize,
+    });
+    const install_safety_tests = b.addTest(.{
+        .root_module = install_safety_module,
+    });
+    install_safety_tests.root_module.linkSystemLibrary("advapi32", .{});
+    install_safety_tests.root_module.linkSystemLibrary("kernel32", .{});
+    const run_install_safety_tests = b.addRunArtifact(install_safety_tests);
+    test_step.dependOn(&run_install_safety_tests.step);
 
     const exe = b.addExecutable(.{
         .name = app,
@@ -126,6 +148,11 @@ pub fn build(b: *std.Build) void {
         exe.root_module.linkSystemLibrary("advapi32", .{});
         exe.root_module.linkSystemLibrary("crypt32", .{});
         exe.root_module.linkSystemLibrary("wintrust", .{});
+    }
+
+    if (std.mem.eql(u8, app, "proxy")) {
+        exe.root_module.addImport("install_safety", install_safety_module);
+        exe.root_module.addImport("wintrust", wintrust_module);
     }
 
     exe.root_module.addImport("errors", b.createModule(.{

@@ -94,15 +94,81 @@ pub fn main() !void {
 
     const verify_outcome = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, resolved.node_bin.?);
     switch (verify_outcome.result) {
-        .trusted_cache, .verified_full => {},
+        .trusted_cache => {},
+        .verified_full => {
+            if (verify_outcome.cache_status != .none) {
+                const cache_message = try std.fmt.allocPrint(
+                    allocator,
+                    "NVM4303 Node.js verify-cache state changed; full verification required: {s} ({s})",
+                    .{ resolved.node_bin.?, @tagName(verify_outcome.cache_status) },
+                );
+                defer allocator.free(cache_message);
+                eventlog.writeLicensedSecurityWarning(
+                    allocator,
+                    cfg.structured_logging,
+                    "node-shim",
+                    "node.security.cache_state_changed",
+                    .{
+                        .action = "full_verification_required",
+                        .cache_status = @tagName(verify_outcome.cache_status),
+                        .node_path = resolved.node_bin.?,
+                        .node_version = resolved.resolved_version.?,
+                        .source = "node-shim",
+                        .verification_result = "cache_invalidated",
+                    },
+                    cache_message,
+                    4303,
+                );
+                const recovery_message = try std.fmt.allocPrint(
+                    allocator,
+                    "NVM4304 Full Node.js verification succeeded after verify-cache state changed: {s}",
+                    .{resolved.node_bin.?},
+                );
+                defer allocator.free(recovery_message);
+                eventlog.writeLicensedSecurityInfo(
+                    allocator,
+                    cfg.structured_logging,
+                    "node-shim",
+                    "node.security.full_verification_recovered",
+                    .{
+                        .action = "execution_allowed",
+                        .cache_status = @tagName(verify_outcome.cache_status),
+                        .node_path = resolved.node_bin.?,
+                        .node_version = resolved.resolved_version.?,
+                        .source = "node-shim",
+                        .verification_result = "trusted",
+                    },
+                    recovery_message,
+                    4304,
+                );
+            }
+        },
         .failed => {
-            const message = if (verify_outcome.reason.len == 0)
-                try std.fmt.allocPrint(allocator, "Node.js executable failed trust verification: {s}", .{resolved.node_bin.?})
-            else
-                try std.fmt.allocPrint(allocator, "Node.js trust verification failed for {s}: {s}", .{ resolved.node_bin.?, verify_outcome.reason });
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "NVM4301 Node.js execution blocked because integrity verification failed: {s} ({s})",
+                .{ resolved.node_bin.?, if (verify_outcome.reason.len == 0) "trust verification failed" else verify_outcome.reason },
+            );
             defer allocator.free(message);
-            eventlog.writeError(allocator, "node-shim", message);
-            nodeVerifyFailed(resolved.node_bin.?, verify_outcome.reason);
+            eventlog.writeLicensedSecurityError(
+                allocator,
+                cfg.structured_logging,
+                "node-shim",
+                "node.security.verification_failed",
+                .{
+                    .action = "execution_blocked",
+                    .cache_status = @tagName(verify_outcome.cache_status),
+                    .detail = if (verify_outcome.reason.len == 0) "trust verification failed" else verify_outcome.reason,
+                    .failure_kind = "executable_trust_failed",
+                    .node_path = resolved.node_bin.?,
+                    .node_version = resolved.resolved_version.?,
+                    .source = "node-shim",
+                    .verification_result = "failed",
+                },
+                message,
+                4301,
+            );
+            nodeVerifyFailed(resolved.node_bin.?, resolved.resolved_version.?, verify_outcome.reason);
         },
     }
 

@@ -128,6 +128,7 @@ pub fn main() !void {
 
     if (cmd_names.len == 0) {
         prewarmShims(allocator, shim_dir, silent);
+        signVersionScripts(allocator, install_root, target_version_dir);
         try writeStdoutf(allocator, silent, "All shims up to date.\n", .{});
         return;
     }
@@ -187,6 +188,38 @@ pub fn main() !void {
 
     try writeStdoutf(allocator, silent, "\nCreated {d} shim(s).\n", .{linked});
     prewarmShims(allocator, shim_dir, silent);
+    signVersionScripts(allocator, install_root, target_version_dir);
+}
+
+fn signVersionScripts(allocator: std.mem.Allocator, install_root: []const u8, target_version_dir: ?[]const u8) void {
+    const nvm_path = std.fs.path.resolve(allocator, &.{ install_root, "..", "nvm.exe" }) catch return;
+    defer allocator.free(nvm_path);
+    std.fs.accessAbsolute(nvm_path, .{}) catch return;
+
+    if (target_version_dir) |version_dir| {
+        spawnSignVersionScripts(allocator, nvm_path, version_dir);
+        return;
+    }
+
+    var root_dir = std.fs.cwd().openDir(install_root, .{ .iterate = true }) catch return;
+    defer root_dir.close();
+    var it = root_dir.iterate();
+    while (it.next() catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (!(std.mem.startsWith(u8, entry.name, "v") or std.mem.startsWith(u8, entry.name, "V"))) continue;
+        const version_dir = std.fs.path.join(allocator, &.{ install_root, entry.name }) catch continue;
+        defer allocator.free(version_dir);
+        spawnSignVersionScripts(allocator, nvm_path, version_dir);
+    }
+}
+
+fn spawnSignVersionScripts(allocator: std.mem.Allocator, nvm_path: []const u8, version_dir: []const u8) void {
+    var child = std.process.Child.init(&.{ nvm_path, "--sign-version-scripts", version_dir }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return;
+    _ = child.wait() catch {};
 }
 
 fn prewarmShims(allocator: std.mem.Allocator, shim_dir: []const u8, silent: bool) void {

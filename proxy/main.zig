@@ -6,6 +6,7 @@ const eventlog = @import("eventlog");
 const errors = @import("errors");
 const shimintegrity = @import("shimintegrity");
 const verifycache = @import("verifycache");
+const install_safety = @import("install_safety");
 
 const ParsedArgs = struct {
     override_version: ?[]const u8,
@@ -80,6 +81,50 @@ pub fn main() !void {
     const node_install_dir_abs = try std.fs.path.resolve(allocator, &.{node_install_dir});
     defer allocator.free(node_install_dir_abs);
 
+    install_safety.checkVersionDirTrust(allocator, node_install_dir_abs) catch |err| {
+        const detail = switch (err) {
+            error.ReparsePoint => "Directory is a junction, symbolic link, or other reparse point.",
+            error.CrossUserWritable => "Directory is writable by other users.",
+            error.NotADirectory => "Path is not a directory.",
+            error.PathUnavailable => "Directory trust checks failed.",
+        };
+        const message = try std.fmt.allocPrint(
+            allocator,
+            "NVM4305 Package-manager launch blocked because the Node.js directory is unsafe: {s} ({s})",
+            .{ node_install_dir_abs, detail },
+        );
+        defer allocator.free(message);
+        eventlog.writeLicensedSecurityError(
+            allocator,
+            cfg.structured_logging,
+            "proxy",
+            "node.security.activation_blocked",
+            .{
+                .action = "execution_blocked",
+                .command = command_name,
+                .detail = detail,
+                .failure_kind = @errorName(err),
+                .node_path = resolved.node_bin.?,
+                .node_version = resolved.resolved_version.?,
+                .source = "proxy",
+                .version_path = node_install_dir_abs,
+            },
+            message,
+            4305,
+        );
+        std.debug.print(
+            \\NVM blocked package-manager execution because the Node.js directory is unsafe.
+            \\
+            \\Path: {s}
+            \\Reason: {s}
+            \\Action: Reinstall this version into a private install root.
+            \\If this change was unexpected, contact your administrator and review NVM event logs.
+            \\Event code: NVM4305
+            \\
+        , .{ node_install_dir_abs, detail });
+        std.process.exit(1);
+    };
+
     const command_path = try resolveDelegatedCommandPath(allocator, node_install_dir_abs, command_name);
     defer allocator.free(command_path);
 
@@ -89,21 +134,101 @@ pub fn main() !void {
 
     const verify_outcome = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, resolved.node_bin.?);
     switch (verify_outcome.result) {
-        .trusted_cache, .verified_full => {},
+        .trusted_cache => {},
+        .verified_full => {
+            if (verify_outcome.cache_status != .none) {
+                const cache_message = try std.fmt.allocPrint(
+                    allocator,
+                    "NVM4303 Node.js verify-cache state changed; full verification required: {s} ({s})",
+                    .{ resolved.node_bin.?, @tagName(verify_outcome.cache_status) },
+                );
+                defer allocator.free(cache_message);
+                eventlog.writeLicensedSecurityWarning(
+                    allocator,
+                    cfg.structured_logging,
+                    "proxy",
+                    "node.security.cache_state_changed",
+                    .{
+                        .action = "full_verification_required",
+                        .cache_status = @tagName(verify_outcome.cache_status),
+                        .command = command_name,
+                        .node_path = resolved.node_bin.?,
+                        .node_version = resolved.resolved_version.?,
+                        .source = "proxy",
+                        .verification_result = "cache_invalidated",
+                    },
+                    cache_message,
+                    4303,
+                );
+                const recovery_message = try std.fmt.allocPrint(
+                    allocator,
+                    "NVM4304 Full Node.js verification succeeded after verify-cache state changed: {s}",
+                    .{resolved.node_bin.?},
+                );
+                defer allocator.free(recovery_message);
+                eventlog.writeLicensedSecurityInfo(
+                    allocator,
+                    cfg.structured_logging,
+                    "proxy",
+                    "node.security.full_verification_recovered",
+                    .{
+                        .action = "execution_allowed",
+                        .cache_status = @tagName(verify_outcome.cache_status),
+                        .command = command_name,
+                        .node_path = resolved.node_bin.?,
+                        .node_version = resolved.resolved_version.?,
+                        .source = "proxy",
+                        .verification_result = "trusted",
+                    },
+                    recovery_message,
+                    4304,
+                );
+            }
+        },
         .failed => {
-            const message = if (verify_outcome.reason.len == 0)
-                try std.fmt.allocPrint(allocator, "Node.js executable failed trust verification: {s}", .{resolved.node_bin.?})
-            else
-                try std.fmt.allocPrint(allocator, "Node.js trust verification failed for {s}: {s}", .{ resolved.node_bin.?, verify_outcome.reason });
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "NVM4301 Node.js execution blocked because integrity verification failed: {s} ({s})",
+                .{ resolved.node_bin.?, if (verify_outcome.reason.len == 0) "trust verification failed" else verify_outcome.reason },
+            );
             defer allocator.free(message);
-            eventlog.writeError(allocator, "proxy", message);
-            nodeVerifyFailed(resolved.node_bin.?, verify_outcome.reason);
+            eventlog.writeLicensedSecurityError(
+                allocator,
+                cfg.structured_logging,
+                "proxy",
+                "node.security.verification_failed",
+                .{
+                    .action = "execution_blocked",
+                    .cache_status = @tagName(verify_outcome.cache_status),
+                    .command = command_name,
+                    .detail = if (verify_outcome.reason.len == 0) "trust verification failed" else verify_outcome.reason,
+                    .failure_kind = "executable_trust_failed",
+                    .node_path = resolved.node_bin.?,
+                    .node_version = resolved.resolved_version.?,
+                    .source = "proxy",
+                    .verification_result = "failed",
+                },
+                message,
+                4301,
+            );
+            nodeVerifyFailed(resolved.node_bin.?, resolved.resolved_version.?, verify_outcome.reason);
         },
     }
 
+    try enforceDelegatedCommandTrust(allocator, cfg, command_name, command_path, resolved.node_bin.?, resolved.resolved_version.?, node_install_dir_abs);
+
     const needs_reshim = detectReshimNeeded(command_name, parsed_args.forwarded);
 
-    const process_exit_code = runDelegatedCommand(allocator, node_install_dir_abs, command_name, command_path, cfg.npm_module_minimum_age, cfg.npm_registry_fallback, parsed_args.forwarded) catch |err| blk: {
+    const process_exit_code = runDelegatedCommand(
+        allocator,
+        node_install_dir_abs,
+        resolved.node_bin.?,
+        command_name,
+        command_path,
+        cfg.npm_module_minimum_age,
+        cfg.npm_registry_fallback,
+        parsed_args.forwarded,
+    ) catch |err| blk: {
         std.debug.print("proxy failed to run {s}: {s}\n", .{ command_name, @errorName(err) });
         break :blk 1;
     };
@@ -208,7 +333,7 @@ fn isConstrainedPackageManagerHardlink(command_name: []const u8) bool {
 }
 
 fn resolveDelegatedCommandPath(allocator: std.mem.Allocator, node_install_dir: []const u8, command_name: []const u8) ![]u8 {
-    const exts = [_][]const u8{ ".cmd", ".exe", ".bat" };
+    const exts = [_][]const u8{ ".exe", ".cmd", ".bat" };
 
     for (exts) |ext| {
         const filename = try std.fmt.allocPrint(allocator, "{s}{s}", .{ command_name, ext });
@@ -228,9 +353,126 @@ fn resolveDelegatedCommandPath(allocator: std.mem.Allocator, node_install_dir: [
     return error.CommandNotFound;
 }
 
+fn enforceDelegatedCommandTrust(
+    allocator: std.mem.Allocator,
+    cfg: nodeversion.ShimConfig,
+    command_name: []const u8,
+    command_path: []const u8,
+    node_bin: []const u8,
+    node_version: []const u8,
+    node_install_dir: []const u8,
+) !void {
+    // Fast path entrypoints (npm-cli.js / npx-cli.js) use the same script-cache
+    // trust as *.cmd — node.exe trust alone is never enough (SEC-04).
+    if (try resolvePackageManagerCliJs(allocator, node_install_dir, command_name)) |cli_js| {
+        defer allocator.free(cli_js);
+        const outcome = verifycache.ensureDelegatedScriptTrusted(allocator, cfg.root, cli_js);
+        if (outcome.result == .failed) {
+            reportDelegatedTrustFailure(
+                allocator,
+                cfg,
+                command_name,
+                cli_js,
+                node_bin,
+                node_version,
+                if (outcome.reason.len == 0) "delegated package-manager entrypoint trust verification failed" else outcome.reason,
+            );
+        }
+        return;
+    }
+
+    const ext = std.fs.path.extension(command_path);
+    if (std.ascii.eqlIgnoreCase(ext, ".exe")) {
+        // Same TPM verify-cache as node.exe — never full Authenticode on warm path.
+        const outcome = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, command_path);
+        if (outcome.result == .failed) {
+            reportDelegatedTrustFailure(
+                allocator,
+                cfg,
+                command_name,
+                command_path,
+                node_bin,
+                node_version,
+                if (outcome.reason.len == 0) "delegated executable trust verification failed" else outcome.reason,
+            );
+        }
+        return;
+    }
+
+    if (std.ascii.eqlIgnoreCase(ext, ".cmd") or std.ascii.eqlIgnoreCase(ext, ".bat")) {
+        const outcome = verifycache.ensureDelegatedScriptTrusted(allocator, cfg.root, command_path);
+        if (outcome.result == .failed) {
+            reportDelegatedTrustFailure(
+                allocator,
+                cfg,
+                command_name,
+                command_path,
+                node_bin,
+                node_version,
+                if (outcome.reason.len == 0) "delegated script trust verification failed" else outcome.reason,
+            );
+        }
+        return;
+    }
+
+    reportDelegatedTrustFailure(allocator, cfg, command_name, command_path, node_bin, node_version, "unsupported delegated command type");
+}
+
+fn reportDelegatedTrustFailure(
+    allocator: std.mem.Allocator,
+    cfg: nodeversion.ShimConfig,
+    command_name: []const u8,
+    command_path: []const u8,
+    node_bin: []const u8,
+    node_version: []const u8,
+    detail: []const u8,
+) noreturn {
+    const message = std.fmt.allocPrint(
+        allocator,
+        "NVM4306 Package-manager launch blocked because delegated command trust failed: {s} ({s})",
+        .{ command_path, detail },
+    ) catch {
+        std.debug.print("NVM4306 delegated command trust failed\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(message);
+    eventlog.writeLicensedSecurityError(
+        allocator,
+        cfg.structured_logging,
+        "proxy",
+        "node.security.verification_failed",
+        .{
+            .action = "execution_blocked",
+            .command = command_name,
+            .detail = detail,
+            .failure_kind = "delegated_command_trust_failed",
+            .node_path = node_bin,
+            .node_version = node_version,
+            .script_path = command_path,
+            .source = "proxy",
+            .verification_result = "failed",
+        },
+        message,
+        4306,
+    );
+    std.debug.print(
+        \\NVM blocked package-manager execution because a delegated command could not be trusted.
+        \\
+        \\Command: {s}
+        \\File: {s}
+        \\Reason: {s}
+        \\Action: Reinstall this Node.js version or run `nvm reshim` after a trusted install.
+        \\If this change was unexpected, contact your administrator and review NVM event logs.
+        \\Event code: NVM4306
+        \\
+    , .{ command_name, command_path, detail });
+    std.process.exit(1);
+}
+
 fn runDelegatedCommand(
     allocator: std.mem.Allocator,
     node_install_dir: []const u8,
+    node_bin: []const u8,
     command_name: []const u8,
     command_path: []const u8,
     npm_module_minimum_age: ?u64,
@@ -250,16 +492,19 @@ fn runDelegatedCommand(
     try applyPackageManagerMinimumAgeGate(allocator, &env_map, command_name, npm_module_minimum_age);
     try applyPackageManagerRegistryFallback(allocator, &env_map, command_name, forwarded_args, npm_registry_fallback);
 
+    // Fast path: skip cmd.exe + *.cmd wrapper (often doubles Node startup).
+    // Entrypoint must already be script-cache trusted in enforceDelegatedCommandTrust.
+    if (try resolvePackageManagerCliJs(allocator, node_install_dir, command_name)) |cli_js| {
+        defer allocator.free(cli_js);
+        return spawnArgv(allocator, &env_map, node_bin, cli_js, forwarded_args);
+    }
+
     const ext = std.fs.path.extension(command_path);
     const use_cmd = std.ascii.eqlIgnoreCase(ext, ".cmd") or std.ascii.eqlIgnoreCase(ext, ".bat");
 
-    var argv = if (use_cmd)
-        try allocator.alloc([]const u8, forwarded_args.len + 4)
-    else
-        try allocator.alloc([]const u8, forwarded_args.len + 1);
-    defer allocator.free(argv);
-
     if (use_cmd) {
+        var argv = try allocator.alloc([]const u8, forwarded_args.len + 4);
+        defer allocator.free(argv);
         argv[0] = "cmd.exe";
         argv[1] = "/d";
         argv[2] = "/c";
@@ -267,18 +512,73 @@ fn runDelegatedCommand(
         for (forwarded_args, 0..) |arg, i| {
             argv[i + 4] = arg;
         }
-    } else {
-        argv[0] = command_path;
-        for (forwarded_args, 0..) |arg, i| {
-            argv[i + 1] = arg;
-        }
+        return spawnArgvSlice(allocator, &env_map, argv);
     }
 
+    var argv = try allocator.alloc([]const u8, forwarded_args.len + 1);
+    defer allocator.free(argv);
+    argv[0] = command_path;
+    for (forwarded_args, 0..) |arg, i| {
+        argv[i + 1] = arg;
+    }
+    return spawnArgvSlice(allocator, &env_map, argv);
+}
+
+fn resolvePackageManagerCliJs(allocator: std.mem.Allocator, node_install_dir: []const u8, command_name: []const u8) !?[]u8 {
+    const parts: []const []const u8 = blk: {
+        if (std.ascii.eqlIgnoreCase(command_name, "npm")) {
+            break :blk &.{ "node_modules", "npm", "bin", "npm-cli.js" };
+        }
+        if (std.ascii.eqlIgnoreCase(command_name, "npx")) {
+            break :blk &.{ "node_modules", "npm", "bin", "npx-cli.js" };
+        }
+        if (std.ascii.eqlIgnoreCase(command_name, "corepack")) {
+            break :blk &.{ "node_modules", "corepack", "dist", "corepack.js" };
+        }
+        return null;
+    };
+
+    var segments = try allocator.alloc([]const u8, parts.len + 1);
+    defer allocator.free(segments);
+    segments[0] = node_install_dir;
+    for (parts, 0..) |part, i| {
+        segments[i + 1] = part;
+    }
+
+    const full = try std.fs.path.join(allocator, segments);
+    errdefer allocator.free(full);
+
+    var file = std.fs.openFileAbsolute(full, .{}) catch {
+        allocator.free(full);
+        return null;
+    };
+    file.close();
+    return full;
+}
+
+fn spawnArgv(
+    allocator: std.mem.Allocator,
+    env_map: *std.process.EnvMap,
+    node_bin: []const u8,
+    cli_js: []const u8,
+    forwarded_args: []const []const u8,
+) !u8 {
+    var argv = try allocator.alloc([]const u8, forwarded_args.len + 2);
+    defer allocator.free(argv);
+    argv[0] = node_bin;
+    argv[1] = cli_js;
+    for (forwarded_args, 0..) |arg, i| {
+        argv[i + 2] = arg;
+    }
+    return spawnArgvSlice(allocator, env_map, argv);
+}
+
+fn spawnArgvSlice(allocator: std.mem.Allocator, env_map: *std.process.EnvMap, argv: []const []const u8) !u8 {
     var child = std.process.Child.init(argv, allocator);
     child.stdin_behavior = .Inherit;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
-    child.env_map = &env_map;
+    child.env_map = env_map;
 
     try child.spawn();
     const term = try child.wait();
