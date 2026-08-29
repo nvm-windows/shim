@@ -128,7 +128,11 @@ pub fn main() !void {
 
     if (cmd_names.len == 0) {
         prewarmShims(allocator, shim_dir, silent);
-        signVersionScripts(allocator, install_root, target_version_dir);
+        // --silent runs on every nvm use. Script trust for unchanged shims is
+        // unchanged; Go PrewarmVerifyCache signs the active node.exe after reshim.
+        if (!silent) {
+            signVersionScripts(allocator, install_root, target_version_dir);
+        }
         try writeStdoutf(allocator, silent, "All shims up to date.\n", .{});
         return;
     }
