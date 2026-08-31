@@ -161,6 +161,23 @@ const CacheEntry = struct {
     }
 };
 
+const CacheEntryLoadStatus = union(enum) {
+    found: CacheEntry,
+    missing,
+    incomplete: []const u8,
+};
+
+fn readOptionalU64(hive: windows.HKEY, sub_key: []const u8, value_name: []const u8) ?u64 {
+    if (registry.queryQwordOptional(hive, sub_key, value_name) catch null) |value| return value;
+    if (registry.queryDwordOptional(hive, sub_key, value_name) catch null) |value| return value;
+    return null;
+}
+
+fn readOptionalI64(hive: windows.HKEY, sub_key: []const u8, value_name: []const u8) ?i64 {
+    if (readOptionalU64(hive, sub_key, value_name)) |value| return @intCast(value);
+    return null;
+}
+
 const default_allowed_signers = config.default_allowed_signers;
 
 const policy_hives = &[_]windows.HKEY{
@@ -676,10 +693,20 @@ fn loadCacheEntry(allocator: std.mem.Allocator, cache_key: []const u8) !?CacheEn
         cache_key,
     });
     defer allocator.free(sub_key);
-    return loadCacheEntryAt(allocator, sub_key, true);
+    return switch (try loadCacheEntryAt(allocator, sub_key, true)) {
+        .found => |entry| entry,
+        .missing, .incomplete => null,
+    };
 }
 
 fn loadScriptCacheEntry(allocator: std.mem.Allocator, cache_key: []const u8) !?CacheEntry {
+    return switch (try loadScriptCacheEntryStatus(allocator, cache_key)) {
+        .found => |entry| entry,
+        .missing, .incomplete => null,
+    };
+}
+
+fn loadScriptCacheEntryStatus(allocator: std.mem.Allocator, cache_key: []const u8) !CacheEntryLoadStatus {
     const sub_key = try std.fmt.allocPrint(allocator, "{s}\\{s}\\{s}\\{s}", .{
         config.preference_registry_root,
         config.verify_cache_subkey,
@@ -690,34 +717,32 @@ fn loadScriptCacheEntry(allocator: std.mem.Allocator, cache_key: []const u8) !?C
     return loadCacheEntryAt(allocator, sub_key, false);
 }
 
-fn loadCacheEntryAt(allocator: std.mem.Allocator, sub_key: []const u8, require_thumbprint: bool) !?CacheEntry {
+fn loadCacheEntryAt(allocator: std.mem.Allocator, sub_key: []const u8, require_thumbprint: bool) !CacheEntryLoadStatus {
     const hive = windows.HKEY_CURRENT_USER;
 
-    const path = registry.queryString(allocator, hive, sub_key, "Path") catch return null;
-    errdefer allocator.free(path);
-
-    const size_dword = registry.queryDwordOptional(hive, sub_key, "Size") catch null;
-    const size_qword = registry.queryQwordOptional(hive, sub_key, "Size") catch null;
-    const size: ?i64 = if (size_qword) |value|
-        @intCast(value)
-    else if (size_dword) |value|
-        @intCast(value)
-    else
-        null;
-    if (size == null) {
-        allocator.free(path);
-        return null;
+    if (!registry.subKeyExists(hive, sub_key)) {
+        return .missing;
     }
 
-    const mtime = registry.queryQwordOptional(hive, sub_key, "Mtime") catch null orelse {
+    const path = registry.queryString(allocator, hive, sub_key, "Path") catch {
+        return .missing;
+    };
+    errdefer allocator.free(path);
+
+    const size = readOptionalI64(hive, sub_key, "Size") orelse {
         allocator.free(path);
-        return null;
+        return .{ .incomplete = "Size" };
+    };
+
+    const mtime = readOptionalU64(hive, sub_key, "Mtime") orelse {
+        allocator.free(path);
+        return .{ .incomplete = "Mtime" };
     };
 
     const thumbprint = if (require_thumbprint)
         registry.queryString(allocator, hive, sub_key, "Thumbprint") catch {
             allocator.free(path);
-            return null;
+            return .{ .incomplete = "Thumbprint" };
         }
     else
         try allocator.dupe(u8, "");
@@ -726,7 +751,7 @@ fn loadCacheEntryAt(allocator: std.mem.Allocator, sub_key: []const u8, require_t
     const digest = registry.queryString(allocator, hive, sub_key, "Digest") catch {
         allocator.free(path);
         allocator.free(thumbprint);
-        return null;
+        return .{ .incomplete = "Digest" };
     };
     errdefer allocator.free(digest);
 
@@ -734,33 +759,34 @@ fn loadCacheEntryAt(allocator: std.mem.Allocator, sub_key: []const u8, require_t
         allocator.free(path);
         allocator.free(thumbprint);
         allocator.free(digest);
-        return null;
+        return .{ .incomplete = "VolumeSerial" };
     };
-    const file_id = registry.queryQwordOptional(hive, sub_key, "FileID") catch null orelse {
+    const file_id = readOptionalU64(hive, sub_key, "FileID") orelse {
         allocator.free(path);
         allocator.free(thumbprint);
         allocator.free(digest);
-        return null;
+        return .{ .incomplete = "FileID" };
     };
-    const usn = registry.queryQwordOptional(hive, sub_key, "USN") catch null orelse {
+    const usn = readOptionalU64(hive, sub_key, "USN") orelse {
         allocator.free(path);
         allocator.free(thumbprint);
         allocator.free(digest);
-        return null;
+        return .{ .incomplete = "USN" };
     };
 
-    const sig = registry.queryBinaryOptional(allocator, hive, sub_key, "Sig") catch null orelse {
+    const sig = registry.queryBinaryOptional(allocator, hive, sub_key, "Sig") catch {
         allocator.free(path);
         allocator.free(thumbprint);
         allocator.free(digest);
-        return null;
+        return .{ .incomplete = "Sig" };
     };
+    errdefer allocator.free(sig);
     if (sig.len == 0) {
         allocator.free(path);
         allocator.free(thumbprint);
         allocator.free(digest);
         allocator.free(sig);
-        return null;
+        return .{ .incomplete = "Sig" };
     }
 
     const version = registry.queryDwordOptional(hive, sub_key, "Version") catch null orelse {
@@ -768,12 +794,12 @@ fn loadCacheEntryAt(allocator: std.mem.Allocator, sub_key: []const u8, require_t
         allocator.free(thumbprint);
         allocator.free(digest);
         allocator.free(sig);
-        return null;
+        return .{ .incomplete = "Version" };
     };
 
-    return CacheEntry{
+    return .{ .found = .{
         .path = path,
-        .size = size.?,
+        .size = size,
         .mtime = mtime,
         .thumbprint = thumbprint,
         .digest = digest,
@@ -782,7 +808,7 @@ fn loadCacheEntryAt(allocator: std.mem.Allocator, sub_key: []const u8, require_t
         .usn = usn,
         .sig = sig,
         .version = version,
-    };
+    } };
 }
 
 pub fn canonicalScriptPayload(
@@ -847,11 +873,17 @@ pub fn ensureDelegatedScriptTrusted(
     };
     defer allocator.free(cache_key);
 
-    const entry_opt = loadScriptCacheEntry(allocator, cache_key) catch {
+    const lookup = loadScriptCacheEntryStatus(allocator, cache_key) catch {
         return VerifyOutcome.failedStatic("unable to read delegated script trust cache");
     };
-    const entry = entry_opt orelse {
-        return VerifyOutcome.failedStatic("delegated script is not trusted (added after install/reshim)");
+    const entry = switch (lookup) {
+        .missing => return VerifyOutcome.failedStatic("delegated script is not trusted (run nvm reshim or reinstall the version to trust package-manager entrypoints)"),
+        .incomplete => |field| {
+            var outcome = VerifyOutcome{ .result = .failed };
+            outcome.setReason("delegated script trust cache entry is incomplete (missing {s}); run nvm reshim or nvm doctor --autofix", .{field});
+            return outcome;
+        },
+        .found => |cached| cached,
     };
     defer entry.deinit(allocator);
 

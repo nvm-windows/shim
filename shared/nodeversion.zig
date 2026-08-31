@@ -237,6 +237,33 @@ fn loadPolicyOrPrefBool(config_hives: []const windows.HKEY, value_name: []const 
     return false;
 }
 
+/// Returns installs/vX for the configured active version, or null when unset/missing.
+pub fn activeVersionInstallDir(allocator: std.mem.Allocator, install_root: []const u8) !?[]u8 {
+    const config_hives = registry.preferenceHives();
+    const raw_version = registry.queryStringWithFallback(allocator, config_hives, reg_path, reg_value_version) catch return null;
+    defer allocator.free(raw_version);
+
+    const trimmed = std.mem.trim(u8, raw_version, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    const version = try resolver.normalizeVersionSpec(allocator, trimmed);
+    defer allocator.free(version);
+    if (version.len == 0) return null;
+
+    const version_dir_name = try std.fmt.allocPrint(allocator, "v{s}", .{version});
+    defer allocator.free(version_dir_name);
+
+    const version_dir = try std.fs.path.join(allocator, &.{ install_root, version_dir_name });
+    errdefer allocator.free(version_dir);
+
+    std.fs.accessAbsolute(version_dir, .{}) catch {
+        allocator.free(version_dir);
+        return null;
+    };
+
+    return version_dir;
+}
+
 pub fn loadInstallRoot(allocator: std.mem.Allocator) ![]u8 {
     const config_hives = registry.preferenceHives();
     const raw_root = registry.queryStringWithFallback(allocator, config_hives, reg_path, reg_value_root) catch

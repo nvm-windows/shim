@@ -128,11 +128,7 @@ pub fn main() !void {
 
     if (cmd_names.len == 0) {
         prewarmShims(allocator, shim_dir, silent);
-        // --silent runs on every nvm use. Script trust for unchanged shims is
-        // unchanged; Go PrewarmVerifyCache signs the active node.exe after reshim.
-        if (!silent) {
-            signVersionScripts(allocator, install_root, target_version_dir);
-        }
+        signVersionScriptsAfterReshim(allocator, install_root, target_version_dir, silent);
         try writeStdoutf(allocator, silent, "All shims up to date.\n", .{});
         return;
     }
@@ -192,7 +188,31 @@ pub fn main() !void {
 
     try writeStdoutf(allocator, silent, "\nCreated {d} shim(s).\n", .{linked});
     prewarmShims(allocator, shim_dir, silent);
-    signVersionScripts(allocator, install_root, target_version_dir);
+    signVersionScriptsAfterReshim(allocator, install_root, target_version_dir, silent);
+}
+
+fn signVersionScriptsAfterReshim(
+    allocator: std.mem.Allocator,
+    install_root: []const u8,
+    target_version_dir: ?[]const u8,
+    silent: bool,
+) void {
+    if (target_version_dir) |version_dir| {
+        signVersionScripts(allocator, install_root, version_dir);
+        return;
+    }
+    if (silent) {
+        signActiveVersionScripts(allocator, install_root);
+        return;
+    }
+    signVersionScripts(allocator, install_root, null);
+}
+
+fn signActiveVersionScripts(allocator: std.mem.Allocator, install_root: []const u8) void {
+    const version_dir_opt = nodeversion.activeVersionInstallDir(allocator, install_root) catch return;
+    const version_dir = version_dir_opt orelse return;
+    defer allocator.free(version_dir);
+    signVersionScripts(allocator, install_root, version_dir);
 }
 
 fn signVersionScripts(allocator: std.mem.Allocator, install_root: []const u8, target_version_dir: ?[]const u8) void {

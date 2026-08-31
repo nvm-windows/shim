@@ -145,6 +145,21 @@ pub fn queryMultiStringOptional(allocator: std.mem.Allocator, hive: windows.HKEY
     return try parseMultiStringUtf16(allocator, wide_buf);
 }
 
+pub fn subKeyExists(hive: windows.HKEY, sub_key: []const u8) bool {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const sub_key_w = std.unicode.utf8ToUtf16LeAllocZ(allocator, sub_key) catch return false;
+    defer allocator.free(sub_key_w);
+
+    var hkey: windows.HKEY = undefined;
+    const rc_open = windows.advapi32.RegOpenKeyExW(hive, sub_key_w, 0, windows.KEY_QUERY_VALUE, &hkey);
+    if (rc_open != 0) return false;
+    defer _ = windows.advapi32.RegCloseKey(hkey);
+    return true;
+}
+
 pub fn queryDwordOptional(hive: windows.HKEY, sub_key: []const u8, value_name: []const u8) !?u32 {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
