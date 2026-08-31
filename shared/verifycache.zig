@@ -779,6 +779,11 @@ fn loadCacheEntryAt(allocator: std.mem.Allocator, sub_key: []const u8, require_t
         allocator.free(thumbprint);
         allocator.free(digest);
         return .{ .incomplete = "Sig" };
+    } orelse {
+        allocator.free(path);
+        allocator.free(thumbprint);
+        allocator.free(digest);
+        return .{ .incomplete = "Sig" };
     };
     errdefer allocator.free(sig);
     if (sig.len == 0) {
