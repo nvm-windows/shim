@@ -49,13 +49,49 @@ pub fn versionSatisfiesSpec(allocator: std.mem.Allocator, spec: []const u8, vers
     return matchesAnyRequirement(parsed, req_set.alternatives);
 }
 
-pub fn resolveInstalledVersionSpec(allocator: std.mem.Allocator, root: []const u8, spec: []const u8, available_versions_text: ?[]const u8) !?[]u8 {
+pub fn isNamedAliasSpec(spec: []const u8) bool {
+    const trimmed = std.mem.trim(u8, spec, " \t\r\n");
+    if (trimmed.len == 0) return false;
+
+    if (std.ascii.eqlIgnoreCase(trimmed, "latest") or
+        std.ascii.eqlIgnoreCase(trimmed, "lts") or
+        std.ascii.eqlIgnoreCase(trimmed, "default") or
+        std.ascii.eqlIgnoreCase(trimmed, "current"))
+    {
+        return true;
+    }
+
+    return trimmed.len > 4 and std.ascii.eqlIgnoreCase(trimmed[0..4], "lts/");
+}
+
+pub fn resolveInstalledVersionSpec(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    spec: []const u8,
+    available_versions_text: ?[]const u8,
+    active_version: ?[]const u8,
+) !?[]u8 {
     const normalized = try normalizeVersionSpec(allocator, spec);
     defer allocator.free(normalized);
 
     if (normalized.len == 0) return null;
 
-    const req_set = try parseRequirementSet(allocator, normalized);
+    const req_set = parseRequirementSet(allocator, normalized) catch |err| switch (err) {
+        error.UnsupportedVersionSpec => {
+            if (available_versions_text) |catalog| {
+                if (try resolveNamedAliasSpec(allocator, normalized, catalog, active_version)) |concrete| {
+                    const exact_req = try exactRequirementFromVersion(concrete);
+                    if (try findBestInstalledVersion(allocator, root, &.{exact_req})) |installed| {
+                        allocator.free(concrete);
+                        return installed;
+                    }
+                    return concrete;
+                }
+            }
+            return error.UnsupportedVersionSpec;
+        },
+        else => return err,
+    };
     defer allocator.free(req_set.alternatives);
 
     if (try findBestInstalledVersion(allocator, root, req_set.alternatives)) |installed| {
@@ -67,6 +103,121 @@ pub fn resolveInstalledVersionSpec(allocator: std.mem.Allocator, root: []const u
     }
 
     return null;
+}
+
+fn exactRequirementFromVersion(version: []const u8) !Requirement {
+    const pattern = try parseVersionPattern(version);
+    const exact = SemVer{
+        .major = pattern.major.?,
+        .minor = pattern.minor orelse 0,
+        .patch = pattern.patch orelse 0,
+        .prerelease = pattern.prerelease,
+    };
+    return .{
+        .min = .{ .version = exact, .inclusive = true },
+        .max = .{ .version = exact, .inclusive = true },
+    };
+}
+
+fn resolveNamedAliasSpec(
+    allocator: std.mem.Allocator,
+    spec: []const u8,
+    catalog_text: []const u8,
+    active_version: ?[]const u8,
+) !?[]u8 {
+    const trimmed = std.mem.trim(u8, spec, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (std.ascii.eqlIgnoreCase(trimmed, "default") or std.ascii.eqlIgnoreCase(trimmed, "current")) {
+        if (active_version) |active| {
+            const bare = std.mem.trim(u8, active, " \t\r\n");
+            if (bare.len == 0) return null;
+            return try allocator.dupe(u8, bare);
+        }
+        return null;
+    }
+
+    const catalog = std.mem.trim(u8, catalog_text, " \t\r\n");
+    if (catalog.len == 0 or catalog[0] != '[') return null;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, catalog, .{}) catch return null;
+    defer parsed.deinit();
+
+    const entries = switch (parsed.value) {
+        .array => |arr| arr.items,
+        else => return null,
+    };
+    if (entries.len == 0) return null;
+
+    if (std.ascii.eqlIgnoreCase(trimmed, "latest")) {
+        return releaseEntryVersion(allocator, entries[0]);
+    }
+
+    if (std.ascii.eqlIgnoreCase(trimmed, "lts")) {
+        for (entries) |entry| {
+            if (releaseEntryIsLts(entry)) {
+                return releaseEntryVersion(allocator, entry);
+            }
+        }
+        return null;
+    }
+
+    const lts_prefix = "lts/";
+    if (trimmed.len > lts_prefix.len and std.ascii.eqlIgnoreCase(trimmed[0..lts_prefix.len], lts_prefix)) {
+        const name = std.mem.trim(u8, trimmed[lts_prefix.len..], " \t\r\n");
+        if (name.len == 0) return null;
+
+        for (entries) |entry| {
+            if (releaseEntryCodenameMatches(entry, name)) {
+                return releaseEntryVersion(allocator, entry);
+            }
+        }
+        return null;
+    }
+
+    return null;
+}
+
+fn releaseEntryVersion(allocator: std.mem.Allocator, entry: std.json.Value) !?[]u8 {
+    const obj = switch (entry) {
+        .object => |o| o,
+        else => return null,
+    };
+
+    const version_val = obj.get("version") orelse return null;
+    if (version_val != .string) return null;
+
+    const version = std.mem.trim(u8, version_val.string, " \t\r\n");
+    if (version.len == 0) return null;
+
+    return try allocator.dupe(u8, version);
+}
+
+fn releaseEntryIsLts(entry: std.json.Value) bool {
+    const obj = switch (entry) {
+        .object => |o| o,
+        else => return false,
+    };
+
+    const lts_val = obj.get("lts") orelse return false;
+    return switch (lts_val) {
+        .bool => |value| value,
+        .string => |value| value.len > 0 and !std.ascii.eqlIgnoreCase(value, "false"),
+        else => false,
+    };
+}
+
+fn releaseEntryCodenameMatches(entry: std.json.Value, name: []const u8) bool {
+    const obj = switch (entry) {
+        .object => |o| o,
+        else => return false,
+    };
+
+    const codename_val = obj.get("codename") orelse return false;
+    return switch (codename_val) {
+        .string => |value| std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), name),
+        else => false,
+    };
 }
 
 const RequirementSet = struct {
@@ -621,13 +772,13 @@ fn parseFullSemver(v: []const u8) !SemVer {
 }
 
 fn expectResolvedTo(allocator: std.mem.Allocator, root: []const u8, available: []const u8, spec: []const u8, expected: []const u8) !void {
-    const resolved = (try resolveInstalledVersionSpec(allocator, root, spec, available)).?;
+    const resolved = (try resolveInstalledVersionSpec(allocator, root, spec, available, null)).?;
     defer allocator.free(resolved);
     try std.testing.expectEqualStrings(expected, resolved);
 }
 
 fn expectUnsupported(allocator: std.mem.Allocator, root: []const u8, available: []const u8, spec: []const u8) !void {
-    try std.testing.expectError(error.UnsupportedVersionSpec, resolveInstalledVersionSpec(allocator, root, spec, available));
+    try std.testing.expectError(error.UnsupportedVersionSpec, resolveInstalledVersionSpec(allocator, root, spec, available, null));
 }
 
 test "resolve supports exact, comparator, caret, tilde, range, wildcard, partial, and prerelease specs" {
@@ -636,69 +787,97 @@ test "resolve supports exact, comparator, caret, tilde, range, wildcard, partial
     const available =
         "14.20.0 15.5.0 16.0.0 16.0.9 16.1.0 16.9.1 16.20.2 17.0.0 18.12.1 18.12.2 18.13.0 20.0.0-rc.1 20.0.0 20.0.1 21.0.0-beta.1 21.0.0-rc.1 21.0.0-rc.2 21.0.0 24.9.9 25.0.0 25.9.0";
 
-    const v_exact = (try resolveInstalledVersionSpec(allocator, root, "18.12.1", available)).?;
+    const v_exact = (try resolveInstalledVersionSpec(allocator, root, "18.12.1", available, null)).?;
     defer allocator.free(v_exact);
     try std.testing.expectEqualStrings("18.12.1", v_exact);
 
-    const v_gte = (try resolveInstalledVersionSpec(allocator, root, ">=16.0.0", available)).?;
+    const v_gte = (try resolveInstalledVersionSpec(allocator, root, ">=16.0.0", available, null)).?;
     defer allocator.free(v_gte);
     try std.testing.expectEqualStrings("16.0.0", v_gte);
 
-    const v_caret = (try resolveInstalledVersionSpec(allocator, root, "^16.0.0", available)).?;
+    const v_caret = (try resolveInstalledVersionSpec(allocator, root, "^16.0.0", available, null)).?;
     defer allocator.free(v_caret);
     try std.testing.expectEqualStrings("16.20.2", v_caret);
 
-    const v_tilde = (try resolveInstalledVersionSpec(allocator, root, "~16.0.0", available)).?;
+    const v_tilde = (try resolveInstalledVersionSpec(allocator, root, "~16.0.0", available, null)).?;
     defer allocator.free(v_tilde);
     try std.testing.expectEqualStrings("16.0.9", v_tilde);
 
-    const v_range = (try resolveInstalledVersionSpec(allocator, root, ">=14.0.0 <17.0.0", available)).?;
+    const v_range = (try resolveInstalledVersionSpec(allocator, root, ">=14.0.0 <17.0.0", available, null)).?;
     defer allocator.free(v_range);
     try std.testing.expectEqualStrings("16.20.2", v_range);
 
-    const v_wildcard = (try resolveInstalledVersionSpec(allocator, root, "16.x", available)).?;
+    const v_wildcard = (try resolveInstalledVersionSpec(allocator, root, "16.x", available, null)).?;
     defer allocator.free(v_wildcard);
     try std.testing.expectEqualStrings("16.20.2", v_wildcard);
 
-    const v_any = (try resolveInstalledVersionSpec(allocator, root, "*", available)).?;
+    const v_any = (try resolveInstalledVersionSpec(allocator, root, "*", available, null)).?;
     defer allocator.free(v_any);
     try std.testing.expectEqualStrings("25.9.0", v_any);
 
-    const v_partial_major = (try resolveInstalledVersionSpec(allocator, root, "25", available)).?;
+    const v_partial_major = (try resolveInstalledVersionSpec(allocator, root, "25", available, null)).?;
     defer allocator.free(v_partial_major);
     try std.testing.expectEqualStrings("25.9.0", v_partial_major);
 
-    const v_partial_minor = (try resolveInstalledVersionSpec(allocator, root, "18.12", available)).?;
+    const v_partial_minor = (try resolveInstalledVersionSpec(allocator, root, "18.12", available, null)).?;
     defer allocator.free(v_partial_minor);
     try std.testing.expectEqualStrings("18.12.2", v_partial_minor);
 
-    const v_lt_25 = (try resolveInstalledVersionSpec(allocator, root, "<25", available)).?;
+    const v_lt_25 = (try resolveInstalledVersionSpec(allocator, root, "<25", available, null)).?;
     defer allocator.free(v_lt_25);
     try std.testing.expectEqualStrings("24.9.9", v_lt_25);
 
-    const v_gt_20 = (try resolveInstalledVersionSpec(allocator, root, ">20", available)).?;
+    const v_gt_20 = (try resolveInstalledVersionSpec(allocator, root, ">20", available, null)).?;
     defer allocator.free(v_gt_20);
     try std.testing.expectEqualStrings("20.0.1", v_gt_20);
 
-    const v_exact_pr = (try resolveInstalledVersionSpec(allocator, root, "21.0.0-rc.2", available)).?;
+    const v_exact_pr = (try resolveInstalledVersionSpec(allocator, root, "21.0.0-rc.2", available, null)).?;
     defer allocator.free(v_exact_pr);
     try std.testing.expectEqualStrings("21.0.0-rc.2", v_exact_pr);
 
-    const v_lt_pr = (try resolveInstalledVersionSpec(allocator, root, "<21.0.0", available)).?;
+    const v_lt_pr = (try resolveInstalledVersionSpec(allocator, root, "<21.0.0", available, null)).?;
     defer allocator.free(v_lt_pr);
     try std.testing.expectEqualStrings("21.0.0-rc.2", v_lt_pr);
 
-    const v_or = (try resolveInstalledVersionSpec(allocator, root, ">=14 <15 || >=24 <25", available)).?;
+    const v_or = (try resolveInstalledVersionSpec(allocator, root, ">=14 <15 || >=24 <25", available, null)).?;
     defer allocator.free(v_or);
     try std.testing.expectEqualStrings("24.9.9", v_or);
 
-    const v_hyphen_full = (try resolveInstalledVersionSpec(allocator, root, "20.0.0-rc.1 - 20.0.1", available)).?;
+    const v_hyphen_full = (try resolveInstalledVersionSpec(allocator, root, "20.0.0-rc.1 - 20.0.1", available, null)).?;
     defer allocator.free(v_hyphen_full);
     try std.testing.expectEqualStrings("20.0.1", v_hyphen_full);
 
-    const v_hyphen_partial = (try resolveInstalledVersionSpec(allocator, root, "20 - 21", available)).?;
+    const v_hyphen_partial = (try resolveInstalledVersionSpec(allocator, root, "20 - 21", available, null)).?;
     defer allocator.free(v_hyphen_partial);
     try std.testing.expectEqualStrings("21.0.0", v_hyphen_partial);
+}
+
+test "resolve supports named aliases from releases json catalog" {
+    const allocator = std.testing.allocator;
+    const root = "C:\\does-not-exist";
+    const catalog =
+        \\[
+        \\  {"version":"26.8.1","lts":false,"codename":null},
+        \\  {"version":"22.17.0","lts":true,"codename":"Jod"},
+        \\  {"version":"20.19.4","lts":true,"codename":"Iron"}
+        \\]
+    ;
+
+    const latest = (try resolveInstalledVersionSpec(allocator, root, "latest", catalog, null)).?;
+    defer allocator.free(latest);
+    try std.testing.expectEqualStrings("26.8.1", latest);
+
+    const lts = (try resolveInstalledVersionSpec(allocator, root, "lts", catalog, null)).?;
+    defer allocator.free(lts);
+    try std.testing.expectEqualStrings("22.17.0", lts);
+
+    const lts_name = (try resolveInstalledVersionSpec(allocator, root, "lts/iron", catalog, null)).?;
+    defer allocator.free(lts_name);
+    try std.testing.expectEqualStrings("20.19.4", lts_name);
+
+    const current = (try resolveInstalledVersionSpec(allocator, root, "current", catalog, "22.23.2")).?;
+    defer allocator.free(current);
+    try std.testing.expectEqualStrings("22.23.2", current);
 }
 
 test "installed versions prefer newest match before fallback behavior" {
@@ -716,7 +895,7 @@ test "installed versions prefer newest match before fallback behavior" {
 
     const available = "20.0.1 21.0.0 25.9.0";
 
-    const resolved = (try resolveInstalledVersionSpec(allocator, root, ">20", available)).?;
+    const resolved = (try resolveInstalledVersionSpec(allocator, root, ">20", available, null)).?;
     defer allocator.free(resolved);
 
     try std.testing.expectEqualStrings("23.1.4", resolved);

@@ -520,13 +520,17 @@ fn reconcileShimExecutables(
             defer allocator.free(shim_path);
 
             if (force or !shimintegrity.filesHaveSameContents(shim_path, proxy_path)) {
-                if (force) {
+            if (force) {
+                if (!shimintegrity.filesHaveSameContents(shim_path, proxy_path)) {
                     try removals.append(allocator, .{
                         .file_name = try allocator.dupe(u8, entry.name),
                         .log_module_removed = false,
                     });
-                    continue;
+                } else {
+                    try existing.put(try allocator.dupe(u8, key), {});
                 }
+                continue;
+            }
 
                 try removals.append(allocator, .{
                     .file_name = try allocator.dupe(u8, entry.name),
@@ -557,7 +561,11 @@ fn reconcileShimExecutables(
 
         deleteFileWithRetries(remove_path) catch {
             retireStaleShim(allocator, shim_dir, candidate.file_name) catch |err| {
-                std.debug.print("  failed to replace {s}: {}\n", .{ candidate.file_name, err });
+                if (err == error.AccessDenied) {
+                    std.debug.print("  skipped {s}: access denied (close using processes, then run 'nvm reshim --force')\n", .{candidate.file_name});
+                } else {
+                    std.debug.print("  failed to replace {s}: {}\n", .{ candidate.file_name, err });
+                }
                 continue;
             };
         };

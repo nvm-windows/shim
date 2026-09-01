@@ -57,6 +57,13 @@ pub fn main() !void {
 
     var resolved = nodeversion.resolveConfiguredNode(allocator, cfg, parsed_args.override_version) catch |err| switch (err) {
         error.NoActiveVersion => noActiveVersionConfigured(),
+        error.NoVersionsInstalled => errors.noVersionsInstalled(),
+        error.UnsupportedVersionSpec => {
+            if (!nodeversion.hasInstalledVersions(cfg.root)) {
+                errors.noVersionsInstalled();
+            }
+            errors.unresolvedVersionSpec(nodeversion.lastResolutionSpec());
+        },
         else => return err,
     };
     defer resolved.deinit(allocator);

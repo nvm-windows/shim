@@ -15,7 +15,25 @@ pub fn nodeNotFound(ver: []const u8) noreturn {
 }
 
 pub fn noActiveVersionConfigured() noreturn {
-    std.debug.print("Please install or specify (use) a version to run.\n", .{});
+    std.debug.print("No active Node.js version is configured. Run `nvm install <version>` then `nvm use <version>`.\n", .{});
+    std.process.exit(1);
+}
+
+pub fn noVersionsInstalled() noreturn {
+    std.debug.print("No Node.js versions are installed. Run `nvm install <version>` first.\n", .{});
+    std.process.exit(1);
+}
+
+pub fn unresolvedVersionSpec(spec: []const u8) noreturn {
+    const trimmed = std.mem.trim(u8, spec, " \t\r\n");
+    if (trimmed.len > 0) {
+        std.debug.print(
+            "Could not resolve Node.js version \"{s}\". Install a matching version with `nvm install`, or run `nvm use` to select an installed version.\n",
+            .{trimmed},
+        );
+    } else {
+        std.debug.print("Could not resolve the configured Node.js version. Run `nvm use` to select an installed version.\n", .{});
+    }
     std.process.exit(1);
 }
 

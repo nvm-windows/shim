@@ -68,6 +68,30 @@ pub const DetectedVersion = struct {
     source: []const u8,
 };
 
+var last_resolution_spec: []const u8 = "";
+
+pub fn lastResolutionSpec() []const u8 {
+    return last_resolution_spec;
+}
+
+pub fn hasInstalledVersions(root: []const u8) bool {
+    var install_dir = std.fs.openDirAbsolute(root, .{ .iterate = true }) catch return false;
+    defer install_dir.close();
+
+    var it = install_dir.iterate();
+    while (it.next() catch return false) |entry| {
+        if (entry.kind != .directory) continue;
+        if (entry.name.len < 2 or entry.name[0] != 'v') continue;
+
+        var version_dir = install_dir.openDir(entry.name, .{}) catch continue;
+        defer version_dir.close();
+        version_dir.access("node.exe", .{}) catch continue;
+        return true;
+    }
+
+    return false;
+}
+
 pub const ResolvedNode = struct {
     requested_version: []const u8,
     effective_version: []const u8,
@@ -301,13 +325,31 @@ pub fn resolveConfiguredNode(allocator: std.mem.Allocator, cfg: ShimConfig, over
         version_source = "override";
     }
 
+    last_resolution_spec = requested_version;
+
     if (requested_version.len == 0) {
         if (detected_version) |value| allocator.free(value);
         return error.NoActiveVersion;
     }
 
     const effective_version = selectEffectiveVersion(cfg.aliases, requested_version);
-    const resolved_version = try resolveInstalledVersionSpec(allocator, cfg.root, effective_version);
+    const resolved_version = resolveVersionForConfig(allocator, cfg, effective_version, detected_version != null) catch |err| switch (err) {
+        error.UnsupportedVersionSpec => blk: {
+            if (detected_version) |value| {
+                allocator.free(value);
+                detected_version = null;
+            }
+            if (cfg.active_version.len == 0) {
+                if (!hasInstalledVersions(cfg.root)) return error.NoVersionsInstalled;
+                return err;
+            }
+            requested_version = cfg.active_version;
+            version_source = "system_default";
+            const fallback_effective = selectEffectiveVersion(cfg.aliases, requested_version);
+            break :blk try resolveVersionForConfig(allocator, cfg, fallback_effective, false);
+        },
+        else => return err,
+    };
     errdefer if (resolved_version) |value| allocator.free(value);
 
     const node_bin = if (resolved_version) |value|
@@ -358,15 +400,52 @@ pub fn detectVersionFromCwd(allocator: std.mem.Allocator, detect_files: []const 
     return null;
 }
 
-pub fn resolveInstalledVersionSpec(allocator: std.mem.Allocator, root: []const u8, spec: []const u8) !?[]u8 {
-    if (try resolver.resolveInstalledVersionSpec(allocator, root, spec, null)) |installed| {
+fn resolveVersionForConfig(
+    allocator: std.mem.Allocator,
+    cfg: ShimConfig,
+    spec: []const u8,
+    allow_named_catalog: bool,
+) !?[]u8 {
+    const active_version: ?[]const u8 = if (cfg.active_version.len > 0) cfg.active_version else null;
+
+    if (try resolver.resolveInstalledVersionSpec(allocator, cfg.root, spec, null, active_version)) |installed| {
         return installed;
+    }
+
+    if (!allow_named_catalog and resolver.isNamedAliasSpec(spec)) {
+        if (!hasInstalledVersions(cfg.root)) return error.NoVersionsInstalled;
+        return error.UnsupportedVersionSpec;
+    }
+
+    const json_output = execNvmCapture(allocator, &.{ "list", "releases", "--json", "--no-limit" }) catch null;
+    if (json_output) |output| {
+        defer allocator.free(output);
+        return resolver.resolveInstalledVersionSpec(allocator, cfg.root, spec, output, active_version);
     }
 
     const output = execNvmCapture(allocator, &.{ "list", "available" }) catch return null;
     defer allocator.free(output);
 
-    return resolver.resolveInstalledVersionSpec(allocator, root, spec, output);
+    return resolver.resolveInstalledVersionSpec(allocator, cfg.root, spec, output, active_version);
+}
+
+pub fn resolveInstalledVersionSpec(allocator: std.mem.Allocator, root: []const u8, spec: []const u8) !?[]u8 {
+    if (try resolver.resolveInstalledVersionSpec(allocator, root, spec, null, null)) |installed| {
+        return installed;
+    }
+
+    const json_output = execNvmCapture(allocator, &.{ "list", "releases", "--json", "--no-limit" }) catch null;
+    if (json_output) |output| {
+        defer allocator.free(output);
+        if (try resolver.resolveInstalledVersionSpec(allocator, root, spec, output, null)) |installed| {
+            return installed;
+        }
+    }
+
+    const output = execNvmCapture(allocator, &.{ "list", "available" }) catch return null;
+    defer allocator.free(output);
+
+    return resolver.resolveInstalledVersionSpec(allocator, root, spec, output, null);
 }
 
 pub fn resolveNodeBinaryPath(allocator: std.mem.Allocator, primary_root: []const u8, version: []const u8) !?[]u8 {
