@@ -249,13 +249,16 @@ fn spawnSignVersionScripts(allocator: std.mem.Allocator, nvm_path: []const u8, v
 }
 
 fn prewarmShims(allocator: std.mem.Allocator, shim_dir: []const u8, silent: bool) void {
-    // --silent is every nvm.exe bootstrap + nvm use. Spawning node -v without
-    // waiting leaves installs\vX\node.exe mapped, so nvm rm of the default
-    // version hits unlinkat Access is denied. Skip here; Go PrewarmVerifyCache
-    // still signs the HKCU verify cache after reshim.
-    if (silent) return;
-    runPrewarmCommand(allocator, shim_dir, "npm");
-    runPrewarmCommand(allocator, shim_dir, "node");
+    // Wait (not fire-and-forget) so KillOnClose / unlink locks stay safe.
+    // Always run on --silent (`nvm use` / install) so first launch of node and
+    // common package-manager shims after a version switch is warm.
+    // Timeout kills hung prewarm (same idea as installer #1390).
+    // Missing shims (e.g. yarn not installed) are skipped.
+    _ = silent;
+    const names = [_][]const u8{ "node", "npm", "npx", "yarn", "pnpm" };
+    for (names) |name| {
+        runPrewarmCommand(allocator, shim_dir, name);
+    }
 }
 
 fn runPrewarmCommand(allocator: std.mem.Allocator, shim_dir: []const u8, command_name: []const u8) void {
@@ -273,6 +276,16 @@ fn runPrewarmCommand(allocator: std.mem.Allocator, shim_dir: []const u8, command
     child.stderr_behavior = .Ignore;
 
     child.spawn() catch return;
+    // On Windows, Child.id is hProcess. Cap wait so a hung node/npm cannot
+    // block nvm use forever; kill + cleanup on timeout.
+    windows.WaitForSingleObjectEx(child.id, 15_000, false) catch {
+        // kill() reaps on success; AlreadyTerminated race still needs wait().
+        _ = child.kill() catch {
+            _ = child.wait() catch {};
+            return;
+        };
+        return;
+    };
     _ = child.wait() catch return;
 }
 
