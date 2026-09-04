@@ -124,7 +124,7 @@ pub fn main() !void {
             \\
             \\Path: {s}
             \\Reason: {s}
-            \\Action: Reinstall this version into a private install root.
+            \\Action: Run `nvm doctor --autofix` (elevation prompted if needed), or use a private root under %LOCALAPPDATA%.
             \\If this change was unexpected, contact your administrator and review NVM event logs.
             \\Event code: NVM4305
             \\
@@ -468,7 +468,7 @@ fn reportDelegatedTrustFailure(
         \\Command: {s}
         \\File: {s}
         \\Reason: {s}
-        \\Action: Reinstall this Node.js version or run `nvm reshim` after a trusted install.
+        \\Action: Run `nvm reshim` (re-signs package-manager scripts) or `nvm doctor --autofix`.
         \\If this change was unexpected, contact your administrator and review NVM event logs.
         \\Event code: NVM4306
         \\
@@ -953,10 +953,12 @@ fn asciiEndsWithIgnoreCase(value: []const u8, suffix: []const u8) bool {
 }
 
 fn runReshim(allocator: std.mem.Allocator, install_root: []const u8, node_install_dir: []const u8) void {
-    const reshim_path = std.fs.path.resolve(allocator, &.{ install_root, "..", "utils", "reshim.exe" }) catch return;
+    _ = install_root;
+    const reshim_path = nodeversion.resolveReshimExePath(allocator) catch {
+        std.debug.print("reshim.exe not found under ProgramRoot\\utils; skipping post-global reshim\n", .{});
+        return;
+    };
     defer allocator.free(reshim_path);
-
-    std.fs.cwd().access(reshim_path, .{}) catch return;
 
     var child = std.process.Child.init(&.{ reshim_path, node_install_dir }, allocator);
     child.stdin_behavior = .Ignore;

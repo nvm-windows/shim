@@ -515,6 +515,91 @@ pub fn runNvmCommand(allocator: std.mem.Allocator, nvm_args: []const []const u8)
     if (term != .Exited or term.Exited != 0) return error.AutoInstallFailed;
 }
 
+/// ProgramRoot holds nvm.exe and utils\*. Prefer NVM_HOME, then self layout, then default LOCALAPPDATA path.
+pub fn resolveProgramRoot(allocator: std.mem.Allocator) ![]u8 {
+    if (std.process.getEnvVarOwned(allocator, "NVM_HOME")) |home| {
+        defer allocator.free(home);
+        const trimmed = std.mem.trimRight(u8, home, "\\/");
+        if (trimmed.len > 0) {
+            const nvm_exe = try std.fs.path.join(allocator, &.{ trimmed, "nvm.exe" });
+            defer allocator.free(nvm_exe);
+            if (std.fs.accessAbsolute(nvm_exe, .{})) |_| {
+                return try allocator.dupe(u8, trimmed);
+            } else |_| {}
+        }
+    } else |_| {}
+
+    const self_path = try std.fs.selfExePathAlloc(allocator);
+    defer allocator.free(self_path);
+    const self_dir = std.fs.path.dirname(self_path) orelse return error.ProgramRootNotFound;
+    const self_base = std.fs.path.basename(self_path);
+    const self_dir_base = std.fs.path.basename(self_dir);
+
+    // utils\reshim.exe / utils\proxy.exe → ProgramRoot = parent(utils)
+    if (std.ascii.eqlIgnoreCase(self_dir_base, "utils")) {
+        if (std.fs.path.dirname(self_dir)) |root| {
+            const nvm_exe = try std.fs.path.join(allocator, &.{ root, "nvm.exe" });
+            defer allocator.free(nvm_exe);
+            if (std.fs.accessAbsolute(nvm_exe, .{})) |_| {
+                return try allocator.dupe(u8, root);
+            } else |_| {}
+        }
+    }
+
+    // nvm.exe itself
+    if (std.ascii.eqlIgnoreCase(self_base, "nvm.exe")) {
+        return try allocator.dupe(u8, self_dir);
+    }
+
+    // Sibling nvm.exe (ProgramRoot == cwd of caller)
+    {
+        const nvm_exe = try std.fs.path.join(allocator, &.{ self_dir, "nvm.exe" });
+        defer allocator.free(nvm_exe);
+        if (std.fs.accessAbsolute(nvm_exe, .{})) |_| {
+            return try allocator.dupe(u8, self_dir);
+        } else |_| {}
+    }
+
+    // Parent of self_dir (DataRoot\.shim → DataRoot when it equals ProgramRoot)
+    if (std.fs.path.dirname(self_dir)) |parent| {
+        const nvm_exe = try std.fs.path.join(allocator, &.{ parent, "nvm.exe" });
+        defer allocator.free(nvm_exe);
+        if (std.fs.accessAbsolute(nvm_exe, .{})) |_| {
+            return try allocator.dupe(u8, parent);
+        } else |_| {}
+    }
+
+    if (std.process.getEnvVarOwned(allocator, "LOCALAPPDATA")) |lad| {
+        defer allocator.free(lad);
+        const root = try std.fs.path.join(allocator, &.{ lad, "Author Software", "nvm" });
+        errdefer allocator.free(root);
+        const nvm_exe = try std.fs.path.join(allocator, &.{ root, "nvm.exe" });
+        defer allocator.free(nvm_exe);
+        try std.fs.accessAbsolute(nvm_exe, .{});
+        return root;
+    } else |_| {}
+
+    return error.ProgramRootNotFound;
+}
+
+pub fn resolveNvmExePath(allocator: std.mem.Allocator) ![]u8 {
+    const root = try resolveProgramRoot(allocator);
+    defer allocator.free(root);
+    const nvm_exe = try std.fs.path.join(allocator, &.{ root, "nvm.exe" });
+    errdefer allocator.free(nvm_exe);
+    try std.fs.accessAbsolute(nvm_exe, .{});
+    return nvm_exe;
+}
+
+pub fn resolveReshimExePath(allocator: std.mem.Allocator) ![]u8 {
+    const root = try resolveProgramRoot(allocator);
+    defer allocator.free(root);
+    const reshim = try std.fs.path.join(allocator, &.{ root, "utils", "reshim.exe" });
+    errdefer allocator.free(reshim);
+    try std.fs.accessAbsolute(reshim, .{});
+    return reshim;
+}
+
 pub fn autoInstallVersion(allocator: std.mem.Allocator, version: []const u8) !void {
     try runNvmCommand(allocator, &.{ "install", version });
 }
@@ -820,16 +905,6 @@ fn simulateNvmCommandLookup(allocator: std.mem.Allocator) void {
     const command_hives = registry.commandLookupHives();
     const value = registry.queryStringWithFallback(allocator, command_hives, reg_nvm_cmd_path, "") catch return;
     allocator.free(value);
-}
-
-fn resolveNvmExePath(allocator: std.mem.Allocator) ![]u8 {
-    const self_path = try std.fs.selfExePathAlloc(allocator);
-    defer allocator.free(self_path);
-
-    const self_dir = std.fs.path.dirname(self_path) orelse return error.NvmExecutableNotFound;
-    const nvm_exe = try std.fs.path.join(allocator, &.{ self_dir, "..", "nvm.exe" });
-    std.fs.cwd().access(nvm_exe, .{}) catch return error.NvmExecutableNotFound;
-    return nvm_exe;
 }
 
 fn parseCsvList(allocator: std.mem.Allocator, raw: []const u8) ![]const []const u8 {

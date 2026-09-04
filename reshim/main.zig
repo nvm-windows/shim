@@ -216,9 +216,11 @@ fn signActiveVersionScripts(allocator: std.mem.Allocator, install_root: []const 
 }
 
 fn signVersionScripts(allocator: std.mem.Allocator, install_root: []const u8, target_version_dir: ?[]const u8) void {
-    const nvm_path = std.fs.path.resolve(allocator, &.{ install_root, "..", "nvm.exe" }) catch return;
+    const nvm_path = nodeversion.resolveNvmExePath(allocator) catch {
+        std.debug.print("nvm.exe not found under ProgramRoot; cannot re-sign version scripts\n", .{});
+        return;
+    };
     defer allocator.free(nvm_path);
-    std.fs.accessAbsolute(nvm_path, .{}) catch return;
 
     if (target_version_dir) |version_dir| {
         spawnSignVersionScripts(allocator, nvm_path, version_dir);
