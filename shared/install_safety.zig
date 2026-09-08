@@ -2,13 +2,21 @@ const std = @import("std");
 const windows = std.os.windows;
 
 const file_attribute_reparse_point: u32 = 0x400;
-const file_generic_write: u32 = 0x00120116;
-const generic_write: u32 = 0x40000000;
-const generic_all: u32 = 0x10000000;
+// Write-capable bits only. Do not include READ_CONTROL/SYNCHRONIZE — those
+// overlap FILE_GENERIC_READ/EXECUTE and false-positive AuthUsers RX ACEs.
+// Keep aligned with common/fs/acl_windows.go crossUserWriteMask (0x500D0156).
+const file_write_data: u32 = 0x00000002;
+const file_append_data: u32 = 0x00000004;
+const file_write_ea: u32 = 0x00000010;
+const file_delete_child: u32 = 0x00000040;
+const file_write_attributes: u32 = 0x00000100;
 const delete_access: u32 = 0x00010000;
 const write_dac: u32 = 0x00040000;
 const write_owner: u32 = 0x00080000;
-const cross_user_write_mask: u32 = file_generic_write | generic_write | generic_all | delete_access | write_dac | write_owner;
+const generic_write: u32 = 0x40000000;
+const generic_all: u32 = 0x10000000;
+const cross_user_write_mask: u32 = file_write_data | file_append_data | file_write_ea | file_write_attributes |
+    file_delete_child | delete_access | write_dac | write_owner | generic_write | generic_all;
 
 const dacl_security_information: u32 = 0x00000004;
 const se_file_object: u32 = 1;
