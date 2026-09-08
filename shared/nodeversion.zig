@@ -218,21 +218,7 @@ pub fn tokenAllowsStructuredLogging(allocator: std.mem.Allocator, raw_token: []c
         if (temporary != .bool or temporary.bool) return false;
     }
 
-    var license_type: []const u8 = "";
-    if (claims.get("lic")) |license_value| {
-        if (license_value != .string) return false;
-        license_type = std.mem.trim(u8, license_value.string, " \t\r\n");
-    }
-    if (license_type.len == 0) {
-        const plan_value = claims.get("plan") orelse return false;
-        if (plan_value != .string) return false;
-        license_type = std.mem.trim(u8, plan_value.string, " \t\r\n");
-    }
-    if (!std.ascii.eqlIgnoreCase(license_type, "compliance") and
-        !std.ascii.eqlIgnoreCase(license_type, "governance"))
-    {
-        return false;
-    }
+    if (!claimsAllowStructuredLogging(claims)) return false;
 
     if (claims.get("nbf")) |not_before| {
         const timestamp = jsonInteger(not_before) orelse return false;
@@ -241,6 +227,46 @@ pub fn tokenAllowsStructuredLogging(allocator: std.mem.Allocator, raw_token: []c
     const expires = jsonInteger(claims.get("exp") orelse return false) orelse return false;
     const grace_seconds: i64 = 7 * 24 * 60 * 60;
     return now <= expires +| grace_seconds;
+}
+
+fn claimsAllowStructuredLogging(claims: std.json.ObjectMap) bool {
+    // Match Go common/token + licensing: lic is string or []string; audit/compliance/governance unlock SIEM.
+    if (claims.get("lic")) |license_value| {
+        if (licenseValueAllowsStructuredLogging(license_value)) return true;
+        // Empty lic falls through to plan.
+        if (licenseValueHasEntries(license_value)) return false;
+    }
+    const plan_value = claims.get("plan") orelse return false;
+    return licenseValueAllowsStructuredLogging(plan_value);
+}
+
+fn licenseValueHasEntries(value: std.json.Value) bool {
+    return switch (value) {
+        .string => |s| std.mem.trim(u8, s, " \t\r\n").len != 0,
+        .array => |items| items.items.len != 0,
+        else => true,
+    };
+}
+
+fn licenseValueAllowsStructuredLogging(value: std.json.Value) bool {
+    return switch (value) {
+        .string => |s| entitlementAllowsStructuredLogging(s),
+        .array => |items| blk: {
+            for (items.items) |item| {
+                if (item != .string) continue;
+                if (entitlementAllowsStructuredLogging(item.string)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn entitlementAllowsStructuredLogging(raw: []const u8) bool {
+    const entitlement = std.mem.trim(u8, raw, " \t\r\n");
+    return std.ascii.eqlIgnoreCase(entitlement, "audit") or
+        std.ascii.eqlIgnoreCase(entitlement, "compliance") or
+        std.ascii.eqlIgnoreCase(entitlement, "governance");
 }
 
 fn jsonInteger(value: std.json.Value) ?i64 {
@@ -1027,13 +1053,22 @@ test "tokenAllowsStructuredLogging accepts eligible license in grace window" {
     try std.testing.expect(tokenAllowsStructuredLogging(std.testing.allocator, token, 200 + (7 * 24 * 60 * 60)));
 }
 
+test "tokenAllowsStructuredLogging accepts audit entitlement array" {
+    const array_token = "header.eyJsaWMiOlsiYXVkaXQiLCJidWlsZCJdLCJ0bXAiOmZhbHNlLCJuYmYiOjEwMCwiZXhwIjoyMDB9.signature";
+    const string_audit = "header.eyJsaWMiOiJhdWRpdCIsInRtcCI6ZmFsc2UsIm5iZiI6MTAwLCJleHAiOjIwMH0.signature";
+    try std.testing.expect(tokenAllowsStructuredLogging(std.testing.allocator, array_token, 201));
+    try std.testing.expect(tokenAllowsStructuredLogging(std.testing.allocator, string_audit, 201));
+}
+
 test "tokenAllowsStructuredLogging rejects ineligible or invalid tokens" {
     const professional = "header.eyJsaWMiOiJwcm9mZXNzaW9uYWwiLCJ0bXAiOmZhbHNlLCJleHAiOjIwMH0.signature";
     const temporary = "header.eyJsaWMiOiJjb21wbGlhbmNlIiwidG1wIjp0cnVlLCJleHAiOjIwMH0.signature";
     const expired = "header.eyJwbGFuIjoiZ292ZXJuYW5jZSIsInRtcCI6ZmFsc2UsImV4cCI6MjAwfQ.signature";
+    const build_only = "header.eyJsaWMiOlsiYnVpbGQiXSwidG1wIjpmYWxzZSwiZXhwIjoyMDB9.signature";
 
     try std.testing.expect(!tokenAllowsStructuredLogging(std.testing.allocator, professional, 100));
     try std.testing.expect(!tokenAllowsStructuredLogging(std.testing.allocator, temporary, 100));
     try std.testing.expect(!tokenAllowsStructuredLogging(std.testing.allocator, expired, 201 + (7 * 24 * 60 * 60)));
+    try std.testing.expect(!tokenAllowsStructuredLogging(std.testing.allocator, build_only, 100));
     try std.testing.expect(!tokenAllowsStructuredLogging(std.testing.allocator, "invalid", 100));
 }
