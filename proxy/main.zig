@@ -954,18 +954,21 @@ fn asciiEndsWithIgnoreCase(value: []const u8, suffix: []const u8) bool {
 
 fn runReshim(allocator: std.mem.Allocator, install_root: []const u8, node_install_dir: []const u8) void {
     _ = install_root;
-    const reshim_path = nodeversion.resolveReshimExePath(allocator) catch {
-        std.debug.print("reshim.exe not found under ProgramRoot\\utils; skipping post-global reshim\n", .{});
+    // Route through nvm.exe --reshim so the CLI opens the .shim ACL write
+    // window. Spawning utils\reshim.exe alone fails against the locked DACL
+    // (manual `nvm reshim` worked because sync/cli unlock first).
+    const nvm_path = nodeversion.resolveNvmExePath(allocator) catch {
+        std.debug.print("nvm.exe not found under ProgramRoot; skipping post-global reshim\n", .{});
         return;
     };
-    defer allocator.free(reshim_path);
+    defer allocator.free(nvm_path);
 
-    var child = std.process.Child.init(&.{ reshim_path, node_install_dir }, allocator);
+    var child = std.process.Child.init(&.{ nvm_path, "--reshim", "--silent", node_install_dir }, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
 
-    // Detached on purpose: npm/yarn global install already finished; reshim
+    // Detached on purpose: npm/yarn global install already finished; nvm/reshim
     // must outlive proxy.exe. reshim.exe binds a kill-on-close job so its
     // own children cannot leak after it exits.
     child.spawn() catch return;
