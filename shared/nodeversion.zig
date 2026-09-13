@@ -15,6 +15,8 @@ const reg_value_auto_detect = config.reg_value_auto_detect;
 const reg_value_aliases = config.reg_value_aliases;
 const reg_value_log_executions = config.reg_value_log_executions;
 const reg_value_access_token = config.reg_value_access_token;
+const reg_value_last_license_verified_at = config.reg_value_last_license_verified_at;
+const reg_value_air_gapped = config.reg_value_air_gapped;
 const reg_value_enforce_permission_model = config.reg_value_enforce_permission_model;
 const reg_value_freeze_v8_global_objects = config.reg_value_freeze_v8_global_objects;
 const reg_value_disable_eval_and_string_execution = config.reg_value_disable_eval_and_string_execution;
@@ -186,13 +188,118 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
 }
 
 fn allowsStructuredLogging(allocator: std.mem.Allocator, hives: []const windows.HKEY) bool {
+    const now = std.time.timestamp();
+    if (!commercialLicenseTrustOK(allocator, hives, now)) return false;
     for (hives) |hive| {
         const token_optional = registry.queryBinaryOptional(allocator, hive, reg_path, reg_value_access_token) catch continue;
         const token = token_optional orelse continue;
         defer allocator.free(token);
-        return tokenAllowsStructuredLogging(allocator, token, std.time.timestamp());
+        return tokenAllowsStructuredLogging(allocator, token, now);
     }
     return false;
+}
+
+/// Online hosts require LastLicenseVerifiedAt within 30 days. AirGapped skips stamp check.
+pub fn commercialLicenseTrustOK(allocator: std.mem.Allocator, hives: []const windows.HKEY, now: i64) bool {
+    if (isAirGappedConfigured(hives)) return true;
+    const stamp_optional = readLastLicenseVerifiedAt(allocator, hives) orelse return false;
+    defer allocator.free(stamp_optional);
+    return licenseVerifiedWithinMaxAge(stamp_optional, now);
+}
+
+fn isAirGappedConfigured(hives: []const windows.HKEY) bool {
+    if (registry.queryDwordOptionalWithFallback(policy_hives[0..], policy_path, reg_value_air_gapped) catch null) |value| {
+        return value != 0;
+    }
+    if (registry.queryDwordOptionalWithFallback(hives, reg_path, reg_value_air_gapped) catch null) |value| {
+        return value != 0;
+    }
+    return false;
+}
+
+fn readLastLicenseVerifiedAt(allocator: std.mem.Allocator, hives: []const windows.HKEY) ?[]u8 {
+    if (registry.queryStringWithFallback(allocator, hives, reg_path, reg_value_last_license_verified_at)) |value| {
+        return value;
+    } else |_| {}
+    return null;
+}
+
+const license_verify_max_age_seconds: i64 = 30 * 24 * 60 * 60;
+
+/// Pure helper: RFC3339 UTC stamp within 30d of now. Empty/invalid → false.
+pub fn licenseVerifiedWithinMaxAge(stamp_rfc3339: []const u8, now: i64) bool {
+    const stamp = parseRfc3339UtcSeconds(std.mem.trim(u8, stamp_rfc3339, " \t\r\n\x00")) orelse return false;
+    return now <= stamp +| license_verify_max_age_seconds;
+}
+
+fn parseRfc3339UtcSeconds(raw: []const u8) ?i64 {
+    // Expect YYYY-MM-DDTHH:MM:SSZ or with numeric offset / fractional seconds truncated.
+    if (raw.len < 20) return null;
+    const year = parseFixedInt(raw[0..4]) orelse return null;
+    if (raw[4] != '-') return null;
+    const month = parseFixedInt(raw[5..7]) orelse return null;
+    if (raw[7] != '-') return null;
+    const day = parseFixedInt(raw[8..10]) orelse return null;
+    if (raw[10] != 'T' and raw[10] != 't') return null;
+    const hour = parseFixedInt(raw[11..13]) orelse return null;
+    if (raw[13] != ':') return null;
+    const minute = parseFixedInt(raw[14..16]) orelse return null;
+    if (raw[16] != ':') return null;
+    const second = parseFixedInt(raw[17..19]) orelse return null;
+
+    var idx: usize = 19;
+    // Skip fractional seconds.
+    if (idx < raw.len and raw[idx] == '.') {
+        idx += 1;
+        while (idx < raw.len and raw[idx] >= '0' and raw[idx] <= '9') : (idx += 1) {}
+    }
+
+    var offset_seconds: i64 = 0;
+    if (idx >= raw.len) return null;
+    if (raw[idx] == 'Z' or raw[idx] == 'z') {
+        idx += 1;
+    } else if (raw[idx] == '+' or raw[idx] == '-') {
+        const sign: i64 = if (raw[idx] == '-') -1 else 1;
+        idx += 1;
+        if (idx + 4 > raw.len) return null;
+        const off_h = parseFixedInt(raw[idx .. idx + 2]) orelse return null;
+        idx += 2;
+        if (idx < raw.len and raw[idx] == ':') idx += 1;
+        if (idx + 2 > raw.len) return null;
+        const off_m = parseFixedInt(raw[idx .. idx + 2]) orelse return null;
+        idx += 2;
+        offset_seconds = sign * ((@as(i64, @intCast(off_h)) * 60 + @as(i64, @intCast(off_m))) * 60);
+    } else return null;
+    if (idx != raw.len) return null;
+
+    const days = civilDaysFromYmd(year, month, day) orelse return null;
+    const day_seconds: i64 = @as(i64, @intCast(hour)) * 3600 + @as(i64, @intCast(minute)) * 60 + @as(i64, @intCast(second));
+    // Unix epoch 1970-01-01
+    const unix = days * 86400 + day_seconds - offset_seconds;
+    return unix;
+}
+
+fn parseFixedInt(digits: []const u8) ?u32 {
+    var value: u32 = 0;
+    for (digits) |c| {
+        if (c < '0' or c > '9') return null;
+        value = value * 10 + (c - '0');
+    }
+    return value;
+}
+
+fn civilDaysFromYmd(year: u32, month: u32, day: u32) ?i64 {
+    if (month < 1 or month > 12 or day < 1 or day > 31) return null;
+    // Howard Hinnant civil_from_days inverse (days since 1970-01-01).
+    var y: i64 = @as(i64, @intCast(year));
+    const m: i64 = @as(i64, @intCast(month));
+    const d: i64 = @as(i64, @intCast(day));
+    y -= @intFromBool(m <= 2);
+    const era: i64 = @divTrunc(y, 400) - @intFromBool(y < 0);
+    const yoe: i64 = y - era * 400;
+    const doy: i64 = @divTrunc((153 * (m + @as(i64, if (m > 2) -3 else 9)) + 2), 5) + d - 1;
+    const doe: i64 = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
 }
 
 pub fn tokenAllowsStructuredLogging(allocator: std.mem.Allocator, raw_token: []const u8, now: i64) bool {
@@ -1071,4 +1178,14 @@ test "tokenAllowsStructuredLogging rejects ineligible or invalid tokens" {
     try std.testing.expect(!tokenAllowsStructuredLogging(std.testing.allocator, expired, 201 + (7 * 24 * 60 * 60)));
     try std.testing.expect(!tokenAllowsStructuredLogging(std.testing.allocator, build_only, 100));
     try std.testing.expect(!tokenAllowsStructuredLogging(std.testing.allocator, "invalid", 100));
+}
+
+test "licenseVerifiedWithinMaxAge accepts fresh stamp and rejects stale" {
+    const stamp = "2026-09-01T00:00:00Z";
+    const stamp_unix: i64 = 1788220800; // 2026-09-01T00:00:00Z
+    try std.testing.expect(licenseVerifiedWithinMaxAge(stamp, stamp_unix));
+    try std.testing.expect(licenseVerifiedWithinMaxAge(stamp, stamp_unix + (30 * 24 * 60 * 60)));
+    try std.testing.expect(!licenseVerifiedWithinMaxAge(stamp, stamp_unix + (30 * 24 * 60 * 60) + 1));
+    try std.testing.expect(!licenseVerifiedWithinMaxAge("", stamp_unix));
+    try std.testing.expect(!licenseVerifiedWithinMaxAge("not-a-date", stamp_unix));
 }

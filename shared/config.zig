@@ -13,6 +13,7 @@ pub const reg_value_auto_detect = "AutoDetect";
 pub const reg_value_aliases = "Aliases";
 pub const reg_value_log_executions = "LogExecutions";
 pub const reg_value_access_token = "AccessToken";
+pub const reg_value_last_license_verified_at = "LastLicenseVerifiedAt";
 pub const reg_value_enforce_permission_model = "EnforcePermissionModel";
 pub const reg_value_freeze_v8_global_objects = "FreezeV8GlobalObjects";
 pub const reg_value_disable_eval_and_string_execution = "DisableEvalAndStringExecution";
