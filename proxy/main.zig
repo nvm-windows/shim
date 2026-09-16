@@ -1123,11 +1123,11 @@ fn enforceModuleFirewall(allocator: std.mem.Allocator, command_name: []const u8,
     // Empty list => default ALL (no enforcement).
     if (rules.len == 0) return;
 
-    // HTTPS remote policy: fail closed with message (full client in Go helper later).
-    if (rules.len == 1 and std.ascii.startsWithIgnoreCase(std.mem.trim(u8, rules[0], " \t"), "https://")) {
-        std.debug.print("NVM4403 Module firewall remote HTTPS policy is configured; local shim cannot evaluate URL lists yet. Blocked for safety.\n", .{});
-        eventlog.writeInfo(allocator, "proxy", "firewall remote URL policy blocked install (NVM4403)");
-        std.process.exit(1);
+    // HTTPS remote policy: evaluate via nvm.exe helper (Go TLS + timeout + pins).
+    if (module_firewall.listHasHttps(rules)) {
+        const pkgs = try collectPackageTokens(allocator, command_name, args);
+        try evaluateRemoteModuleFirewall(allocator, global, pkgs);
+        return;
     }
 
     const pkgs = try collectPackageTokens(allocator, command_name, args);
@@ -1151,6 +1151,54 @@ fn enforceModuleFirewall(allocator: std.mem.Allocator, command_name: []const u8,
     }
 }
 
+fn evaluateRemoteModuleFirewall(allocator: std.mem.Allocator, global: bool, pkgs: []const module_firewall.PackageSpec) !void {
+    defer allocator.free(pkgs);
+    if (pkgs.len == 0) return;
+
+    const nvm_path = nodeversion.resolveNvmExePath(allocator) catch {
+        std.debug.print("NVM4403 Module firewall remote HTTPS policy configured but nvm.exe not found.\n", .{});
+        eventlog.writeInfo(allocator, "proxy", "firewall remote URL blocked; nvm.exe missing (NVM4403)");
+        std.process.exit(1);
+    };
+    defer allocator.free(nvm_path);
+
+    var argv = std.ArrayListUnmanaged([]const u8){};
+    defer argv.deinit(allocator);
+    try argv.append(allocator, nvm_path);
+    try argv.append(allocator, "firewall");
+    try argv.append(allocator, "check-remote");
+    if (global) try argv.append(allocator, "--global");
+    for (pkgs) |pkg| {
+        try argv.append(allocator, pkg.raw);
+    }
+
+    var child = std.process.Child.init(argv.items, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    const term = child.spawnAndWait() catch {
+        std.debug.print("NVM4403 Module firewall remote validation failed to start.\n", .{});
+        eventlog.writeInfo(allocator, "proxy", "firewall remote helper spawn failed (NVM4403)");
+        std.process.exit(1);
+    };
+    switch (term) {
+        .Exited => |code| {
+            if (code == 0) return;
+            if (code == 1) {
+                eventlog.writeInfo(allocator, "proxy", "firewall remote policy blocked install (NVM4402)");
+                std.process.exit(1);
+            }
+            std.debug.print("NVM4403 Module firewall remote validation failed (exit {d}).\n", .{code});
+            eventlog.writeInfo(allocator, "proxy", "firewall remote validation failed (NVM4403)");
+            std.process.exit(1);
+        },
+        else => {
+            std.debug.print("NVM4403 Module firewall remote validation aborted.\n", .{});
+            std.process.exit(1);
+        },
+    }
+}
+
 fn loadTrustedModules(allocator: std.mem.Allocator) ![]const []const u8 {
     const rules = module_firewall.loadMultiSzPolicy(allocator, module_firewall.reg_value_trusted_modules) catch &[_][]const u8{};
     if (rules.len == 0) {
@@ -1171,12 +1219,30 @@ fn untrustedHandlerIsPrompt(allocator: std.mem.Allocator) bool {
 }
 
 fn promptTrustChange(allocator: std.mem.Allocator, command_name: []const u8) bool {
+    const nvm_path = nodeversion.resolveNvmExePath(allocator) catch {
+        return promptTrustChangeConsoleOnly(allocator, command_name);
+    };
+    defer allocator.free(nvm_path);
+
+    var child = std.process.Child.init(&.{ nvm_path, "firewall", "prompt-trust", command_name }, allocator);
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    const term = child.spawnAndWait() catch {
+        return promptTrustChangeConsoleOnly(allocator, command_name);
+    };
+    return switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+}
+
+fn promptTrustChangeConsoleOnly(allocator: std.mem.Allocator, command_name: []const u8) bool {
     const msg = std.fmt.allocPrint(allocator, "Untrusted module '{s}' changed after running. Approve and reshim? [y/N]: ", .{command_name}) catch {
         return false;
     };
     defer allocator.free(msg);
     std.debug.print("{s}", .{msg});
-    // Console read
     var stdin_buffer: [16]u8 = undefined;
     const stdin = std.fs.File.stdin();
     const n = stdin.read(stdin_buffer[0..]) catch return false;
@@ -1218,8 +1284,6 @@ fn maybeReshimAfterSelfUpdate(
         return;
     }
     if (untrustedHandlerIsPrompt(allocator)) {
-        // TODO: also raise persistent desktop toast when console is backgrounded;
-        // answering either channel should advance (console implemented first).
         if (promptTrustChange(allocator, command_name)) {
             eventlog.writeInfo(allocator, "proxy", "firewall trust prompt accepted; scheduling reshim");
             runReshim(allocator, install_root, node_install_dir);

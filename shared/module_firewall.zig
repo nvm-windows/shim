@@ -95,12 +95,18 @@ fn ruleMatches(rule_entry: []const u8, pkg: PackageSpec) bool {
     return versionMatches(nv.version, pkg.version);
 }
 
+/// True when policy list contains an https:// URL (remote evaluation mode).
+pub fn listHasHttps(rules: []const []const u8) bool {
+    for (rules) |r| {
+        const e = trimAscii(r);
+        if (startsWithIgnoreCase(e, "https://")) return true;
+    }
+    return false;
+}
+
 /// Local-list evaluation (VersionAllowList-compatible). HTTPS URL lists return null (caller does remote).
 pub fn isPackageAllowed(pkg: PackageSpec, rules: []const []const u8) ?bool {
-    if (rules.len == 1) {
-        const e = trimAscii(rules[0]);
-        if (startsWithIgnoreCase(e, "https://")) return null;
-    }
+    if (listHasHttps(rules)) return null;
 
     var not_all = false;
     var has_exclusive = false;
