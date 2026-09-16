@@ -7,6 +7,9 @@ const errors = @import("errors");
 const shimintegrity = @import("shimintegrity");
 const verifycache = @import("verifycache");
 const install_safety = @import("install_safety");
+const module_firewall = @import("module_firewall");
+const config = @import("config");
+const registry = @import("registry");
 
 const ParsedArgs = struct {
     override_version: ?[]const u8,
@@ -226,6 +229,8 @@ pub fn main() !void {
 
     const needs_reshim = detectReshimNeeded(command_name, parsed_args.forwarded);
 
+    const digest_before = hashFileOptional(allocator, command_path);
+
     const process_exit_code = runDelegatedCommand(
         allocator,
         node_install_dir_abs,
@@ -245,6 +250,8 @@ pub fn main() !void {
     if (needs_reshim) {
         eventlog.writeInfo(allocator, "proxy", "reshim scheduled");
         runReshim(allocator, cfg.root, node_install_dir_abs);
+    } else {
+        try maybeReshimAfterSelfUpdate(allocator, cfg.root, node_install_dir_abs, command_name, command_path, digest_before);
     }
 
     std.process.exit(process_exit_code);
@@ -1018,6 +1025,123 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
         .nvm_use_debug = nvm_use_debug,
         .forwarded = try forwarded.toOwnedSlice(allocator),
     };
+}
+
+fn hashFileOptional(allocator: std.mem.Allocator, path: []const u8) ?[32]u8 {
+    _ = allocator;
+    var file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    defer file.close();
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = file.read(&buf) catch return null;
+        if (n == 0) break;
+        hasher.update(buf[0..n]);
+    }
+    var out: [32]u8 = undefined;
+    hasher.final(&out);
+    return out;
+}
+
+fn digestsEqual(a: ?[32]u8, b: ?[32]u8) bool {
+    if (a == null or b == null) return true; // skip trust path if unreadable
+    return std.mem.eql(u8, &a.?, &b.?);
+}
+
+fn loadTrustedModules(allocator: std.mem.Allocator) ![]const []const u8 {
+    const rules = module_firewall.loadMultiSzPolicy(allocator, module_firewall.reg_value_trusted_modules) catch &[_][]const u8{};
+    if (rules.len == 0) {
+        // Default NOT ALL
+        var out = try allocator.alloc([]const u8, 1);
+        out[0] = try allocator.dupe(u8, "NOT ALL");
+        return out;
+    }
+    return rules;
+}
+
+fn untrustedHandlerIsPrompt(allocator: std.mem.Allocator) bool {
+    const raw = registry.queryStringWithFallback(allocator, registry.preferenceHives(), config.preference_registry_root, module_firewall.reg_value_untrusted_handler) catch {
+        return false;
+    };
+    defer allocator.free(raw);
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw, " \t"), "prompt");
+}
+
+fn promptTrustChange(allocator: std.mem.Allocator, command_name: []const u8) bool {
+    const nvm_path = nodeversion.resolveNvmExePath(allocator) catch {
+        return promptTrustChangeConsoleOnly(allocator, command_name);
+    };
+    defer allocator.free(nvm_path);
+
+    var child = std.process.Child.init(&.{ nvm_path, "firewall", "prompt-trust", command_name }, allocator);
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    const term = child.spawnAndWait() catch {
+        return promptTrustChangeConsoleOnly(allocator, command_name);
+    };
+    return switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+}
+
+fn promptTrustChangeConsoleOnly(allocator: std.mem.Allocator, command_name: []const u8) bool {
+    const msg = std.fmt.allocPrint(allocator, "Untrusted module '{s}' changed after running. Approve and reshim? [y/N]: ", .{command_name}) catch {
+        return false;
+    };
+    defer allocator.free(msg);
+    std.debug.print("{s}", .{msg});
+    var stdin_buffer: [16]u8 = undefined;
+    const stdin = std.fs.File.stdin();
+    const n = stdin.read(stdin_buffer[0..]) catch return false;
+    if (n == 0) return false;
+    const answer = std.mem.trim(u8, stdin_buffer[0..n], " \t\r\n");
+    return answer.len > 0 and (answer[0] == 'y' or answer[0] == 'Y');
+}
+
+fn maybeReshimAfterSelfUpdate(
+    allocator: std.mem.Allocator,
+    install_root: []const u8,
+    node_install_dir: []const u8,
+    command_name: []const u8,
+    command_path: []const u8,
+    digest_before: ?[32]u8,
+) !void {
+    const digest_after = hashFileOptional(allocator, command_path);
+    if (digestsEqual(digest_before, digest_after)) return;
+
+    // Package managers already handled via needs_reshim.
+    if (std.ascii.eqlIgnoreCase(command_name, "npm") or
+        std.ascii.eqlIgnoreCase(command_name, "npx") or
+        std.ascii.eqlIgnoreCase(command_name, "pnpm") or
+        std.ascii.eqlIgnoreCase(command_name, "yarn") or
+        std.ascii.eqlIgnoreCase(command_name, "corepack") or
+        std.ascii.eqlIgnoreCase(command_name, "vlt"))
+    {
+        return;
+    }
+
+    const rules = try loadTrustedModules(allocator);
+    defer module_firewall.freeMultiSz(allocator, rules);
+
+    const pkg = module_firewall.PackageSpec{ .name = command_name, .version = "", .raw = command_name };
+    const trusted = module_firewall.isPackageAllowed(pkg, rules) orelse false;
+    if (trusted) {
+        eventlog.writeInfo(allocator, "proxy", "firewall trusted module changed; scheduling reshim");
+        runReshim(allocator, install_root, node_install_dir);
+        return;
+    }
+    if (untrustedHandlerIsPrompt(allocator)) {
+        if (promptTrustChange(allocator, command_name)) {
+            eventlog.writeInfo(allocator, "proxy", "firewall trust prompt accepted; scheduling reshim");
+            runReshim(allocator, install_root, node_install_dir);
+        } else {
+            eventlog.writeInfo(allocator, "proxy", "firewall trust prompt declined; VerifyCache left stale");
+        }
+        return;
+    }
+    eventlog.writeInfo(allocator, "proxy", "firewall untrusted module changed; reshim not scheduled (deny)");
 }
 
 /// Returns true when the invoked package manager command is likely to install
