@@ -153,6 +153,20 @@ pub fn build(b: *std.Build) void {
     if (std.mem.eql(u8, app, "proxy")) {
         exe.root_module.addImport("install_safety", install_safety_module);
         exe.root_module.addImport("wintrust", wintrust_module);
+        const module_firewall_module = b.createModule(.{
+            .root_source_file = b.path("shared/module_firewall.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        module_firewall_module.addImport("config", config_module);
+        module_firewall_module.addImport("registry", registry_module);
+        exe.root_module.addImport("module_firewall", module_firewall_module);
+        const module_firewall_tests = b.addTest(.{
+            .root_module = module_firewall_module,
+        });
+        module_firewall_tests.root_module.linkSystemLibrary("advapi32", .{});
+        const run_module_firewall_tests = b.addRunArtifact(module_firewall_tests);
+        test_step.dependOn(&run_module_firewall_tests.step);
     }
 
     exe.root_module.addImport("errors", b.createModule(.{
