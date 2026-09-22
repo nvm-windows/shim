@@ -36,6 +36,7 @@ pub fn main() !void {
     var force = false;
     var dry_run = false;
     var silent = false;
+    var want_sign_changed = false;
     var target_version_dir: ?[]const u8 = null;
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
@@ -63,6 +64,11 @@ pub fn main() !void {
             continue;
         }
 
+        if (std.mem.eql(u8, arg, "--sign-changed")) {
+            want_sign_changed = true;
+            continue;
+        }
+
         if (target_version_dir == null) {
             target_version_dir = arg;
             continue;
@@ -70,10 +76,12 @@ pub fn main() !void {
 
         if (!silent) {
             std.debug.print("Unknown argument: {s}\n", .{arg});
-            std.debug.print("Usage: reshim [--force] [--dry-run] [--silent] [node_install_dir]\n", .{});
+            std.debug.print("Usage: reshim [--force] [--dry-run] [--silent] [--sign-changed] [node_install_dir]\n", .{});
         }
         return;
     }
+
+    const forward_sign_changed = want_sign_changed and parentIsNvmExe(allocator);
 
     const install_root = if (target_version_dir == null)
         try nodeversion.loadInstallRoot(allocator)
@@ -128,7 +136,7 @@ pub fn main() !void {
 
     if (cmd_names.len == 0) {
         prewarmShims(allocator, shim_dir, silent);
-        signVersionScriptsAfterReshim(allocator, install_root, target_version_dir, silent);
+        signVersionScriptsAfterReshim(allocator, install_root, target_version_dir, silent, forward_sign_changed);
         try writeStdoutf(allocator, silent, "All shims up to date.\n", .{});
         return;
     }
@@ -188,7 +196,7 @@ pub fn main() !void {
 
     try writeStdoutf(allocator, silent, "\nCreated {d} shim(s).\n", .{linked});
     prewarmShims(allocator, shim_dir, silent);
-    signVersionScriptsAfterReshim(allocator, install_root, target_version_dir, silent);
+    signVersionScriptsAfterReshim(allocator, install_root, target_version_dir, silent, forward_sign_changed);
 }
 
 fn signVersionScriptsAfterReshim(
@@ -196,26 +204,27 @@ fn signVersionScriptsAfterReshim(
     install_root: []const u8,
     target_version_dir: ?[]const u8,
     silent: bool,
+    sign_changed: bool,
 ) void {
     if (target_version_dir) |version_dir| {
-        signVersionScripts(allocator, install_root, version_dir);
+        signVersionScripts(allocator, install_root, version_dir, sign_changed);
         return;
     }
     if (silent) {
-        signActiveVersionScripts(allocator, install_root);
+        signActiveVersionScripts(allocator, install_root, sign_changed);
         return;
     }
-    signVersionScripts(allocator, install_root, null);
+    signVersionScripts(allocator, install_root, null, sign_changed);
 }
 
-fn signActiveVersionScripts(allocator: std.mem.Allocator, install_root: []const u8) void {
+fn signActiveVersionScripts(allocator: std.mem.Allocator, install_root: []const u8, sign_changed: bool) void {
     const version_dir_opt = nodeversion.activeVersionInstallDir(allocator, install_root) catch return;
     const version_dir = version_dir_opt orelse return;
     defer allocator.free(version_dir);
-    signVersionScripts(allocator, install_root, version_dir);
+    signVersionScripts(allocator, install_root, version_dir, sign_changed);
 }
 
-fn signVersionScripts(allocator: std.mem.Allocator, install_root: []const u8, target_version_dir: ?[]const u8) void {
+fn signVersionScripts(allocator: std.mem.Allocator, install_root: []const u8, target_version_dir: ?[]const u8, sign_changed: bool) void {
     const nvm_path = nodeversion.resolveNvmExePath(allocator) catch {
         std.debug.print("nvm.exe not found under ProgramRoot; cannot re-sign version scripts\n", .{});
         return;
@@ -223,7 +232,7 @@ fn signVersionScripts(allocator: std.mem.Allocator, install_root: []const u8, ta
     defer allocator.free(nvm_path);
 
     if (target_version_dir) |version_dir| {
-        spawnSignVersionScripts(allocator, nvm_path, version_dir);
+        spawnSignVersionScripts(allocator, nvm_path, version_dir, sign_changed);
         return;
     }
 
@@ -235,17 +244,38 @@ fn signVersionScripts(allocator: std.mem.Allocator, install_root: []const u8, ta
         if (!(std.mem.startsWith(u8, entry.name, "v") or std.mem.startsWith(u8, entry.name, "V"))) continue;
         const version_dir = std.fs.path.join(allocator, &.{ install_root, entry.name }) catch continue;
         defer allocator.free(version_dir);
-        spawnSignVersionScripts(allocator, nvm_path, version_dir);
+        spawnSignVersionScripts(allocator, nvm_path, version_dir, sign_changed);
     }
 }
 
-fn spawnSignVersionScripts(allocator: std.mem.Allocator, nvm_path: []const u8, version_dir: []const u8) void {
-    var child = std.process.Child.init(&.{ nvm_path, "--sign-version-scripts", version_dir }, allocator);
+fn spawnSignVersionScripts(allocator: std.mem.Allocator, nvm_path: []const u8, version_dir: []const u8, sign_changed: bool) void {
+    var argv_buf: [4][]const u8 = undefined;
+    argv_buf[0] = nvm_path;
+    argv_buf[1] = "--sign-version-scripts";
+    argv_buf[2] = version_dir;
+    const argv: []const []const u8 = if (sign_changed) blk: {
+        argv_buf[3] = "--sign-changed";
+        break :blk argv_buf[0..4];
+    } else argv_buf[0..3];
+    var child = std.process.Child.init(argv, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
     child.spawn() catch return;
     _ = child.wait() catch {};
+}
+
+fn parentIsNvmExe(allocator: std.mem.Allocator) bool {
+    const ancestors = eventlog.listAncestorImagePaths(allocator) catch return false;
+    defer eventlog.freeAncestorImagePaths(allocator, ancestors);
+    if (ancestors.len == 0) return false;
+    const self = std.fs.selfExePathAlloc(allocator) catch return false;
+    defer allocator.free(self);
+    const utils_dir = std.fs.path.dirname(self) orelse return false;
+    const program_root = std.fs.path.dirname(utils_dir) orelse return false;
+    const nvm_exe = std.fs.path.join(allocator, &.{ program_root, "nvm.exe" }) catch return false;
+    defer allocator.free(nvm_exe);
+    return std.ascii.eqlIgnoreCase(ancestors[0], nvm_exe);
 }
 
 fn prewarmShims(allocator: std.mem.Allocator, shim_dir: []const u8, silent: bool) void {

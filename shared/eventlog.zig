@@ -144,6 +144,10 @@ pub fn writeInfo(allocator: std.mem.Allocator, source: []const u8, message: []co
     writeOperational(allocator, shim_operational_info_descriptor, source, message, 0) catch {};
 }
 
+pub fn writeInfoCode(allocator: std.mem.Allocator, source: []const u8, message: []const u8, code: u32) void {
+    writeOperational(allocator, shim_operational_info_descriptor, source, message, code) catch {};
+}
+
 pub fn writeWarning(allocator: std.mem.Allocator, source: []const u8, message: []const u8) void {
     writeOperational(allocator, shim_operational_warning_descriptor, source, message, 0) catch {};
 }
@@ -237,6 +241,368 @@ pub fn writeLicensedSecurityInfo(
 
 pub fn writeStructuredInfoJson(allocator: std.mem.Allocator, source: []const u8, event_name: []const u8, payload_json: []const u8, code: u32) void {
     writeStructuredJson(allocator, structured_operational_info_descriptor, source, event_name, payload_json, code) catch {};
+}
+
+/// Best-effort interactive user label (USERDOMAIN\\USERNAME or USERNAME).
+pub fn auditUser(allocator: std.mem.Allocator) ![]const u8 {
+    const domain_owned = std.process.getEnvVarOwned(allocator, "USERDOMAIN") catch null;
+    defer if (domain_owned) |d| allocator.free(d);
+    const user_owned = std.process.getEnvVarOwned(allocator, "USERNAME") catch null;
+    defer if (user_owned) |u| allocator.free(u);
+
+    if (domain_owned) |domain| {
+        if (user_owned) |user| {
+            if (domain.len > 0 and user.len > 0) {
+                return std.fmt.allocPrint(allocator, "{s}\\{s}", .{ domain, user });
+            }
+        }
+    }
+    if (user_owned) |user| {
+        if (user.len > 0) return allocator.dupe(u8, user);
+    }
+    return allocator.dupe(u8, "unknown");
+}
+
+/// Best-effort host label (COMPUTERNAME).
+pub fn auditHostname(allocator: std.mem.Allocator) ![]const u8 {
+    const computer = std.process.getEnvVarOwned(allocator, "COMPUTERNAME") catch null;
+    defer if (computer) |c| allocator.free(c);
+    if (computer) |name| {
+        if (name.len > 0) return allocator.dupe(u8, name);
+    }
+    return allocator.dupe(u8, "unknown");
+}
+
+const TOKEN_QUERY: u32 = 0x0008;
+const TokenUser: i32 = 1;
+const TH32CS_SNAPPROCESS: u32 = 0x00000002;
+
+const SID_AND_ATTRIBUTES = extern struct {
+    Sid: ?*anyopaque,
+    Attributes: u32,
+};
+
+const TOKEN_USER = extern struct {
+    User: SID_AND_ATTRIBUTES,
+};
+
+const PROCESSENTRY32W = extern struct {
+    dwSize: u32,
+    cntUsage: u32,
+    th32ProcessID: u32,
+    th32DefaultHeapID: usize,
+    th32ModuleID: u32,
+    cntThreads: u32,
+    th32ParentProcessID: u32,
+    pcPriClassBase: i32,
+    dwFlags: u32,
+    szExeFile: [260]u16,
+};
+
+extern "kernel32" fn GetCurrentProcess() callconv(.winapi) *anyopaque;
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+extern "kernel32" fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) callconv(.winapi) *anyopaque;
+extern "kernel32" fn Process32FirstW(hSnapshot: *anyopaque, lppe: *PROCESSENTRY32W) callconv(.winapi) u32;
+extern "kernel32" fn Process32NextW(hSnapshot: *anyopaque, lppe: *PROCESSENTRY32W) callconv(.winapi) u32;
+extern "kernel32" fn CloseHandle(hObject: *anyopaque) callconv(.winapi) u32;
+extern "kernel32" fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn QueryFullProcessImageNameW(
+    hProcess: *anyopaque,
+    dwFlags: u32,
+    lpExeName: [*]u16,
+    lpdwSize: *u32,
+) callconv(.winapi) u32;
+extern "kernel32" fn CreateEventW(
+    lpEventAttributes: ?*anyopaque,
+    bManualReset: i32,
+    bInitialState: i32,
+    lpName: [*:0]const u16,
+) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn WaitForSingleObject(hHandle: *anyopaque, dwMilliseconds: u32) callconv(.winapi) u32;
+extern "advapi32" fn OpenProcessToken(ProcessHandle: *anyopaque, DesiredAccess: u32, TokenHandle: *?*anyopaque) callconv(.winapi) u32;
+extern "advapi32" fn GetTokenInformation(
+    TokenHandle: *anyopaque,
+    TokenInformationClass: i32,
+    TokenInformation: ?*anyopaque,
+    TokenInformationLength: u32,
+    ReturnLength: *u32,
+) callconv(.winapi) u32;
+extern "advapi32" fn ConvertSidToStringSidW(Sid: ?*anyopaque, StringSid: *?[*:0]u16) callconv(.winapi) u32;
+extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+
+fn invalidSnapshotHandle(h: *anyopaque) bool {
+    return @intFromPtr(h) == @as(usize, @bitCast(@as(isize, -1)));
+}
+
+/// Best-effort Windows SID string for the current process token.
+pub fn auditSid(allocator: std.mem.Allocator) ![]u8 {
+    var token: ?*anyopaque = null;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) == 0 or token == null) {
+        return allocator.dupe(u8, "unknown");
+    }
+    defer _ = CloseHandle(token.?);
+
+    var needed: u32 = 0;
+    _ = GetTokenInformation(token.?, TokenUser, null, 0, &needed);
+    if (needed == 0) return allocator.dupe(u8, "unknown");
+
+    const buf = allocator.alloc(u8, needed) catch return allocator.dupe(u8, "unknown");
+    defer allocator.free(buf);
+
+    if (GetTokenInformation(token.?, TokenUser, buf.ptr, needed, &needed) == 0) {
+        return allocator.dupe(u8, "unknown");
+    }
+
+    const token_user: *const TOKEN_USER = @ptrCast(@alignCast(buf.ptr));
+    const sid = token_user.User.Sid orelse return allocator.dupe(u8, "unknown");
+
+    var sid_w: ?[*:0]u16 = null;
+    if (ConvertSidToStringSidW(sid, &sid_w) == 0 or sid_w == null) {
+        return allocator.dupe(u8, "unknown");
+    }
+    defer _ = LocalFree(sid_w);
+
+    return std.unicode.utf16LeToUtf8Alloc(allocator, std.mem.span(sid_w.?)) catch allocator.dupe(u8, "unknown");
+}
+
+/// Parent process executable file name and PID (Toolhelp32).
+pub const AuditParentProcess = struct { name: []u8, pid: u32 };
+
+pub fn auditParentProcess(allocator: std.mem.Allocator) !AuditParentProcess {
+    const self_pid = GetCurrentProcessId();
+    const snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (invalidSnapshotHandle(snapshot)) {
+        return .{
+            .name = try allocator.dupe(u8, "unknown"),
+            .pid = 0,
+        };
+    }
+    defer _ = CloseHandle(snapshot);
+
+    var entry: PROCESSENTRY32W = undefined;
+    entry.dwSize = @sizeOf(PROCESSENTRY32W);
+
+    var parent_pid: u32 = 0;
+    if (Process32FirstW(snapshot, &entry) != 0) {
+        while (true) {
+            if (entry.th32ProcessID == self_pid) {
+                parent_pid = entry.th32ParentProcessID;
+                break;
+            }
+            if (Process32NextW(snapshot, &entry) == 0) break;
+        }
+    }
+
+    if (parent_pid == 0) {
+        return .{
+            .name = try allocator.dupe(u8, "unknown"),
+            .pid = 0,
+        };
+    }
+
+    entry.dwSize = @sizeOf(PROCESSENTRY32W);
+    if (Process32FirstW(snapshot, &entry) != 0) {
+        while (true) {
+            if (entry.th32ProcessID == parent_pid) {
+                const exe_w = std.mem.sliceTo(&entry.szExeFile, 0);
+                const exe = std.unicode.utf16LeToUtf8Alloc(allocator, exe_w) catch try allocator.dupe(u8, "unknown");
+                return .{ .name = exe, .pid = parent_pid };
+            }
+            if (Process32NextW(snapshot, &entry) == 0) break;
+        }
+    }
+
+    return .{
+        .name = try allocator.dupe(u8, "unknown"),
+        .pid = parent_pid,
+    };
+}
+
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+fn parentPidFromSnapshot(snapshot: *anyopaque, pid: u32) u32 {
+    var entry: PROCESSENTRY32W = undefined;
+    entry.dwSize = @sizeOf(PROCESSENTRY32W);
+    if (Process32FirstW(snapshot, &entry) == 0) return 0;
+    while (true) {
+        if (entry.th32ProcessID == pid) return entry.th32ParentProcessID;
+        if (Process32NextW(snapshot, &entry) == 0) return 0;
+    }
+}
+
+fn queryProcessImagePath(allocator: std.mem.Allocator, pid: u32) ?[]u8 {
+    const handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) orelse return null;
+    defer _ = CloseHandle(handle);
+    var buf: [1024]u16 = undefined;
+    var size: u32 = buf.len;
+    if (QueryFullProcessImageNameW(handle, 0, &buf, &size) == 0 or size == 0) return null;
+    return std.unicode.utf16LeToUtf8Alloc(allocator, buf[0..size]) catch null;
+}
+
+pub fn freeAncestorImagePaths(allocator: std.mem.Allocator, paths: [][]u8) void {
+    for (paths) |p| allocator.free(p);
+    allocator.free(paths);
+}
+
+/// Full image paths of ancestor processes (parent first), best-effort.
+pub fn listAncestorImagePaths(allocator: std.mem.Allocator) ![][]u8 {
+    var list: std.ArrayListUnmanaged([]u8) = .{};
+    errdefer {
+        for (list.items) |p| allocator.free(p);
+        list.deinit(allocator);
+    }
+
+    const snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (invalidSnapshotHandle(snapshot)) return try list.toOwnedSlice(allocator);
+    defer _ = CloseHandle(snapshot);
+
+    var pid = GetCurrentProcessId();
+    var hops: u8 = 0;
+    var seen: [32]u32 = undefined;
+    var seen_len: usize = 0;
+
+    while (hops < 32) : (hops += 1) {
+        const parent = parentPidFromSnapshot(snapshot, pid);
+        if (parent == 0 or parent == pid) break;
+        var dup = false;
+        for (seen[0..seen_len]) |s| {
+            if (s == parent) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) break;
+        if (seen_len < seen.len) {
+            seen[seen_len] = parent;
+            seen_len += 1;
+        }
+        if (queryProcessImagePath(allocator, parent)) |path| {
+            try list.append(allocator, path);
+        }
+        pid = parent;
+    }
+
+    return try list.toOwnedSlice(allocator);
+}
+
+pub fn createNamedEvent(allocator: std.mem.Allocator, name: []const u8) ?*anyopaque {
+    const name_w = std.unicode.utf8ToUtf16LeAllocZ(allocator, name) catch return null;
+    defer allocator.free(name_w);
+    return CreateEventW(null, 1, 0, name_w.ptr);
+}
+
+pub fn waitAndCloseNamedEvent(handle: *anyopaque, timeout_ms: u32) void {
+    _ = WaitForSingleObject(handle, timeout_ms);
+    _ = CloseHandle(handle);
+}
+
+fn scanPackageJsonName(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    const marker = "\"name\"";
+    var i: usize = 0;
+    while (i + marker.len <= content.len) : (i += 1) {
+        if (!std.mem.eql(u8, content[i .. i + marker.len], marker)) continue;
+        var j = i + marker.len;
+        while (j < content.len and std.ascii.isWhitespace(content[j])) : (j += 1) {}
+        if (j >= content.len or content[j] != ':') continue;
+        j += 1;
+        while (j < content.len and std.ascii.isWhitespace(content[j])) : (j += 1) {}
+        if (j >= content.len or content[j] != '"') continue;
+        j += 1;
+        const start = j;
+        while (j < content.len and content[j] != '"') : (j += 1) {
+            if (content[j] == '\\') j += 1;
+        }
+        if (j >= content.len) return allocator.dupe(u8, "");
+        return allocator.dupe(u8, content[start..j]);
+    }
+    return allocator.dupe(u8, "");
+}
+
+/// Nearest package.json `"name"` walking cwd toward drive root.
+pub const AuditProject = struct { name: []u8, path: []u8 };
+
+pub fn auditProjectName(allocator: std.mem.Allocator) !AuditProject {
+    var dir = std.process.getCwdAlloc(allocator) catch {
+        return .{
+            .name = try allocator.dupe(u8, ""),
+            .path = try allocator.dupe(u8, ""),
+        };
+    };
+    defer allocator.free(dir);
+
+    while (true) {
+        const pkg_path = std.fs.path.join(allocator, &.{ dir, "package.json" }) catch break;
+        defer allocator.free(pkg_path);
+
+        if (std.fs.cwd().openFile(pkg_path, .{})) |file| {
+            defer file.close();
+            const content = file.readToEndAlloc(allocator, 1024 * 1024) catch {
+                break;
+            };
+            defer allocator.free(content);
+            const name = scanPackageJsonName(allocator, content) catch try allocator.dupe(u8, "");
+            if (name.len > 0) {
+                return .{
+                    .name = name,
+                    .path = try allocator.dupe(u8, pkg_path),
+                };
+            }
+        } else |_| {}
+
+        const parent = std.fs.path.dirname(dir) orelse break;
+        if (parent.len == dir.len) break;
+        const next = allocator.dupe(u8, parent) catch break;
+        allocator.free(dir);
+        dir = next;
+    }
+
+    return .{
+        .name = try allocator.dupe(u8, ""),
+        .path = try allocator.dupe(u8, ""),
+    };
+}
+
+pub const AuditContext = struct {
+    user: []const u8,
+    sid: []const u8,
+    hostname: []const u8,
+    parent_process: []const u8,
+    parent_pid: u32,
+    project_name: []const u8,
+    project_path: []const u8,
+
+    pub fn deinit(self: *AuditContext, allocator: std.mem.Allocator) void {
+        allocator.free(self.user);
+        allocator.free(self.sid);
+        allocator.free(self.hostname);
+        allocator.free(self.parent_process);
+        allocator.free(self.project_name);
+        allocator.free(self.project_path);
+    }
+};
+
+pub fn captureAuditContext(allocator: std.mem.Allocator) AuditContext {
+    const user = auditUser(allocator) catch allocator.dupe(u8, "unknown") catch "";
+    const sid = auditSid(allocator) catch allocator.dupe(u8, "unknown") catch "";
+    const hostname = auditHostname(allocator) catch allocator.dupe(u8, "unknown") catch "";
+    const parent = auditParentProcess(allocator) catch AuditParentProcess{
+        .name = allocator.dupe(u8, "unknown") catch "",
+        .pid = 0,
+    };
+    const project = auditProjectName(allocator) catch AuditProject{
+        .name = allocator.dupe(u8, "") catch "",
+        .path = allocator.dupe(u8, "") catch "",
+    };
+
+    return .{
+        .user = user,
+        .sid = sid,
+        .hostname = hostname,
+        .parent_process = parent.name,
+        .parent_pid = parent.pid,
+        .project_name = project.name,
+        .project_path = project.path,
+    };
 }
 
 pub fn writeStructuredWarningJson(allocator: std.mem.Allocator, source: []const u8, event_name: []const u8, payload_json: []const u8, code: u32) void {

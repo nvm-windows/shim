@@ -130,12 +130,12 @@ pub const VerifyOutcome = struct {
     }
 };
 
-const NodeFileTimes = struct {
+pub const NodeFileTimes = struct {
     size: i64,
     mtime: u64,
 };
 
-const FileSecurityState = struct {
+pub const FileSecurityState = struct {
     volume_serial: u32,
     file_id: u64,
     usn: u64,
@@ -704,6 +704,34 @@ fn loadScriptCacheEntry(allocator: std.mem.Allocator, cache_key: []const u8) !?C
         .found => |entry| entry,
         .missing, .incomplete => null,
     };
+}
+
+/// Content digest + size from VerifyCache (script cache first, then node cache).
+/// Caller owns returned strings via CachedContent.deinit.
+pub const CachedContent = struct {
+    digest: []u8,
+    size: i64,
+
+    pub fn deinit(self: CachedContent, allocator: std.mem.Allocator) void {
+        allocator.free(self.digest);
+    }
+};
+
+pub fn loadCachedContent(allocator: std.mem.Allocator, path: []const u8) ?CachedContent {
+    const cache_key = cacheKeyForPath(allocator, path) catch return null;
+    defer allocator.free(cache_key);
+
+    if (loadScriptCacheEntry(allocator, cache_key) catch null) |entry| {
+        defer entry.deinit(allocator);
+        const digest = allocator.dupe(u8, entry.digest) catch return null;
+        return .{ .digest = digest, .size = entry.size };
+    }
+    if (loadCacheEntry(allocator, cache_key) catch null) |entry| {
+        defer entry.deinit(allocator);
+        const digest = allocator.dupe(u8, entry.digest) catch return null;
+        return .{ .digest = digest, .size = entry.size };
+    }
+    return null;
 }
 
 fn loadScriptCacheEntryStatus(allocator: std.mem.Allocator, cache_key: []const u8) !CacheEntryLoadStatus {
