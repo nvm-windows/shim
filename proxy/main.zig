@@ -87,6 +87,9 @@ pub fn main() !void {
         );
     }
 
+    var audit_ctx = eventlog.captureAuditContext(allocator);
+    defer audit_ctx.deinit(allocator);
+
     const node_install_dir = std.fs.path.dirname(resolved.node_bin.?) orelse ".";
     const node_install_dir_abs = try std.fs.path.resolve(allocator, &.{node_install_dir});
     defer allocator.free(node_install_dir_abs);
@@ -118,6 +121,13 @@ pub fn main() !void {
                 .node_version = resolved.resolved_version.?,
                 .source = "proxy",
                 .version_path = node_install_dir_abs,
+                .user = audit_ctx.user,
+                .sid = audit_ctx.sid,
+                .hostname = audit_ctx.hostname,
+                .parent_process = audit_ctx.parent_process,
+                .parent_pid = audit_ctx.parent_pid,
+                .project_name = audit_ctx.project_name,
+                .project_path = audit_ctx.project_path,
             },
             message,
             4305,
@@ -166,6 +176,13 @@ pub fn main() !void {
                         .node_version = resolved.resolved_version.?,
                         .source = "proxy",
                         .verification_result = "cache_invalidated",
+                        .user = audit_ctx.user,
+                        .sid = audit_ctx.sid,
+                        .hostname = audit_ctx.hostname,
+                        .parent_process = audit_ctx.parent_process,
+                        .parent_pid = audit_ctx.parent_pid,
+                        .project_name = audit_ctx.project_name,
+                        .project_path = audit_ctx.project_path,
                     },
                     cache_message,
                     4303,
@@ -189,6 +206,13 @@ pub fn main() !void {
                         .node_version = resolved.resolved_version.?,
                         .source = "proxy",
                         .verification_result = "trusted",
+                        .user = audit_ctx.user,
+                        .sid = audit_ctx.sid,
+                        .hostname = audit_ctx.hostname,
+                        .parent_process = audit_ctx.parent_process,
+                        .parent_pid = audit_ctx.parent_pid,
+                        .project_name = audit_ctx.project_name,
+                        .project_path = audit_ctx.project_path,
                     },
                     recovery_message,
                     4304,
@@ -217,6 +241,13 @@ pub fn main() !void {
                     .node_version = resolved.resolved_version.?,
                     .source = "proxy",
                     .verification_result = "failed",
+                    .user = audit_ctx.user,
+                    .sid = audit_ctx.sid,
+                    .hostname = audit_ctx.hostname,
+                    .parent_process = audit_ctx.parent_process,
+                    .parent_pid = audit_ctx.parent_pid,
+                    .project_name = audit_ctx.project_name,
+                    .project_path = audit_ctx.project_path,
                 },
                 message,
                 4301,
@@ -229,7 +260,34 @@ pub fn main() !void {
 
     const needs_reshim = detectReshimNeeded(command_name, parsed_args.forwarded);
 
-    const digest_before = hashFileOptional(allocator, command_path);
+    const snap_before = captureEntrypointSnapSet(allocator, command_path, command_name);
+    defer snap_before.deinit(allocator);
+
+    if (cfg.log_executions) {
+        const arguments = if (parsed_args.forwarded.len == 0)
+            try allocator.dupe(u8, "")
+        else
+            try std.mem.join(allocator, " ", parsed_args.forwarded);
+        defer allocator.free(arguments);
+
+        const working_directory = std.process.getCwdAlloc(allocator) catch try allocator.dupe(u8, "");
+        defer allocator.free(working_directory);
+
+        eventlog.writeStructuredInfoCode(allocator, "proxy", "package_manager.executed", .{
+            .command = command_name,
+            .node_version = resolved.resolved_version.?,
+            .node_path = resolved.node_bin.?,
+            .working_directory = working_directory,
+            .arguments = arguments,
+            .user = audit_ctx.user,
+            .sid = audit_ctx.sid,
+            .hostname = audit_ctx.hostname,
+            .parent_process = audit_ctx.parent_process,
+            .parent_pid = audit_ctx.parent_pid,
+            .project_name = audit_ctx.project_name,
+            .project_path = audit_ctx.project_path,
+        }, 0);
+    }
 
     const process_exit_code = runDelegatedCommand(
         allocator,
@@ -249,9 +307,9 @@ pub fn main() !void {
 
     if (needs_reshim) {
         eventlog.writeInfo(allocator, "proxy", "reshim scheduled");
-        runReshim(allocator, cfg.root, node_install_dir_abs);
+        runReshim(allocator, cfg.root, node_install_dir_abs, userInitiatedPmReshim(allocator, cfg.root, cfg.structured_logging));
     } else {
-        try maybeReshimAfterSelfUpdate(allocator, cfg.root, node_install_dir_abs, command_name, command_path, digest_before);
+        try maybeReshimAfterSelfUpdate(allocator, cfg.root, node_install_dir_abs, command_name, command_path, snap_before, cfg.structured_logging);
     }
 
     std.process.exit(process_exit_code);
@@ -382,15 +440,22 @@ fn enforceDelegatedCommandTrust(
         defer allocator.free(cli_js);
         const outcome = verifycache.ensureDelegatedScriptTrusted(allocator, cfg.root, cli_js);
         if (outcome.result == .failed) {
-            reportDelegatedTrustFailure(
-                allocator,
-                cfg,
-                command_name,
-                cli_js,
-                node_bin,
-                node_version,
-                if (outcome.reason.len == 0) "delegated package-manager entrypoint trust verification failed" else outcome.reason,
-            );
+            const reason = if (outcome.reason.len == 0) "delegated package-manager entrypoint trust verification failed" else outcome.reason;
+            if (!tryRecoverDelegatedTrustFailure(allocator, cfg.root, node_install_dir, command_name, cli_js, reason, cfg.structured_logging)) {
+                reportDelegatedTrustFailure(allocator, cfg, command_name, cli_js, node_bin, node_version, reason);
+            }
+            const retry = verifycache.ensureDelegatedScriptTrusted(allocator, cfg.root, cli_js);
+            if (retry.result == .failed) {
+                reportDelegatedTrustFailure(
+                    allocator,
+                    cfg,
+                    command_name,
+                    cli_js,
+                    node_bin,
+                    node_version,
+                    if (retry.reason.len == 0) reason else retry.reason,
+                );
+            }
         }
         return;
     }
@@ -400,15 +465,22 @@ fn enforceDelegatedCommandTrust(
         // Same TPM verify-cache as node.exe — never full Authenticode on warm path.
         const outcome = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, command_path);
         if (outcome.result == .failed) {
-            reportDelegatedTrustFailure(
-                allocator,
-                cfg,
-                command_name,
-                command_path,
-                node_bin,
-                node_version,
-                if (outcome.reason.len == 0) "delegated executable trust verification failed" else outcome.reason,
-            );
+            const reason = if (outcome.reason.len == 0) "delegated executable trust verification failed" else outcome.reason;
+            if (!tryRecoverDelegatedTrustFailure(allocator, cfg.root, node_install_dir, command_name, command_path, reason, cfg.structured_logging)) {
+                reportDelegatedTrustFailure(allocator, cfg, command_name, command_path, node_bin, node_version, reason);
+            }
+            const retry = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, command_path);
+            if (retry.result == .failed) {
+                reportDelegatedTrustFailure(
+                    allocator,
+                    cfg,
+                    command_name,
+                    command_path,
+                    node_bin,
+                    node_version,
+                    if (retry.reason.len == 0) reason else retry.reason,
+                );
+            }
         }
         return;
     }
@@ -416,20 +488,103 @@ fn enforceDelegatedCommandTrust(
     if (std.ascii.eqlIgnoreCase(ext, ".cmd") or std.ascii.eqlIgnoreCase(ext, ".bat")) {
         const outcome = verifycache.ensureDelegatedScriptTrusted(allocator, cfg.root, command_path);
         if (outcome.result == .failed) {
-            reportDelegatedTrustFailure(
-                allocator,
-                cfg,
-                command_name,
-                command_path,
-                node_bin,
-                node_version,
-                if (outcome.reason.len == 0) "delegated script trust verification failed" else outcome.reason,
-            );
+            const reason = if (outcome.reason.len == 0) "delegated script trust verification failed" else outcome.reason;
+            if (!tryRecoverDelegatedTrustFailure(allocator, cfg.root, node_install_dir, command_name, command_path, reason, cfg.structured_logging)) {
+                reportDelegatedTrustFailure(allocator, cfg, command_name, command_path, node_bin, node_version, reason);
+            }
+            const retry = verifycache.ensureDelegatedScriptTrusted(allocator, cfg.root, command_path);
+            if (retry.result == .failed) {
+                reportDelegatedTrustFailure(
+                    allocator,
+                    cfg,
+                    command_name,
+                    command_path,
+                    node_bin,
+                    node_version,
+                    if (retry.reason.len == 0) reason else retry.reason,
+                );
+            }
         }
         return;
     }
 
     reportDelegatedTrustFailure(allocator, cfg, command_name, command_path, node_bin, node_version, "unsupported delegated command type");
+}
+
+/// True when VerifyCache failure looks like a self-update (not missing cache / schema).
+fn isSelfUpdateTrustFailure(reason: []const u8) bool {
+    return std.mem.indexOf(u8, reason, "changed since it was trusted") != null or
+        std.mem.indexOf(u8, reason, "identity changed") != null or
+        std.mem.indexOf(u8, reason, "digest mismatch") != null;
+}
+
+/// Prompt/trust+reshim when an untrusted module's entrypoint changed under us.
+fn tryRecoverDelegatedTrustFailure(
+    allocator: std.mem.Allocator,
+    install_root: []const u8,
+    node_install_dir: []const u8,
+    command_name: []const u8,
+    command_path: []const u8,
+    reason: []const u8,
+    structured_logging: bool,
+) bool {
+    if (!isSelfUpdateTrustFailure(reason)) return false;
+    if (isPackageManagerCommand(command_name)) return false;
+
+    const rules = loadTrustedModules(allocator) catch return false;
+    defer module_firewall.freeMultiSz(allocator, rules);
+
+    const trusted = isTrustedModule(allocator, command_name, rules);
+    if (trusted) {
+        logFirewallInfo(allocator, structured_logging, "firewall.trusted_module_stale", "firewall trusted module VerifyCache stale; scheduling reshim");
+        _ = resignScriptSync(allocator, command_path);
+        runReshim(allocator, install_root, node_install_dir, true);
+        return true;
+    }
+    switch (untrustedHandlerAction(allocator)) {
+        .deny => {
+            const audit = auditFromVerifyCache(allocator, command_path);
+            defer audit.deinit(allocator);
+            logUntrustedModuleChanged(allocator, structured_logging, command_name, "deny", "deny", "verify_cache", audit);
+            logFirewallInfo(allocator, structured_logging, "firewall.untrusted_deny", "firewall untrusted module VerifyCache stale; deny (no prompt)");
+            return false;
+        },
+        .allow => {
+            const audit = auditFromVerifyCache(allocator, command_path);
+            defer audit.deinit(allocator);
+            logUntrustedModuleChanged(allocator, structured_logging, command_name, "allow", "allow", "verify_cache", audit);
+            logFirewallInfo(allocator, structured_logging, "firewall.untrusted_allow", "firewall untrusted module VerifyCache stale; allow auto-trust; scheduling reshim");
+            notifyModuleAutoTrusted(allocator, command_name);
+            _ = resignScriptSync(allocator, command_path);
+            runReshim(allocator, install_root, node_install_dir, true);
+            return true;
+        },
+        .prompt => {
+            if (promptTrustChange(allocator, command_name)) {
+                const audit = auditFromVerifyCache(allocator, command_path);
+                defer audit.deinit(allocator);
+                logUntrustedModuleChanged(allocator, structured_logging, command_name, "prompt_accepted", "prompt", "verify_cache", audit);
+                logFirewallInfo(allocator, structured_logging, "firewall.prompt_accepted", "firewall trust prompt accepted on VerifyCache miss; scheduling reshim");
+                _ = resignScriptSync(allocator, command_path);
+                runReshim(allocator, install_root, node_install_dir, true);
+                return true;
+            }
+            const audit = auditFromVerifyCache(allocator, command_path);
+            defer audit.deinit(allocator);
+            logUntrustedModuleChanged(allocator, structured_logging, command_name, "prompt_declined", "prompt", "verify_cache", audit);
+            logFirewallInfo(allocator, structured_logging, "firewall.prompt_declined", "firewall trust prompt declined on VerifyCache miss");
+            return false;
+        },
+    }
+}
+
+fn isPackageManagerCommand(command_name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(command_name, "npm") or
+        std.ascii.eqlIgnoreCase(command_name, "npx") or
+        std.ascii.eqlIgnoreCase(command_name, "pnpm") or
+        std.ascii.eqlIgnoreCase(command_name, "yarn") or
+        std.ascii.eqlIgnoreCase(command_name, "corepack") or
+        std.ascii.eqlIgnoreCase(command_name, "vlt");
 }
 
 fn reportDelegatedTrustFailure(
@@ -450,6 +605,8 @@ fn reportDelegatedTrustFailure(
         std.process.exit(1);
     };
     defer allocator.free(message);
+    var audit_ctx = eventlog.captureAuditContext(allocator);
+    defer audit_ctx.deinit(allocator);
     eventlog.writeLicensedSecurityError(
         allocator,
         cfg.structured_logging,
@@ -465,6 +622,13 @@ fn reportDelegatedTrustFailure(
             .script_path = command_path,
             .source = "proxy",
             .verification_result = "failed",
+            .user = audit_ctx.user,
+            .sid = audit_ctx.sid,
+            .hostname = audit_ctx.hostname,
+            .parent_process = audit_ctx.parent_process,
+            .parent_pid = audit_ctx.parent_pid,
+            .project_name = audit_ctx.project_name,
+            .project_path = audit_ctx.project_path,
         },
         message,
         4306,
@@ -475,11 +639,11 @@ fn reportDelegatedTrustFailure(
         \\Command: {s}
         \\File: {s}
         \\Reason: {s}
-        \\Action: Run `nvm reshim` (re-signs package-manager scripts) or `nvm doctor --autofix`.
+        \\Action: If you trust this change, run `nvm firewall trust module {s}` then `nvm reshim`.
         \\If this change was unexpected, contact your administrator and review NVM event logs.
         \\Event code: NVM4306
         \\
-    , .{ command_name, command_path, detail });
+    , .{ command_name, command_path, detail, command_name });
     std.process.exit(1);
 }
 
@@ -959,26 +1123,99 @@ fn asciiEndsWithIgnoreCase(value: []const u8, suffix: []const u8) bool {
     return std.ascii.eqlIgnoreCase(value[value.len - suffix.len ..], suffix);
 }
 
-fn runReshim(allocator: std.mem.Allocator, install_root: []const u8, node_install_dir: []const u8) void {
+fn userInitiatedPmReshim(allocator: std.mem.Allocator, install_root: []const u8, structured_logging: bool) bool {
+    // npm i -g from a shell is user intent. npm i -g nested under another global
+    // shim (opencode upgrade) is a self-update — keep the VerifyCache gate.
+    const data_root = std.fs.path.dirname(install_root) orelse return true;
+    const shim_dir = std.fs.path.join(allocator, &.{ data_root, ".shim" }) catch return true;
+    defer allocator.free(shim_dir);
+    const ancestors = eventlog.listAncestorImagePaths(allocator) catch return true;
+    defer eventlog.freeAncestorImagePaths(allocator, ancestors);
+    if (module_firewall.nestedUnderNonPmShim(ancestors, shim_dir)) {
+        logFirewallInfo(allocator, structured_logging, "firewall.nested_pm_gate", "firewall nested pm install under global shim; leaving VerifyCache gate on");
+        return false;
+    }
+    return true;
+}
+
+fn runReshim(allocator: std.mem.Allocator, install_root: []const u8, node_install_dir: []const u8, authorize_changed: bool) void {
     _ = install_root;
+    _ = authorize_changed;
     // Route through nvm.exe --reshim so the CLI opens the .shim ACL write
     // window. Spawning utils\reshim.exe alone fails against the locked DACL
     // (manual `nvm reshim` worked because sync/cli unlock first).
+    // Authorization to resign disk-changed launchers is decided by nvm.exe
+    // from the live parent tree — not NVM_SIGN_CHANGED_MODULES.
     const nvm_path = nodeversion.resolveNvmExePath(allocator) catch {
         std.debug.print("nvm.exe not found under ProgramRoot; skipping post-global reshim\n", .{});
         return;
     };
     defer allocator.free(nvm_path);
 
-    var child = std.process.Child.init(&.{ nvm_path, "--reshim", "--silent", node_install_dir }, allocator);
+    var nonce: [8]u8 = undefined;
+    std.crypto.random.bytes(&nonce);
+    const hex = std.fmt.bytesToHex(nonce, .lower);
+    const ev_name = std.fmt.allocPrint(allocator, "Local\\NVMReshimParentReady-{s}", .{hex}) catch {
+        spawnNvmReshim(allocator, nvm_path, node_install_dir, null);
+        return;
+    };
+    defer allocator.free(ev_name);
+
+    const ev = eventlog.createNamedEvent(allocator, ev_name);
+    spawnNvmReshim(allocator, nvm_path, node_install_dir, ev_name);
+    if (ev) |handle| {
+        eventlog.waitAndCloseNamedEvent(handle, 10_000);
+    }
+}
+
+fn spawnNvmReshim(
+    allocator: std.mem.Allocator,
+    nvm_path: []const u8,
+    node_install_dir: []const u8,
+    ready_event: ?[]const u8,
+) void {
+    var env_map = std.process.getEnvMap(allocator) catch {
+        spawnNvmReshimChild(allocator, nvm_path, node_install_dir, ready_event, null);
+        return;
+    };
+    defer env_map.deinit();
+    env_map.remove("NVM_SIGN_CHANGED_MODULES");
+    spawnNvmReshimChild(allocator, nvm_path, node_install_dir, ready_event, &env_map);
+}
+
+fn spawnNvmReshimChild(
+    allocator: std.mem.Allocator,
+    nvm_path: []const u8,
+    node_install_dir: []const u8,
+    ready_event: ?[]const u8,
+    env_map: ?*std.process.EnvMap,
+) void {
+    const argv: []const []const u8 = if (ready_event) |name|
+        &.{ nvm_path, "--reshim", "--silent", node_install_dir, "--parent-ready-event", name }
+    else
+        &.{ nvm_path, "--reshim", "--silent", node_install_dir };
+    var child = std.process.Child.init(argv, allocator);
+    if (env_map) |env| {
+        child.env_map = env;
+    }
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
-
-    // Detached on purpose: npm/yarn global install already finished; nvm/reshim
-    // must outlive proxy.exe. reshim.exe binds a kill-on-close job so its
-    // own children cannot leak after it exits.
     child.spawn() catch return;
+}
+
+fn resignScriptSync(allocator: std.mem.Allocator, script_path: []const u8) bool {
+    const nvm_path = nodeversion.resolveNvmExePath(allocator) catch return false;
+    defer allocator.free(nvm_path);
+    var child = std.process.Child.init(&.{ nvm_path, "--sign-script", script_path }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    const term = child.spawnAndWait() catch return false;
+    return switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
 }
 
 fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs {
@@ -1043,9 +1280,139 @@ fn hashFileOptional(allocator: std.mem.Allocator, path: []const u8) ?[32]u8 {
     return out;
 }
 
-fn digestsEqual(a: ?[32]u8, b: ?[32]u8) bool {
-    if (a == null or b == null) return true; // skip trust path if unreadable
-    return std.mem.eql(u8, &a.?, &b.?);
+const EntrypointSnap = struct {
+    size: i64,
+    mtime: u64,
+    volume_serial: u32,
+    file_id: u64,
+    usn: u64,
+    digest: ?[32]u8,
+};
+
+fn captureEntrypointSnap(allocator: std.mem.Allocator, path: []const u8) ?EntrypointSnap {
+    const times = verifycache.nodeFileTimes(path) catch return null;
+    const state = verifycache.nodeFileSecurityState(path) catch return null;
+    // Skip full digests for large native binaries (e.g. 100MB+ CLIs); size/mtime/id catch rewrites.
+    const digest = if (times.size <= 2 * 1024 * 1024) hashFileOptional(allocator, path) else null;
+    return .{
+        .size = times.size,
+        .mtime = times.mtime,
+        .volume_serial = state.volume_serial,
+        .file_id = state.file_id,
+        .usn = state.usn,
+        .digest = digest,
+    };
+}
+
+/// Content-first comparison. Matching digests win over USN/mtime noise (AV,
+/// last-access, ADS). Fall back to identity/size/mtime when a digest is unavailable.
+fn entrypointSnapChanged(before: ?EntrypointSnap, after: ?EntrypointSnap) bool {
+    const b = before orelse return false;
+    const a = after orelse return true;
+    if (b.digest) |bd| {
+        if (a.digest) |ad| {
+            return !std.mem.eql(u8, &bd, &ad);
+        }
+    }
+    if (b.size != a.size) return true;
+    if (b.volume_serial != a.volume_serial or b.file_id != a.file_id) return true;
+    // mtime without digest: useful for large native CLI self-updates; ignore USN-only noise.
+    if (b.mtime != a.mtime) return true;
+    return false;
+}
+
+const EntrypointSnapSet = struct {
+    paths: []const []const u8,
+    snaps: []const ?EntrypointSnap,
+
+    fn deinit(self: EntrypointSnapSet, allocator: std.mem.Allocator) void {
+        for (self.paths) |p| allocator.free(p);
+        allocator.free(self.paths);
+        allocator.free(self.snaps);
+    }
+};
+
+fn captureEntrypointSnapSet(allocator: std.mem.Allocator, command_path: []const u8, command_name: []const u8) EntrypointSnapSet {
+    var paths = std.ArrayListUnmanaged([]const u8){};
+    errdefer {
+        for (paths.items) |p| allocator.free(p);
+        paths.deinit(allocator);
+    }
+
+    const cmd_path = allocator.dupe(u8, command_path) catch null;
+    if (cmd_path) |p| {
+        paths.append(allocator, p) catch allocator.free(p);
+    }
+
+    appendCompanionBinTargets(allocator, &paths, command_path, command_name);
+
+    const owned_paths = paths.toOwnedSlice(allocator) catch return .{ .paths = &[_][]const u8{}, .snaps = &[_]?EntrypointSnap{} };
+    const snaps = allocator.alloc(?EntrypointSnap, owned_paths.len) catch {
+        for (owned_paths) |p| allocator.free(p);
+        allocator.free(owned_paths);
+        return .{ .paths = &[_][]const u8{}, .snaps = &[_]?EntrypointSnap{} };
+    };
+    for (owned_paths, 0..) |p, i| {
+        snaps[i] = captureEntrypointSnap(allocator, p);
+    }
+    return .{ .paths = owned_paths, .snaps = snaps };
+}
+
+fn appendCompanionBinTargets(
+    allocator: std.mem.Allocator,
+    paths: *std.ArrayListUnmanaged([]const u8),
+    command_path: []const u8,
+    command_name: []const u8,
+) void {
+    const ext = std.fs.path.extension(command_path);
+    if (!(std.ascii.eqlIgnoreCase(ext, ".cmd") or std.ascii.eqlIgnoreCase(ext, ".bat"))) return;
+
+    const version_dir = std.fs.path.dirname(command_path) orelse return;
+    const node_modules = std.fs.path.join(allocator, &.{ version_dir, "node_modules" }) catch return;
+    defer allocator.free(node_modules);
+
+    var nm_dir = std.fs.cwd().openDir(node_modules, .{ .iterate = true }) catch return;
+    defer nm_dir.close();
+
+    var it = nm_dir.iterate();
+    while (it.next() catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (std.mem.eql(u8, entry.name, ".bin")) continue;
+        const candidate = std.fs.path.join(allocator, &.{ node_modules, entry.name, "bin", command_name }) catch continue;
+        defer allocator.free(candidate);
+        // Prefer .exe companion (self-updating native CLIs).
+        const exe = std.mem.concat(allocator, u8, &.{ candidate, ".exe" }) catch continue;
+        std.fs.cwd().access(exe, .{}) catch {
+            allocator.free(exe);
+            continue;
+        };
+        paths.append(allocator, exe) catch allocator.free(exe);
+    }
+}
+
+fn entrypointSnapSetChanged(before: EntrypointSnapSet, after: EntrypointSnapSet) bool {
+    for (before.paths, before.snaps) |bp, bs| {
+        var found = false;
+        for (after.paths, after.snaps) |ap, as| {
+            if (!std.ascii.eqlIgnoreCase(bp, ap)) continue;
+            found = true;
+            if (entrypointSnapChanged(bs, as)) return true;
+            break;
+        }
+        if (!found and bs != null) return true;
+    }
+    for (after.paths, after.snaps) |ap, as| {
+        if (as == null) continue;
+        var found = false;
+        for (before.paths) |bp| {
+            if (std.ascii.eqlIgnoreCase(bp, ap)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return true;
+    }
+    return false;
 }
 
 fn loadTrustedModules(allocator: std.mem.Allocator) ![]const []const u8 {
@@ -1059,17 +1426,238 @@ fn loadTrustedModules(allocator: std.mem.Allocator) ![]const []const u8 {
     return rules;
 }
 
-fn untrustedHandlerIsPrompt(allocator: std.mem.Allocator) bool {
-    const raw = registry.queryStringWithFallback(allocator, registry.preferenceHives(), config.preference_registry_root, module_firewall.reg_value_untrusted_handler) catch {
+/// Local TrustedModules first; if untrusted and an HTTPS URL is configured, ask nvm check-remote-trust
+/// (HTTP only for modules not already trusted locally).
+fn isTrustedModule(allocator: std.mem.Allocator, command_name: []const u8, rules: []const []const u8) bool {
+    const pkg = module_firewall.PackageSpec{ .name = command_name, .version = "", .raw = command_name };
+    if (module_firewall.isPackageAllowed(pkg, rules) orelse false) return true;
+    if (module_firewall.extractHttpsUrl(rules) == null) return false;
+    return evaluateRemoteTrust(allocator, command_name);
+}
+
+fn evaluateRemoteTrust(allocator: std.mem.Allocator, command_name: []const u8) bool {
+    const nvm_path = nodeversion.resolveNvmExePath(allocator) catch {
+        std.debug.print("NVM Firewall: Remote trust service is unavailable or not responding (nvm.exe not found).\n", .{});
         return false;
     };
+    defer allocator.free(nvm_path);
+
+    var child = std.process.Child.init(&.{ nvm_path, "firewall", "check-remote-trust", command_name }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    const term = child.spawnAndWait() catch {
+        std.debug.print("NVM Firewall: Remote trust service is unavailable or not responding.\n", .{});
+        return false;
+    };
+    return switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+}
+
+const UntrustedHandlerAction = enum { deny, prompt, allow };
+
+fn untrustedHandlerAction(allocator: std.mem.Allocator) UntrustedHandlerAction {
+    const raw = registry.queryStringWithFallback(allocator, registry.preferenceHives(), config.preference_registry_root, module_firewall.reg_value_untrusted_handler) catch {
+        return .prompt;
+    };
     defer allocator.free(raw);
-    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw, " \t"), "prompt");
+    const trimmed = std.mem.trim(u8, raw, " \t");
+    if (trimmed.len == 0) return .prompt;
+    if (std.ascii.eqlIgnoreCase(trimmed, "deny")) return .deny;
+    if (std.ascii.eqlIgnoreCase(trimmed, "allow")) return .allow;
+    return .prompt;
+}
+
+fn notifyModuleAutoTrusted(allocator: std.mem.Allocator, command_name: []const u8) void {
+    const nvm_path = nodeversion.resolveNvmExePath(allocator) catch return;
+    defer allocator.free(nvm_path);
+    var child = std.process.Child.init(&.{ nvm_path, "firewall", "notify-changed", command_name }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    _ = child.spawnAndWait() catch {};
+}
+
+const untrusted_module_changed_code: u32 = 4406;
+
+fn logFirewallInfo(allocator: std.mem.Allocator, structured_logging: bool, event_name: []const u8, plaintext: []const u8) void {
+    if (structured_logging) {
+        eventlog.writeStructuredInfo(allocator, "proxy", event_name, .{ .message = plaintext });
+    } else {
+        eventlog.writeInfo(allocator, "proxy", plaintext);
+    }
+}
+
+const ModuleChangeAudit = struct {
+    path: []u8,
+    before_digest: []u8,
+    after_digest: []u8,
+    before_size: i64,
+    after_size: i64,
+
+    fn deinit(self: ModuleChangeAudit, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.before_digest);
+        allocator.free(self.after_digest);
+    }
+};
+
+fn emptyOwned(allocator: std.mem.Allocator) []u8 {
+    return allocator.alloc(u8, 0) catch {
+        // Extremely unlikely; prefer empty alloc so deinit stays safe.
+        return allocator.dupe(u8, "") catch unreachable;
+    };
+}
+
+fn digestBytesToHex(allocator: std.mem.Allocator, digest: ?[32]u8) []u8 {
+    const d = digest orelse return emptyOwned(allocator);
+    var out = allocator.alloc(u8, 64) catch return emptyOwned(allocator);
+    const digits = "0123456789abcdef";
+    for (d, 0..) |byte, i| {
+        out[i * 2] = digits[byte >> 4];
+        out[i * 2 + 1] = digits[byte & 0x0f];
+    }
+    return out;
+}
+
+fn auditFromSnaps(allocator: std.mem.Allocator, path: []const u8, before: ?EntrypointSnap, after: ?EntrypointSnap) ModuleChangeAudit {
+    return .{
+        .path = allocator.dupe(u8, path) catch emptyOwned(allocator),
+        .before_digest = digestBytesToHex(allocator, if (before) |b| b.digest else null),
+        .after_digest = digestBytesToHex(allocator, if (after) |a| a.digest else null),
+        .before_size = if (before) |b| b.size else -1,
+        .after_size = if (after) |a| a.size else -1,
+    };
+}
+
+fn firstChangedEntrypointAudit(allocator: std.mem.Allocator, before: EntrypointSnapSet, after: EntrypointSnapSet, fallback_path: []const u8) ModuleChangeAudit {
+    for (before.paths, before.snaps) |bp, bs| {
+        var found = false;
+        for (after.paths, after.snaps) |ap, as| {
+            if (!std.ascii.eqlIgnoreCase(bp, ap)) continue;
+            found = true;
+            if (entrypointSnapChanged(bs, as)) {
+                return auditFromSnaps(allocator, bp, bs, as);
+            }
+            break;
+        }
+        if (!found and bs != null) {
+            return auditFromSnaps(allocator, bp, bs, null);
+        }
+    }
+    for (after.paths, after.snaps) |ap, as| {
+        if (as == null) continue;
+        var found = false;
+        for (before.paths) |bp| {
+            if (std.ascii.eqlIgnoreCase(bp, ap)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return auditFromSnaps(allocator, ap, null, as);
+        }
+    }
+    return auditFromSnaps(allocator, fallback_path, null, null);
+}
+
+fn auditFromVerifyCache(allocator: std.mem.Allocator, path: []const u8) ModuleChangeAudit {
+    var before_digest = emptyOwned(allocator);
+    var before_size: i64 = -1;
+    if (verifycache.loadCachedContent(allocator, path)) |cached| {
+        allocator.free(before_digest);
+        before_digest = cached.digest;
+        before_size = cached.size;
+    }
+
+    var after_digest = emptyOwned(allocator);
+    var after_size: i64 = -1;
+    if (verifycache.nodeFileTimes(path) catch null) |times| {
+        after_size = times.size;
+        if (times.size <= 2 * 1024 * 1024) {
+            if (verifycache.fileSha256Hex(allocator, path) catch null) |hex| {
+                allocator.free(after_digest);
+                after_digest = hex;
+            }
+        }
+    }
+
+    return .{
+        .path = allocator.dupe(u8, path) catch emptyOwned(allocator),
+        .before_digest = before_digest,
+        .after_digest = after_digest,
+        .before_size = before_size,
+        .after_size = after_size,
+    };
+}
+
+fn logUntrustedModuleChanged(
+    allocator: std.mem.Allocator,
+    structured_logging: bool,
+    module: []const u8,
+    outcome: []const u8,
+    handler: []const u8,
+    via: []const u8,
+    audit: ModuleChangeAudit,
+) void {
+    const plaintext = blk: {
+        if (audit.before_digest.len > 0 or audit.after_digest.len > 0) {
+            break :blk std.fmt.allocPrint(
+                allocator,
+                "NVM{d} Untrusted module '{s}' changed (outcome={s}, handler={s}, via={s}, path={s}, before={s}, after={s})",
+                .{ untrusted_module_changed_code, module, outcome, handler, via, audit.path, audit.before_digest, audit.after_digest },
+            ) catch return;
+        }
+        if (audit.before_size >= 0 or audit.after_size >= 0) {
+            break :blk std.fmt.allocPrint(
+                allocator,
+                "NVM{d} Untrusted module '{s}' changed (outcome={s}, handler={s}, via={s}, path={s}, before_size={d}, after_size={d})",
+                .{ untrusted_module_changed_code, module, outcome, handler, via, audit.path, audit.before_size, audit.after_size },
+            ) catch return;
+        }
+        break :blk std.fmt.allocPrint(
+            allocator,
+            "NVM{d} Untrusted module '{s}' changed (outcome={s}, handler={s}, via={s}, path={s})",
+            .{ untrusted_module_changed_code, module, outcome, handler, via, audit.path },
+        ) catch return;
+    };
+    defer allocator.free(plaintext);
+    var audit_ctx = eventlog.captureAuditContext(allocator);
+    defer audit_ctx.deinit(allocator);
+    eventlog.writeInfoCode(allocator, "proxy", plaintext, untrusted_module_changed_code);
+    if (structured_logging) {
+        eventlog.writeStructuredInfoCode(
+            allocator,
+            "proxy",
+            "firewall.untrusted_module_changed",
+            .{
+                .module = module,
+                .outcome = outcome,
+                .handler = handler,
+                .via = via,
+                .path = audit.path,
+                .before_digest = audit.before_digest,
+                .after_digest = audit.after_digest,
+                .before_size = audit.before_size,
+                .after_size = audit.after_size,
+                .user = audit_ctx.user,
+                .sid = audit_ctx.sid,
+                .hostname = audit_ctx.hostname,
+                .parent_process = audit_ctx.parent_process,
+                .parent_pid = audit_ctx.parent_pid,
+                .project_name = audit_ctx.project_name,
+                .project_path = audit_ctx.project_path,
+            },
+            untrusted_module_changed_code,
+        );
+    }
 }
 
 fn promptTrustChange(allocator: std.mem.Allocator, command_name: []const u8) bool {
     const nvm_path = nodeversion.resolveNvmExePath(allocator) catch {
-        return promptTrustChangeConsoleOnly(allocator, command_name);
+        return promptTrustChangeConsoleOnly(allocator, command_name, null);
     };
     defer allocator.free(nvm_path);
 
@@ -1078,7 +1666,7 @@ fn promptTrustChange(allocator: std.mem.Allocator, command_name: []const u8) boo
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
     const term = child.spawnAndWait() catch {
-        return promptTrustChangeConsoleOnly(allocator, command_name);
+        return promptTrustChangeConsoleOnly(allocator, command_name, nvm_path);
     };
     return switch (term) {
         .Exited => |code| code == 0,
@@ -1086,8 +1674,8 @@ fn promptTrustChange(allocator: std.mem.Allocator, command_name: []const u8) boo
     };
 }
 
-fn promptTrustChangeConsoleOnly(allocator: std.mem.Allocator, command_name: []const u8) bool {
-    const msg = std.fmt.allocPrint(allocator, "Untrusted module '{s}' changed after running. Approve and reshim? [y/N]: ", .{command_name}) catch {
+fn promptTrustChangeConsoleOnly(allocator: std.mem.Allocator, command_name: []const u8, nvm_path: ?[]const u8) bool {
+    const msg = std.fmt.allocPrint(allocator, "Untrusted module '{s}' changed after running. Do you trust this module? [y/N]: ", .{command_name}) catch {
         return false;
     };
     defer allocator.free(msg);
@@ -1097,7 +1685,20 @@ fn promptTrustChangeConsoleOnly(allocator: std.mem.Allocator, command_name: []co
     const n = stdin.read(stdin_buffer[0..]) catch return false;
     if (n == 0) return false;
     const answer = std.mem.trim(u8, stdin_buffer[0..n], " \t\r\n");
-    return answer.len > 0 and (answer[0] == 'y' or answer[0] == 'Y');
+    const ok = answer.len > 0 and (answer[0] == 'y' or answer[0] == 'Y');
+    if (ok) {
+        if (nvm_path) |exe| {
+            var trust = std.process.Child.init(&.{ exe, "firewall", "trust", "module", command_name }, allocator);
+            trust.stdin_behavior = .Ignore;
+            trust.stdout_behavior = .Ignore;
+            trust.stderr_behavior = .Ignore;
+            _ = trust.spawnAndWait() catch {};
+            std.debug.print("{s} is now trusted\n", .{command_name});
+        }
+    } else {
+        std.debug.print("{s} is not trusted\n", .{command_name});
+    }
+    return ok;
 }
 
 fn maybeReshimAfterSelfUpdate(
@@ -1106,42 +1707,54 @@ fn maybeReshimAfterSelfUpdate(
     node_install_dir: []const u8,
     command_name: []const u8,
     command_path: []const u8,
-    digest_before: ?[32]u8,
+    snap_before: EntrypointSnapSet,
+    structured_logging: bool,
 ) !void {
-    const digest_after = hashFileOptional(allocator, command_path);
-    if (digestsEqual(digest_before, digest_after)) return;
+    const snap_after = captureEntrypointSnapSet(allocator, command_path, command_name);
+    defer snap_after.deinit(allocator);
+    if (!entrypointSnapSetChanged(snap_before, snap_after)) return;
 
     // Package managers already handled via needs_reshim.
-    if (std.ascii.eqlIgnoreCase(command_name, "npm") or
-        std.ascii.eqlIgnoreCase(command_name, "npx") or
-        std.ascii.eqlIgnoreCase(command_name, "pnpm") or
-        std.ascii.eqlIgnoreCase(command_name, "yarn") or
-        std.ascii.eqlIgnoreCase(command_name, "corepack") or
-        std.ascii.eqlIgnoreCase(command_name, "vlt"))
-    {
+    if (isPackageManagerCommand(command_name)) {
         return;
     }
 
     const rules = try loadTrustedModules(allocator);
     defer module_firewall.freeMultiSz(allocator, rules);
 
-    const pkg = module_firewall.PackageSpec{ .name = command_name, .version = "", .raw = command_name };
-    const trusted = module_firewall.isPackageAllowed(pkg, rules) orelse false;
+    const trusted = isTrustedModule(allocator, command_name, rules);
+    const audit = firstChangedEntrypointAudit(allocator, snap_before, snap_after, command_path);
+    defer audit.deinit(allocator);
     if (trusted) {
-        eventlog.writeInfo(allocator, "proxy", "firewall trusted module changed; scheduling reshim");
-        runReshim(allocator, install_root, node_install_dir);
+        logFirewallInfo(allocator, structured_logging, "firewall.trusted_module_changed", "firewall trusted module changed; scheduling reshim");
+        _ = resignScriptSync(allocator, command_path);
+        runReshim(allocator, install_root, node_install_dir, true);
         return;
     }
-    if (untrustedHandlerIsPrompt(allocator)) {
-        if (promptTrustChange(allocator, command_name)) {
-            eventlog.writeInfo(allocator, "proxy", "firewall trust prompt accepted; scheduling reshim");
-            runReshim(allocator, install_root, node_install_dir);
-        } else {
-            eventlog.writeInfo(allocator, "proxy", "firewall trust prompt declined; VerifyCache left stale");
-        }
-        return;
+    switch (untrustedHandlerAction(allocator)) {
+        .deny => {
+            logUntrustedModuleChanged(allocator, structured_logging, command_name, "deny", "deny", "post_run", audit);
+            logFirewallInfo(allocator, structured_logging, "firewall.untrusted_deny", "firewall untrusted module changed; reshim not scheduled (deny)");
+        },
+        .allow => {
+            logUntrustedModuleChanged(allocator, structured_logging, command_name, "allow", "allow", "post_run", audit);
+            logFirewallInfo(allocator, structured_logging, "firewall.untrusted_allow", "firewall untrusted module changed; allow auto-trust; scheduling reshim");
+            notifyModuleAutoTrusted(allocator, command_name);
+            _ = resignScriptSync(allocator, command_path);
+            runReshim(allocator, install_root, node_install_dir, true);
+        },
+        .prompt => {
+            if (promptTrustChange(allocator, command_name)) {
+                logUntrustedModuleChanged(allocator, structured_logging, command_name, "prompt_accepted", "prompt", "post_run", audit);
+                logFirewallInfo(allocator, structured_logging, "firewall.prompt_accepted", "firewall trust prompt accepted; trusted modules updated; scheduling reshim");
+                _ = resignScriptSync(allocator, command_path);
+                runReshim(allocator, install_root, node_install_dir, true);
+            } else {
+                logUntrustedModuleChanged(allocator, structured_logging, command_name, "prompt_declined", "prompt", "post_run", audit);
+                logFirewallInfo(allocator, structured_logging, "firewall.prompt_declined", "firewall trust prompt declined; VerifyCache left stale");
+            }
+        },
     }
-    eventlog.writeInfo(allocator, "proxy", "firewall untrusted module changed; reshim not scheduled (deny)");
 }
 
 /// Returns true when the invoked package manager command is likely to install

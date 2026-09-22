@@ -1,4 +1,5 @@
 const std = @import("std");
+const windows = std.os.windows;
 const config = @import("config");
 const registry = @import("registry");
 
@@ -104,23 +105,41 @@ pub fn listHasHttps(rules: []const []const u8) bool {
     return false;
 }
 
-/// Local-list evaluation (VersionAllowList-compatible). HTTPS URL lists return null (caller does remote).
-pub fn isPackageAllowed(pkg: PackageSpec, rules: []const []const u8) ?bool {
-    if (listHasHttps(rules)) return null;
+/// First https:// URL in the list, or null.
+pub fn extractHttpsUrl(rules: []const []const u8) ?[]const u8 {
+    for (rules) |r| {
+        const e = trimAscii(r);
+        if (startsWithIgnoreCase(e, "https://")) return e;
+    }
+    return null;
+}
 
+/// Local-list evaluation (VersionAllowList-compatible). HTTPS URL entries are ignored
+/// so TrustedModules can mix local names with a remote policy URL.
+/// URL-only lists are local-deny (NOT ALL) so callers fall through to remote eval
+/// instead of treating an empty leftover list as allow-all.
+pub fn isPackageAllowed(pkg: PackageSpec, rules: []const []const u8) ?bool {
     var not_all = false;
     var has_exclusive = false;
+    var has_local = false;
     var i: usize = 0;
     while (i < rules.len) : (i += 1) {
+        const e = trimAscii(rules[i]);
+        if (startsWithIgnoreCase(e, "https://")) continue;
         const norm = normalizeRule(rules[i]);
         if (norm.entry.len == 0) continue;
+        has_local = true;
         if (norm.negated and eqlIgnoreCase(norm.entry, "all")) not_all = true;
         if (!norm.negated and !eqlIgnoreCase(norm.entry, "all")) has_exclusive = true;
     }
 
+    if (!has_local and listHasHttps(rules)) return false;
+
     if (not_all) {
         i = 0;
         while (i < rules.len) : (i += 1) {
+            const e = trimAscii(rules[i]);
+            if (startsWithIgnoreCase(e, "https://")) continue;
             const norm = normalizeRule(rules[i]);
             if (norm.negated) continue;
             if (ruleMatches(norm.entry, pkg)) return true;
@@ -130,12 +149,16 @@ pub fn isPackageAllowed(pkg: PackageSpec, rules: []const []const u8) ?bool {
 
     i = 0;
     while (i < rules.len) : (i += 1) {
+        const e = trimAscii(rules[i]);
+        if (startsWithIgnoreCase(e, "https://")) continue;
         const norm = normalizeRule(rules[i]);
         if (!norm.negated) continue;
         if (ruleMatches(norm.entry, pkg)) return false;
     }
     i = 0;
     while (i < rules.len) : (i += 1) {
+        const e = trimAscii(rules[i]);
+        if (startsWithIgnoreCase(e, "https://")) continue;
         const norm = normalizeRule(rules[i]);
         if (norm.negated) continue;
         if (ruleMatches(norm.entry, pkg)) return true;
@@ -144,8 +167,40 @@ pub fn isPackageAllowed(pkg: PackageSpec, rules: []const []const u8) ?bool {
     return true;
 }
 
+fn pathHasPrefixIgnoreCase(path: []const u8, prefix: []const u8) bool {
+    if (prefix.len == 0 or path.len < prefix.len) return false;
+    if (!std.ascii.eqlIgnoreCase(path[0..prefix.len], prefix)) return false;
+    return path.len == prefix.len or path[prefix.len] == '\\' or path[prefix.len] == '/';
+}
+
+pub fn isPackageManagerStem(stem: []const u8) bool {
+    const names = [_][]const u8{ "npm", "npx", "pnpm", "yarn", "yarnpkg", "corepack", "vlt", "node" };
+    for (names) |n| {
+        if (std.ascii.eqlIgnoreCase(stem, n)) return true;
+    }
+    return false;
+}
+
+/// True when image is a global-module shim (in .shim) other than node/npm/etc.
+pub fn isNonPmShimImage(image_path: []const u8, shim_dir: []const u8) bool {
+    if (!pathHasPrefixIgnoreCase(image_path, shim_dir)) return false;
+    const stem = std.fs.path.stem(image_path);
+    return !isPackageManagerStem(stem);
+}
+
+/// True when a non-PM global shim appears in the ancestor list (nested self-update via npm).
+pub fn nestedUnderNonPmShim(ancestor_images: []const []const u8, shim_dir: []const u8) bool {
+    for (ancestor_images) |image| {
+        if (isNonPmShimImage(image, shim_dir)) return true;
+    }
+    return false;
+}
+
 pub fn loadMultiSzPolicy(allocator: std.mem.Allocator, value_name: []const u8) ![]const []const u8 {
-    const policy_hives = [_]registry.Hive{ .hkey_local_machine, .hkey_current_user };
+    const policy_hives = [_]windows.HKEY{
+        windows.HKEY_LOCAL_MACHINE,
+        windows.HKEY_CURRENT_USER,
+    };
     if (registry.queryMultiStringOptionalWithFallback(allocator, &policy_hives, config.policy_registry_root, value_name) catch null) |vals| {
         return vals;
     }
@@ -167,4 +222,99 @@ test "not all with exception" {
     try std.testing.expect(ok != null and ok.?);
     const deny = isPackageAllowed(.{ .name = "eslint", .version = "", .raw = "eslint" }, &rules);
     try std.testing.expect(deny != null and !deny.?);
+}
+
+test "splitNameVersion scoped unscoped" {
+    const scoped = splitNameVersion("@a/b@1.2.3");
+    try std.testing.expectEqualStrings("@a/b", scoped.name);
+    try std.testing.expectEqualStrings("1.2.3", scoped.version);
+    const unscoped = splitNameVersion("a@1");
+    try std.testing.expectEqualStrings("a", unscoped.name);
+    try std.testing.expectEqualStrings("1", unscoped.version);
+}
+
+test "listHasHttps true false" {
+    const yes = [_][]const u8{ "eslint", "https://policy.example/fw" };
+    try std.testing.expect(listHasHttps(&yes));
+    const no = [_][]const u8{ "eslint", "ALL" };
+    try std.testing.expect(!listHasHttps(&no));
+}
+
+test "isPackageAllowed bang deny" {
+    const rules = [_][]const u8{ "ALL", "!eslint" };
+    const deny = isPackageAllowed(.{ .name = "eslint", .version = "", .raw = "eslint" }, &rules);
+    try std.testing.expect(deny != null and !deny.?);
+    const allow = isPackageAllowed(.{ .name = "lodash", .version = "", .raw = "lodash" }, &rules);
+    try std.testing.expect(allow != null and allow.?);
+}
+
+test "isPackageAllowed exclusive miss" {
+    const rules = [_][]const u8{"eslint"};
+    const miss = isPackageAllowed(.{ .name = "lodash", .version = "", .raw = "lodash" }, &rules);
+    try std.testing.expect(miss != null and !miss.?);
+}
+
+test "isPackageAllowed https ignored for local" {
+    const rules = [_][]const u8{ "NOT ALL", "eslint", "https://policy.example/fw" };
+    const ok = isPackageAllowed(.{ .name = "eslint", .version = "", .raw = "eslint" }, &rules);
+    try std.testing.expect(ok != null and ok.?);
+    const deny = isPackageAllowed(.{ .name = "lodash", .version = "", .raw = "lodash" }, &rules);
+    try std.testing.expect(deny != null and !deny.?);
+}
+
+test "isPackageAllowed https-only is local deny" {
+    const rules = [_][]const u8{"https://127.0.0.1:8443/module/trust"};
+    const deny = isPackageAllowed(.{ .name = "opencode", .version = "", .raw = "opencode" }, &rules);
+    try std.testing.expect(deny != null and !deny.?);
+}
+
+test "nestedUnderNonPmShim user npm from shell" {
+    const shim = "C:\\Users\\x\\AppData\\Local\\Author Software\\nvm\\.shim";
+    const ancestors = [_][]const u8{
+        "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+        "C:\\Windows\\explorer.exe",
+    };
+    try std.testing.expect(!nestedUnderNonPmShim(&ancestors, shim));
+}
+
+test "nestedUnderNonPmShim opencode spawning npm" {
+    const shim = "C:\\Users\\x\\AppData\\Local\\Author Software\\nvm\\.shim";
+    const ancestors = [_][]const u8{
+        "C:\\Users\\x\\AppData\\Local\\Author Software\\nvm\\installs\\v24.20.0\\node.exe",
+        "C:\\Users\\x\\AppData\\Local\\Author Software\\nvm\\.shim\\opencode.exe",
+        "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+    };
+    try std.testing.expect(nestedUnderNonPmShim(&ancestors, shim));
+}
+
+test "nestedUnderNonPmShim npm.exe in shim is package manager" {
+    const shim = "C:\\Users\\x\\AppData\\Local\\Author Software\\nvm\\.shim";
+    const ancestors = [_][]const u8{
+        "C:\\Users\\x\\AppData\\Local\\Author Software\\nvm\\.shim\\npm.exe",
+        "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+    };
+    try std.testing.expect(!nestedUnderNonPmShim(&ancestors, shim));
+}
+
+test "extractHttpsUrl" {
+    const rules = [_][]const u8{ "eslint", "https://policy.example/fw" };
+    const url = extractHttpsUrl(&rules) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqualStrings("https://policy.example/fw", url);
+}
+
+test "isPackageAllowed org wildcard" {
+    const rules = [_][]const u8{ "NOT ALL", "@org/*" };
+    const ok = isPackageAllowed(.{ .name = "@org/pkg", .version = "1.0.0", .raw = "@org/pkg@1.0.0" }, &rules);
+    try std.testing.expect(ok != null and ok.?);
+}
+
+test "isPackageAllowed star pin match miss" {
+    const rules = [_][]const u8{"eslint@1.*"};
+    const match = isPackageAllowed(.{ .name = "eslint", .version = "1.2.3", .raw = "eslint@1.2.3" }, &rules);
+    try std.testing.expect(match != null and match.?);
+    const miss = isPackageAllowed(.{ .name = "eslint", .version = "2.0.0", .raw = "eslint@2.0.0" }, &rules);
+    try std.testing.expect(miss != null and !miss.?);
 }
