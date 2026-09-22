@@ -3,6 +3,7 @@ const windows = std.os.windows;
 const registry = @import("registry");
 const config = @import("config");
 const resolver = @import("resolver");
+const cmd_spawn = @import("cmd_spawn");
 
 const reg_path = config.preference_registry_root;
 const policy_path = config.policy_registry_root;
@@ -893,11 +894,10 @@ fn resolvePackageManagerVersionFromCommand(allocator: std.mem.Allocator, node_in
     try env_map.put("PATH", child_path);
 
     // Spawn .cmd/.bat as argv[0] so Zig uses scriptCommandLine quoting
-    // (nvm-windows/nvm#1408 — manual cmd.exe /c argv breaks on spaced paths+args).
-    var argv = try allocator.alloc([]const u8, 2);
+    // (nvm-windows/nvm#1408 — see shared/cmd_spawn.zig).
+    const version_args = [_][]const u8{"--version"};
+    const argv = try cmd_spawn.buildEntrypointArgv(allocator, command_path, &version_args);
     defer allocator.free(argv);
-    argv[0] = command_path;
-    argv[1] = "--version";
 
     const result = std.process.Child.run(.{
         .allocator = allocator,
