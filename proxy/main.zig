@@ -690,22 +690,11 @@ fn runDelegatedCommand(
         return spawnArgv(allocator, &env_map, node_bin, cli_js, forwarded_args);
     }
 
-    const ext = std.fs.path.extension(command_path);
-    const use_cmd = std.ascii.eqlIgnoreCase(ext, ".cmd") or std.ascii.eqlIgnoreCase(ext, ".bat");
-
-    if (use_cmd) {
-        var argv = try allocator.alloc([]const u8, forwarded_args.len + 4);
-        defer allocator.free(argv);
-        argv[0] = "cmd.exe";
-        argv[1] = "/d";
-        argv[2] = "/c";
-        argv[3] = command_path;
-        for (forwarded_args, 0..) |arg, i| {
-            argv[i + 4] = arg;
-        }
-        return spawnArgvSlice(allocator, &env_map, argv);
-    }
-
+    // Spawn the entrypoint directly. For .cmd/.bat, Zig's Child uses
+    // argvToScriptCommandLineWindows (cmd /c with BatBadBut-safe quoting).
+    // Hand-building [cmd.exe,/d,/c,path,...args] breaks when both the path and
+    // a forwarded arg contain spaces (cmd.exe re-parses /c differently than
+    // CommandLineToArgvW) — see nvm-windows/nvm#1408.
     var argv = try allocator.alloc([]const u8, forwarded_args.len + 1);
     defer allocator.free(argv);
     argv[0] = command_path;

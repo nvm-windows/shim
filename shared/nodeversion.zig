@@ -892,25 +892,12 @@ fn resolvePackageManagerVersionFromCommand(allocator: std.mem.Allocator, node_in
     defer allocator.free(child_path);
     try env_map.put("PATH", child_path);
 
-    const ext = std.fs.path.extension(command_path);
-    const use_cmd = std.ascii.eqlIgnoreCase(ext, ".cmd") or std.ascii.eqlIgnoreCase(ext, ".bat");
-
-    var argv = if (use_cmd)
-        try allocator.alloc([]const u8, 5)
-    else
-        try allocator.alloc([]const u8, 2);
+    // Spawn .cmd/.bat as argv[0] so Zig uses scriptCommandLine quoting
+    // (nvm-windows/nvm#1408 — manual cmd.exe /c argv breaks on spaced paths+args).
+    var argv = try allocator.alloc([]const u8, 2);
     defer allocator.free(argv);
-
-    if (use_cmd) {
-        argv[0] = "cmd.exe";
-        argv[1] = "/d";
-        argv[2] = "/c";
-        argv[3] = command_path;
-        argv[4] = "--version";
-    } else {
-        argv[0] = command_path;
-        argv[1] = "--version";
-    }
+    argv[0] = command_path;
+    argv[1] = "--version";
 
     const result = std.process.Child.run(.{
         .allocator = allocator,
