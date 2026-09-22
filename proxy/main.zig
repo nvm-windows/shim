@@ -10,6 +10,7 @@ const install_safety = @import("install_safety");
 const module_firewall = @import("module_firewall");
 const config = @import("config");
 const registry = @import("registry");
+const cmd_spawn = @import("cmd_spawn");
 
 const ParsedArgs = struct {
     override_version: ?[]const u8,
@@ -680,14 +681,9 @@ fn runDelegatedCommand(
     // Spawn the entrypoint directly. For .cmd/.bat, Zig's Child uses
     // argvToScriptCommandLineWindows (cmd /c with BatBadBut-safe quoting).
     // Hand-building [cmd.exe,/d,/c,path,...args] breaks when both the path and
-    // a forwarded arg contain spaces (cmd.exe re-parses /c differently than
-    // CommandLineToArgvW) — see nvm-windows/nvm#1408.
-    var argv = try allocator.alloc([]const u8, forwarded_args.len + 1);
+    // a forwarded arg contain spaces — see nvm-windows/nvm#1408 / cmd_spawn.zig.
+    const argv = try cmd_spawn.buildEntrypointArgv(allocator, command_path, forwarded_args);
     defer allocator.free(argv);
-    argv[0] = command_path;
-    for (forwarded_args, 0..) |arg, i| {
-        argv[i + 1] = arg;
-    }
     return spawnArgvSlice(allocator, &env_map, argv);
 }
 
