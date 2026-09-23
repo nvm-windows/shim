@@ -260,9 +260,23 @@ fn spawnSignVersionScripts(allocator: std.mem.Allocator, nvm_path: []const u8, v
     var child = std.process.Child.init(argv, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return;
-    _ = child.wait() catch {};
+    child.stderr_behavior = .Inherit;
+    child.spawn() catch {
+        std.debug.print("failed to start nvm.exe to sign scripts in {s}\n", .{version_dir});
+        return;
+    };
+    const term = child.wait() catch {
+        std.debug.print("failed to sign scripts in {s}\n", .{version_dir});
+        return;
+    };
+    switch (term) {
+        .Exited => |code| {
+            if (code != 0) {
+                std.debug.print("failed to sign scripts in {s} (nvm exit {d})\n", .{ version_dir, code });
+            }
+        },
+        else => std.debug.print("failed to sign scripts in {s}\n", .{version_dir}),
+    }
 }
 
 fn parentIsNvmExe(allocator: std.mem.Allocator) bool {
