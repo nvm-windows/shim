@@ -525,6 +525,10 @@ fn isSelfUpdateTrustFailure(reason: []const u8) bool {
         std.mem.indexOf(u8, reason, "digest mismatch") != null;
 }
 
+fn isMissingDelegatedTrust(reason: []const u8) bool {
+    return std.mem.indexOf(u8, reason, "is not trusted") != null;
+}
+
 /// Prompt/trust+reshim when an untrusted module's entrypoint changed under us.
 fn tryRecoverDelegatedTrustFailure(
     allocator: std.mem.Allocator,
@@ -535,19 +539,32 @@ fn tryRecoverDelegatedTrustFailure(
     reason: []const u8,
     structured_logging: bool,
 ) bool {
-    if (!isSelfUpdateTrustFailure(reason)) return false;
-    if (isPackageManagerCommand(command_name)) return false;
+    const self_update = isSelfUpdateTrustFailure(reason);
+    const missing = isMissingDelegatedTrust(reason);
+    if (!self_update and !missing) return false;
+
+    // npm/npx ship with Node. A 2.0.0 upgrade has no script-trust row for them.
+    // Re-sign that miss even when TrustedModules is still the old NOT ALL seed.
+    if (missing and isBuiltinPackageManager(command_name)) {
+        logFirewallInfo(allocator, structured_logging, "firewall.builtin_pm_unsigned", "firewall unsigned npm/npx entrypoint after upgrade; re-signing");
+        _ = resignScriptSync(allocator, command_path);
+        runReshim(allocator, install_root, node_install_dir, true);
+        return true;
+    }
 
     const rules = loadTrustedModules(allocator) catch return false;
     defer module_firewall.freeMultiSz(allocator, rules);
 
     const trust = classifyModuleTrust(allocator, command_name, rules);
-    if (trust == .trusted) {
+    // Default trust includes npm/npx so their upgrades (and a missing first
+    // script-trust entry) re-sign instead of NVM4306.
+    if (trust == .trusted and (self_update or (missing and isPackageManagerCommand(command_name)))) {
         logFirewallInfo(allocator, structured_logging, "firewall.trusted_module_stale", "firewall trusted module VerifyCache stale; scheduling reshim");
         _ = resignScriptSync(allocator, command_path);
         runReshim(allocator, install_root, node_install_dir, true);
         return true;
     }
+    if (!self_update) return false;
     if (trust == .remote_blocked) {
         const audit = auditFromVerifyCache(allocator, command_path);
         defer audit.deinit(allocator);
@@ -590,6 +607,11 @@ fn tryRecoverDelegatedTrustFailure(
             return false;
         },
     }
+}
+
+fn isBuiltinPackageManager(command_name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(command_name, "npm") or
+        std.ascii.eqlIgnoreCase(command_name, "npx");
 }
 
 fn isPackageManagerCommand(command_name: []const u8) bool {
@@ -1650,9 +1672,11 @@ fn evaluateRemoteModuleFirewall(allocator: std.mem.Allocator, structured_logging
 fn loadTrustedModules(allocator: std.mem.Allocator) ![]const []const u8 {
     const rules = module_firewall.loadMultiSzPolicy(allocator, module_firewall.reg_value_trusted_modules) catch &[_][]const u8{};
     if (rules.len == 0) {
-        // Default NOT ALL
-        var out = try allocator.alloc([]const u8, 1);
+        // Empty TrustedModules: deny all except npm and npx.
+        var out = try allocator.alloc([]const u8, 3);
         out[0] = try allocator.dupe(u8, "NOT ALL");
+        out[1] = try allocator.dupe(u8, "npm");
+        out[2] = try allocator.dupe(u8, "npx");
         return out;
     }
     return rules;
