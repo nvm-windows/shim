@@ -146,7 +146,7 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    const command_path = try resolveDelegatedCommandPath(allocator, node_install_dir_abs, command_name);
+    const command_path = try resolveDelegatedOrCorepackPath(allocator, node_install_dir_abs, command_name);
     defer allocator.free(command_path);
 
     if (!try enforcePackageManagerConstraint(allocator, cfg, resolved.version_source, command_name, resolved.node_bin.?, command_path)) {
@@ -426,6 +426,68 @@ fn resolveDelegatedCommandPath(allocator: std.mem.Allocator, node_install_dir: [
     return error.CommandNotFound;
 }
 
+fn resolveDelegatedOrCorepackPath(allocator: std.mem.Allocator, node_install_dir: []const u8, command_name: []const u8) ![]u8 {
+    if (resolveDelegatedCommandPath(allocator, node_install_dir, command_name)) |path| {
+        return path;
+    } else |err| {
+        if (err != error.CommandNotFound) return err;
+    }
+
+    if (isCorepackBackedCommand(command_name)) {
+        if (try resolveCorepackJs(allocator, node_install_dir)) |corepack_js| {
+            return corepack_js;
+        }
+    }
+
+    reportMissingPackageManager(command_name);
+    return error.CommandNotFound;
+}
+
+fn reportMissingPackageManager(command_name: []const u8) void {
+    const prepare_name = if (std.ascii.eqlIgnoreCase(command_name, "yarnpkg")) "yarn" else command_name;
+    std.debug.print(
+        \\{s} is not installed for this Node.js version.
+        \\
+        \\Run:  corepack enable
+        \\      corepack prepare {s}@stable --activate
+        \\
+    , .{ command_name, prepare_name });
+}
+
+fn isCorepackBackedCommand(command_name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(command_name, "yarn") or
+        std.ascii.eqlIgnoreCase(command_name, "yarnpkg") or
+        std.ascii.eqlIgnoreCase(command_name, "pnpm");
+}
+
+fn resolveCorepackJs(allocator: std.mem.Allocator, node_install_dir: []const u8) !?[]u8 {
+    return tryJoinExisting(allocator, node_install_dir, &.{ "node_modules", "corepack", "dist", "corepack.js" });
+}
+
+fn tryJoinExisting(allocator: std.mem.Allocator, root: []const u8, parts: []const []const u8) !?[]u8 {
+    var segments = try allocator.alloc([]const u8, parts.len + 1);
+    defer allocator.free(segments);
+    segments[0] = root;
+    for (parts, 0..) |part, i| {
+        segments[i + 1] = part;
+    }
+
+    const full = try std.fs.path.join(allocator, segments);
+    errdefer allocator.free(full);
+
+    var file = std.fs.openFileAbsolute(full, .{}) catch {
+        allocator.free(full);
+        return null;
+    };
+    file.close();
+    return full;
+}
+
+fn isCorepackJsPath(path: []const u8) bool {
+    const lower = std.fs.path.basename(path);
+    return std.ascii.eqlIgnoreCase(lower, "corepack.js");
+}
+
 fn enforceDelegatedCommandTrust(
     allocator: std.mem.Allocator,
     cfg: nodeversion.ShimConfig,
@@ -487,6 +549,29 @@ fn enforceDelegatedCommandTrust(
     }
 
     if (std.ascii.eqlIgnoreCase(ext, ".cmd") or std.ascii.eqlIgnoreCase(ext, ".bat")) {
+        const outcome = verifycache.ensureDelegatedScriptTrusted(allocator, cfg.root, command_path);
+        if (outcome.result == .failed) {
+            const reason = if (outcome.reason.len == 0) "delegated script trust verification failed" else outcome.reason;
+            if (!tryRecoverDelegatedTrustFailure(allocator, cfg.root, node_install_dir, command_name, command_path, reason, cfg.structured_logging)) {
+                reportDelegatedTrustFailure(allocator, cfg, command_name, command_path, node_bin, node_version, reason);
+            }
+            const retry = verifycache.ensureDelegatedScriptTrusted(allocator, cfg.root, command_path);
+            if (retry.result == .failed) {
+                reportDelegatedTrustFailure(
+                    allocator,
+                    cfg,
+                    command_name,
+                    command_path,
+                    node_bin,
+                    node_version,
+                    if (retry.reason.len == 0) reason else retry.reason,
+                );
+            }
+        }
+        return;
+    }
+
+    if (std.ascii.eqlIgnoreCase(ext, ".js") and isCorepackJsPath(command_path)) {
         const outcome = verifycache.ensureDelegatedScriptTrusted(allocator, cfg.root, command_path);
         if (outcome.result == .failed) {
             const reason = if (outcome.reason.len == 0) "delegated script trust verification failed" else outcome.reason;
@@ -598,7 +683,11 @@ fn tryRecoverDelegatedTrustFailure(
 
 fn isBuiltinPackageManager(command_name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(command_name, "npm") or
-        std.ascii.eqlIgnoreCase(command_name, "npx");
+        std.ascii.eqlIgnoreCase(command_name, "npx") or
+        std.ascii.eqlIgnoreCase(command_name, "yarn") or
+        std.ascii.eqlIgnoreCase(command_name, "yarnpkg") or
+        std.ascii.eqlIgnoreCase(command_name, "corepack") or
+        std.ascii.eqlIgnoreCase(command_name, "pnpm");
 }
 
 fn isPackageManagerCommand(command_name: []const u8) bool {
@@ -606,6 +695,7 @@ fn isPackageManagerCommand(command_name: []const u8) bool {
         std.ascii.eqlIgnoreCase(command_name, "npx") or
         std.ascii.eqlIgnoreCase(command_name, "pnpm") or
         std.ascii.eqlIgnoreCase(command_name, "yarn") or
+        std.ascii.eqlIgnoreCase(command_name, "yarnpkg") or
         std.ascii.eqlIgnoreCase(command_name, "corepack") or
         std.ascii.eqlIgnoreCase(command_name, "vlt");
 }
@@ -699,6 +789,11 @@ fn runDelegatedCommand(
         defer allocator.free(cli_js);
         return spawnArgv(allocator, &env_map, node_bin, cli_js, forwarded_args);
     }
+    if (isCorepackBackedCommand(command_name) and isCorepackJsPath(command_path)) {
+        const argv = try corepackBackedArgv(allocator, node_bin, command_path, command_name, forwarded_args);
+        defer allocator.free(argv);
+        return spawnArgvSlice(allocator, &env_map, argv);
+    }
 
     // Spawn the entrypoint directly. For .cmd/.bat, Zig's Child uses
     // argvToScriptCommandLineWindows (cmd /c with BatBadBut-safe quoting).
@@ -739,6 +834,23 @@ fn resolvePackageManagerCliJs(allocator: std.mem.Allocator, node_install_dir: []
     };
     file.close();
     return full;
+}
+
+fn corepackBackedArgv(
+    allocator: std.mem.Allocator,
+    node_bin: []const u8,
+    corepack_js: []const u8,
+    command_name: []const u8,
+    forwarded_args: []const []const u8,
+) ![]const []const u8 {
+    var argv = try allocator.alloc([]const u8, forwarded_args.len + 3);
+    argv[0] = node_bin;
+    argv[1] = corepack_js;
+    argv[2] = command_name;
+    for (forwarded_args, 0..) |arg, i| {
+        argv[i + 3] = arg;
+    }
+    return argv;
 }
 
 fn spawnArgv(
@@ -1425,11 +1537,12 @@ fn entrypointSnapSetChanged(before: EntrypointSnapSet, after: EntrypointSnapSet)
 fn loadTrustedModules(allocator: std.mem.Allocator) ![]const []const u8 {
     const rules = module_firewall.loadMultiSzPolicy(allocator, module_firewall.reg_value_trusted_modules) catch &[_][]const u8{};
     if (rules.len == 0) {
-        // Empty TrustedModules: deny all except npm and npx.
-        var out = try allocator.alloc([]const u8, 3);
-        out[0] = try allocator.dupe(u8, "NOT ALL");
-        out[1] = try allocator.dupe(u8, "npm");
-        out[2] = try allocator.dupe(u8, "npx");
+        // Empty TrustedModules: deny all except bundled package managers.
+        const defaults = [_][]const u8{ "NOT ALL", "npm", "npx", "yarn", "yarnpkg", "corepack", "pnpm" };
+        var out = try allocator.alloc([]const u8, defaults.len);
+        for (defaults, 0..) |entry, i| {
+            out[i] = try allocator.dupe(u8, entry);
+        }
         return out;
     }
     return rules;
@@ -1965,4 +2078,26 @@ test "filterForwardedArgsForAgePolicy keeps yarn bypass flag when minutes is zer
     defer allocator.free(zero);
     try std.testing.expectEqual(@as(usize, 2), zero.len);
     try std.testing.expectEqualStrings("--bypass-age-policy", zero[1]);
+}
+
+test "corepackBackedArgv prefixes command name" {
+    const allocator = std.testing.allocator;
+    const forwarded = [_][]const u8{ "-v", "--verbose" };
+    const argv = try corepackBackedArgv(allocator, "C:\\nvm\\node.exe", "C:\\nvm\\corepack.js", "yarn", &forwarded);
+    defer allocator.free(argv);
+
+    try std.testing.expectEqual(@as(usize, 5), argv.len);
+    try std.testing.expectEqualStrings("C:\\nvm\\node.exe", argv[0]);
+    try std.testing.expectEqualStrings("C:\\nvm\\corepack.js", argv[1]);
+    try std.testing.expectEqualStrings("yarn", argv[2]);
+    try std.testing.expectEqualStrings("-v", argv[3]);
+    try std.testing.expectEqualStrings("--verbose", argv[4]);
+}
+
+test "isCorepackBackedCommand covers yarn yarnpkg pnpm" {
+    try std.testing.expect(isCorepackBackedCommand("yarn"));
+    try std.testing.expect(isCorepackBackedCommand("YARNPKG"));
+    try std.testing.expect(isCorepackBackedCommand("pnpm"));
+    try std.testing.expect(!isCorepackBackedCommand("npm"));
+    try std.testing.expect(!isCorepackBackedCommand("corepack"));
 }

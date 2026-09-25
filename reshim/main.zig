@@ -685,7 +685,7 @@ fn collectCmdNamesFromInstallRoot(allocator: std.mem.Allocator, install_root: []
     }
 
     try appendPnpmHomeBinCmdNames(allocator, &dedupe, &names);
-    try appendUniqueCommandName(allocator, &dedupe, &names, "pnpm");
+    try appendDefaultPackageManagerShims(allocator, &dedupe, &names);
 
     std.mem.sort([]const u8, names.items, {}, lessThanIgnoreCase);
     return names.toOwnedSlice(allocator);
@@ -711,10 +711,21 @@ fn collectCmdNamesFromVersionDir(allocator: std.mem.Allocator, version_dir_path:
 
     try collectCmdNamesFromCommandDirectory(allocator, &version_dir, &dedupe, &names);
     try appendPnpmHomeBinCmdNames(allocator, &dedupe, &names);
-    try appendUniqueCommandName(allocator, &dedupe, &names, "pnpm");
+    try appendDefaultPackageManagerShims(allocator, &dedupe, &names);
 
     std.mem.sort([]const u8, names.items, {}, lessThanIgnoreCase);
     return names.toOwnedSlice(allocator);
+}
+
+fn appendDefaultPackageManagerShims(
+    allocator: std.mem.Allocator,
+    dedupe: *std.StringHashMap(void),
+    names: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    // Always-on PATH names. Proxy falls back to corepack.js when no *.cmd exists.
+    try appendUniqueCommandName(allocator, dedupe, names, "pnpm");
+    try appendUniqueCommandName(allocator, dedupe, names, "yarn");
+    try appendUniqueCommandName(allocator, dedupe, names, "yarnpkg");
 }
 
 fn collectCmdNamesFromCommandDirectory(
