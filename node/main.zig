@@ -79,6 +79,9 @@ pub fn main() !void {
         );
     }
 
+    var audit_ctx = eventlog.captureAuditContext(allocator);
+    defer audit_ctx.deinit(allocator);
+
     if (cfg.log_executions) {
         const requested_command = std.fs.path.stem(std.fs.path.basename(args[0]));
         const arguments = if (parsed_args.forwarded.len == 0)
@@ -96,6 +99,13 @@ pub fn main() !void {
             .NodeVersion = resolved.resolved_version.?,
             .Arguments = arguments,
             .WorkingDirectory = working_directory,
+            .user = audit_ctx.user,
+            .sid = audit_ctx.sid,
+            .hostname = audit_ctx.hostname,
+            .parent_process = audit_ctx.parent_process,
+            .parent_pid = audit_ctx.parent_pid,
+            .project_name = audit_ctx.project_name,
+            .project_path = audit_ctx.project_path,
         });
     }
 
@@ -122,6 +132,13 @@ pub fn main() !void {
                         .node_version = resolved.resolved_version.?,
                         .source = "node-shim",
                         .verification_result = "cache_invalidated",
+                        .user = audit_ctx.user,
+                        .sid = audit_ctx.sid,
+                        .hostname = audit_ctx.hostname,
+                        .parent_process = audit_ctx.parent_process,
+                        .parent_pid = audit_ctx.parent_pid,
+                        .project_name = audit_ctx.project_name,
+                        .project_path = audit_ctx.project_path,
                     },
                     cache_message,
                     4303,
@@ -144,6 +161,13 @@ pub fn main() !void {
                         .node_version = resolved.resolved_version.?,
                         .source = "node-shim",
                         .verification_result = "trusted",
+                        .user = audit_ctx.user,
+                        .sid = audit_ctx.sid,
+                        .hostname = audit_ctx.hostname,
+                        .parent_process = audit_ctx.parent_process,
+                        .parent_pid = audit_ctx.parent_pid,
+                        .project_name = audit_ctx.project_name,
+                        .project_path = audit_ctx.project_path,
                     },
                     recovery_message,
                     4304,
@@ -171,6 +195,13 @@ pub fn main() !void {
                     .node_version = resolved.resolved_version.?,
                     .source = "node-shim",
                     .verification_result = "failed",
+                    .user = audit_ctx.user,
+                    .sid = audit_ctx.sid,
+                    .hostname = audit_ctx.hostname,
+                    .parent_process = audit_ctx.parent_process,
+                    .parent_pid = audit_ctx.parent_pid,
+                    .project_name = audit_ctx.project_name,
+                    .project_path = audit_ctx.project_path,
                 },
                 message,
                 4301,

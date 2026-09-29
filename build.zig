@@ -48,6 +48,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const cmd_spawn_module = b.createModule(.{
+        .root_source_file = b.path("shared/cmd_spawn.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const nodeversion_module = b.createModule(.{
         .root_source_file = b.path(nodeversion_path),
         .target = target,
@@ -56,6 +62,7 @@ pub fn build(b: *std.Build) void {
     nodeversion_module.addImport("config", config_module);
     nodeversion_module.addImport("registry", registry_module);
     nodeversion_module.addImport("resolver", resolver_module);
+    nodeversion_module.addImport("cmd_spawn", cmd_spawn_module);
 
     const shimintegrity_module = b.createModule(.{
         .root_source_file = b.path(shimintegrity_path),
@@ -112,6 +119,12 @@ pub fn build(b: *std.Build) void {
     const run_install_safety_tests = b.addRunArtifact(install_safety_tests);
     test_step.dependOn(&run_install_safety_tests.step);
 
+    const cmd_spawn_tests = b.addTest(.{
+        .root_module = cmd_spawn_module,
+    });
+    const run_cmd_spawn_tests = b.addRunArtifact(cmd_spawn_tests);
+    test_step.dependOn(&run_cmd_spawn_tests.step);
+
     const exe = b.addExecutable(.{
         .name = app,
         .root_module = b.createModule(.{
@@ -153,6 +166,21 @@ pub fn build(b: *std.Build) void {
     if (std.mem.eql(u8, app, "proxy")) {
         exe.root_module.addImport("install_safety", install_safety_module);
         exe.root_module.addImport("wintrust", wintrust_module);
+        const module_firewall_module = b.createModule(.{
+            .root_source_file = b.path("shared/module_firewall.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        module_firewall_module.addImport("config", config_module);
+        module_firewall_module.addImport("registry", registry_module);
+        exe.root_module.addImport("module_firewall", module_firewall_module);
+        exe.root_module.addImport("cmd_spawn", cmd_spawn_module);
+        const module_firewall_tests = b.addTest(.{
+            .root_module = module_firewall_module,
+        });
+        module_firewall_tests.root_module.linkSystemLibrary("advapi32", .{});
+        const run_module_firewall_tests = b.addRunArtifact(module_firewall_tests);
+        test_step.dependOn(&run_module_firewall_tests.step);
     }
 
     exe.root_module.addImport("errors", b.createModule(.{

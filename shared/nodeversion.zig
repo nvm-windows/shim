@@ -3,6 +3,7 @@ const windows = std.os.windows;
 const registry = @import("registry");
 const config = @import("config");
 const resolver = @import("resolver");
+const cmd_spawn = @import("cmd_spawn");
 
 const reg_path = config.preference_registry_root;
 const policy_path = config.policy_registry_root;
@@ -892,25 +893,11 @@ fn resolvePackageManagerVersionFromCommand(allocator: std.mem.Allocator, node_in
     defer allocator.free(child_path);
     try env_map.put("PATH", child_path);
 
-    const ext = std.fs.path.extension(command_path);
-    const use_cmd = std.ascii.eqlIgnoreCase(ext, ".cmd") or std.ascii.eqlIgnoreCase(ext, ".bat");
-
-    var argv = if (use_cmd)
-        try allocator.alloc([]const u8, 5)
-    else
-        try allocator.alloc([]const u8, 2);
+    // Spawn .cmd/.bat as argv[0] so Zig uses scriptCommandLine quoting
+    // (nvm-windows/nvm#1408 — see shared/cmd_spawn.zig).
+    const version_args = [_][]const u8{"--version"};
+    const argv = try cmd_spawn.buildEntrypointArgv(allocator, command_path, &version_args);
     defer allocator.free(argv);
-
-    if (use_cmd) {
-        argv[0] = "cmd.exe";
-        argv[1] = "/d";
-        argv[2] = "/c";
-        argv[3] = command_path;
-        argv[4] = "--version";
-    } else {
-        argv[0] = command_path;
-        argv[1] = "--version";
-    }
 
     const result = std.process.Child.run(.{
         .allocator = allocator,
