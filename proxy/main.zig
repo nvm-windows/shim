@@ -259,6 +259,8 @@ pub fn main() !void {
 
     try enforceDelegatedCommandTrust(allocator, cfg, command_name, command_path, resolved.node_bin.?, resolved.resolved_version.?, node_install_dir_abs);
 
+    try enforceModuleFirewall(allocator, cfg.structured_logging, command_name, parsed_args.forwarded);
+
     const needs_reshim = detectReshimNeeded(command_name, parsed_args.forwarded);
 
     const snap_before = captureEntrypointSnapSet(allocator, command_path, command_name);
@@ -303,6 +305,10 @@ pub fn main() !void {
         std.debug.print("proxy failed to run {s}: {s}\n", .{ command_name, @errorName(err) });
         break :blk 1;
     };
+
+    if (process_exit_code == 0 and isNpmAuthCommand(command_name, parsed_args.forwarded)) {
+        maybeRefreshNpmIdentity(allocator);
+    }
 
     // std.debug.print("{s}\n", .{node_install_dir});
 
@@ -634,16 +640,23 @@ fn tryRecoverDelegatedTrustFailure(
     const rules = loadTrustedModules(allocator) catch return false;
     defer module_firewall.freeMultiSz(allocator, rules);
 
-    const trusted = isTrustedModule(allocator, command_name, rules);
+    const trust = classifyModuleTrust(allocator, command_name, rules);
     // Default trust includes npm/npx so their upgrades (and a missing first
     // script-trust entry) re-sign instead of NVM4306.
-    if (trusted and (self_update or (missing and isPackageManagerCommand(command_name)))) {
+    if (trust == .trusted and (self_update or (missing and isPackageManagerCommand(command_name)))) {
         logFirewallInfo(allocator, structured_logging, "firewall.trusted_module_stale", "firewall trusted module VerifyCache stale; scheduling reshim");
         _ = resignScriptSync(allocator, command_path);
         runReshim(allocator, install_root, node_install_dir, true);
         return true;
     }
     if (!self_update) return false;
+    if (trust == .remote_blocked) {
+        const audit = auditFromVerifyCache(allocator, command_path);
+        defer audit.deinit(allocator);
+        logUntrustedModuleChanged(allocator, structured_logging, command_name, "deny", "remote", "verify_cache", audit);
+        logFirewallInfo(allocator, structured_logging, "firewall.remote_blocked", "firewall remote policy blocked module; deny (no prompt)");
+        return false;
+    }
     switch (untrustedHandlerAction(allocator)) {
         .deny => {
             const audit = auditFromVerifyCache(allocator, command_path);
@@ -1383,6 +1396,27 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs
     };
 }
 
+/// Returns true when the invoked package manager command is likely to install
+/// or remove a globally-visible executable that reshim needs to reconcile.
+fn detectReshimNeeded(command_name: []const u8, args: []const []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(command_name, "npm") or
+        std.ascii.eqlIgnoreCase(command_name, "pnpm") or
+        std.ascii.eqlIgnoreCase(command_name, "vlt"))
+    {
+        return npmOrPnpmNeedsReshim(args);
+    }
+
+    if (std.ascii.eqlIgnoreCase(command_name, "yarn")) {
+        return yarnNeedsReshim(args);
+    }
+
+    if (std.ascii.eqlIgnoreCase(command_name, "corepack")) {
+        return corepackNeedsReshim(args);
+    }
+
+    return false;
+}
+
 fn hashFileOptional(allocator: std.mem.Allocator, path: []const u8) ?[32]u8 {
     _ = allocator;
     var file = std.fs.openFileAbsolute(path, .{}) catch return null;
@@ -1534,6 +1568,219 @@ fn entrypointSnapSetChanged(before: EntrypointSnapSet, after: EntrypointSnapSet)
     return false;
 }
 
+fn pmInstallLike(command_name: []const u8, args: []const []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(command_name, "npx")) return true;
+    if (args.len == 0) return false;
+    const sub = args[0];
+    if (std.ascii.eqlIgnoreCase(command_name, "npm")) {
+        return std.ascii.eqlIgnoreCase(sub, "install") or std.ascii.eqlIgnoreCase(sub, "i") or
+            std.ascii.eqlIgnoreCase(sub, "add") or std.ascii.eqlIgnoreCase(sub, "exec") or
+            std.ascii.eqlIgnoreCase(sub, "ci");
+    }
+    if (std.ascii.eqlIgnoreCase(command_name, "pnpm") or std.ascii.eqlIgnoreCase(command_name, "vlt")) {
+        return std.ascii.eqlIgnoreCase(sub, "install") or std.ascii.eqlIgnoreCase(sub, "i") or
+            std.ascii.eqlIgnoreCase(sub, "add") or std.ascii.eqlIgnoreCase(sub, "exec") or
+            std.ascii.eqlIgnoreCase(sub, "dlx") or std.ascii.eqlIgnoreCase(sub, "ci");
+    }
+    if (std.ascii.eqlIgnoreCase(command_name, "yarn")) {
+        return std.ascii.eqlIgnoreCase(sub, "add") or std.ascii.eqlIgnoreCase(sub, "install") or
+            std.ascii.eqlIgnoreCase(sub, "global") or std.ascii.eqlIgnoreCase(sub, "dlx");
+    }
+    return false;
+}
+
+const code_module_firewall_blocked: u32 = 4403;
+const code_module_firewall_allowed: u32 = 4408;
+
+fn logPackageManagerInstallAudit(
+    allocator: std.mem.Allocator,
+    command_name: []const u8,
+    global: bool,
+    pkgs: []const module_firewall.PackageSpec,
+    outcome: []const u8,
+    event_code: u32,
+    denied: bool,
+) void {
+    var audit_ctx = eventlog.captureAuditContext(allocator);
+    defer audit_ctx.deinit(allocator);
+
+    const package_raws = allocator.alloc([]const u8, pkgs.len) catch return;
+    defer allocator.free(package_raws);
+    for (pkgs, 0..) |pkg, i| {
+        package_raws[i] = pkg.raw;
+    }
+
+    const payload = .{
+        .packages = package_raws,
+        .global = global,
+        .outcome = outcome,
+        .command = command_name,
+        .user = audit_ctx.user,
+        .hostname = audit_ctx.hostname,
+        .sid = audit_ctx.sid,
+        .parent_process = audit_ctx.parent_process,
+        .parent_pid = audit_ctx.parent_pid,
+        .project_name = audit_ctx.project_name,
+        .project_path = audit_ctx.project_path,
+    };
+    if (denied) {
+        eventlog.writeStructuredErrorCode(allocator, "proxy", "package_manager.install", payload, event_code);
+    } else {
+        eventlog.writeStructuredInfoCode(allocator, "proxy", "package_manager.install", payload, event_code);
+    }
+}
+
+fn enforceModuleFirewall(allocator: std.mem.Allocator, structured_logging: bool, command_name: []const u8, args: []const []const u8) !void {
+    if (!pmInstallLike(command_name, args)) return;
+
+    const global = npmOrPnpmNeedsReshim(args) or (std.ascii.eqlIgnoreCase(command_name, "yarn") and args.len > 0 and std.ascii.eqlIgnoreCase(args[0], "global"));
+    const key = if (global) module_firewall.reg_value_approved_global_modules else module_firewall.reg_value_approved_modules;
+    const rules = module_firewall.loadMultiSzPolicy(allocator, key) catch &[_][]const u8{};
+    defer module_firewall.freeMultiSz(allocator, rules);
+
+    // Empty list => default ALL (no enforcement).
+    if (rules.len == 0) return;
+
+    // HTTPS remote: pass CLI package tokens only. Empty → Go expands lock/package.json.
+    if (module_firewall.listHasHttps(rules)) {
+        const cli_pkgs = try module_firewall.collectPackageTokensFromArgs(allocator, command_name, args);
+        defer module_firewall.freePackageSpecs(allocator, cli_pkgs);
+        try evaluateRemoteModuleFirewall(allocator, structured_logging, command_name, global, cli_pkgs, args);
+        return;
+    }
+
+    const cwd = std.fs.cwd().realpathAlloc(allocator, ".") catch try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
+
+    const pkgs = try module_firewall.collectInstallPackages(allocator, command_name, args, cwd);
+    defer module_firewall.freePackageSpecs(allocator, pkgs);
+
+    if (pkgs.len == 0) return;
+
+    var blocked_raws = std.ArrayListUnmanaged([]const u8){};
+    defer blocked_raws.deinit(allocator);
+    for (pkgs) |pkg| {
+        const allowed = module_firewall.isPackageAllowed(pkg, rules) orelse true;
+        if (!allowed) {
+            try blocked_raws.append(allocator, pkg.raw);
+        }
+    }
+    if (blocked_raws.items.len == 0) {
+        logPackageManagerInstallAudit(allocator, command_name, global, pkgs, "allowed", code_module_firewall_allowed, false);
+        return;
+    }
+
+    const cap: usize = 20;
+    const show = @min(blocked_raws.items.len, cap);
+    var i: usize = 0;
+    while (i < show) : (i += 1) {
+        const raw = blocked_raws.items[i];
+        std.debug.print("NVM4403 {s} blocked by policy\n", .{raw});
+        if (!structured_logging) {
+            const msg = std.fmt.allocPrint(allocator, "NVM4403 {s} blocked by policy", .{raw}) catch continue;
+            defer allocator.free(msg);
+            eventlog.writeInfoCode(allocator, "proxy", msg, code_module_firewall_blocked);
+        }
+    }
+    if (blocked_raws.items.len > cap) {
+        std.debug.print("and {d} more\n", .{blocked_raws.items.len - cap});
+    }
+    logPackageManagerInstallAudit(allocator, command_name, global, pkgs, "denied", code_module_firewall_blocked, true);
+    if (structured_logging) {
+        logFirewallInfo(allocator, structured_logging, "firewall.module_install_blocked", "firewall module install blocked (NVM4403)");
+    }
+    std.process.exit(1);
+}
+
+fn isNpmAuthCommand(command_name: []const u8, args: []const []const u8) bool {
+    const is_npm = std.mem.eql(u8, command_name, "npm") or std.mem.eql(u8, command_name, "npx");
+    const is_pnpm = std.mem.eql(u8, command_name, "pnpm");
+    if (!is_npm and !is_pnpm) return false;
+    for (args) |a| {
+        if (a.len == 0 or a[0] == '-') continue;
+        return std.mem.eql(u8, a, "login") or
+            std.mem.eql(u8, a, "adduser") or
+            std.mem.eql(u8, a, "logout") or
+            std.mem.eql(u8, a, "whoami");
+    }
+    return false;
+}
+
+fn maybeRefreshNpmIdentity(allocator: std.mem.Allocator) void {
+    const nvm_path = nodeversion.resolveNvmExePath(allocator) catch return;
+    defer allocator.free(nvm_path);
+    var child = std.process.Child.init(&.{ nvm_path, "firewall", "refresh-npm-identity" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return;
+    _ = child.wait() catch {};
+}
+
+fn evaluateRemoteModuleFirewall(allocator: std.mem.Allocator, structured_logging: bool, command_name: []const u8, global: bool, pkgs: []const module_firewall.PackageSpec, args: []const []const u8) !void {
+    const nvm_path = nodeversion.resolveNvmExePath(allocator) catch {
+        std.debug.print("NVM4402 Module firewall remote HTTPS policy configured but nvm.exe not found.\n", .{});
+        logFirewallError(allocator, structured_logging, "firewall.remote_failed", "firewall remote URL blocked; nvm.exe missing (NVM4402)", 4402);
+        std.process.exit(1);
+    };
+    defer allocator.free(nvm_path);
+
+    var argv = std.ArrayListUnmanaged([]const u8){};
+    defer argv.deinit(allocator);
+    try argv.append(allocator, nvm_path);
+    try argv.append(allocator, "firewall");
+    try argv.append(allocator, "check-remote");
+    if (global) try argv.append(allocator, "--global");
+    try argv.append(allocator, "--shim");
+    try argv.append(allocator, command_name);
+    const cwd_for_remote = std.fs.cwd().realpathAlloc(allocator, ".") catch try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd_for_remote);
+    try argv.append(allocator, "--cwd");
+    try argv.append(allocator, cwd_for_remote);
+    if (module_firewall.productionOmit(args)) {
+        try argv.append(allocator, "--omit-dev");
+    }
+    for (pkgs) |pkg| {
+        try argv.append(allocator, pkg.raw);
+    }
+
+    var child = std.process.Child.init(argv.items, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    const term = child.spawnAndWait() catch {
+        std.debug.print("NVM4402 Module firewall remote validation failed to start.\n", .{});
+        logFirewallError(allocator, structured_logging, "firewall.remote_failed", "firewall remote helper spawn failed (NVM4402)", 4402);
+        std.process.exit(1);
+    };
+    switch (term) {
+        .Exited => |code| {
+            if (code == 0) {
+                logPackageManagerInstallAudit(allocator, command_name, global, pkgs, "allowed", code_module_firewall_allowed, false);
+                return;
+            }
+            if (code == 1) {
+                logPackageManagerInstallAudit(allocator, command_name, global, pkgs, "denied", code_module_firewall_blocked, true);
+                logFirewallInfo(allocator, structured_logging, "firewall.remote_blocked", "firewall remote policy blocked install (NVM4403)");
+                std.process.exit(1);
+            }
+            // Exit 2+: check-remote already wrote the NVM44xx user message to stderr.
+            if (code == 2) {
+                logFirewallError(allocator, structured_logging, "firewall.remote_failed", "firewall remote validation failed", 4402);
+                std.process.exit(1);
+            }
+            std.debug.print("NVM4402 Module firewall remote validation failed (exit {d}).\n", .{code});
+            logFirewallError(allocator, structured_logging, "firewall.remote_failed", "firewall remote validation failed (NVM4402)", 4402);
+            std.process.exit(1);
+        },
+        else => {
+            std.debug.print("NVM4402 Module firewall remote validation aborted.\n", .{});
+            logFirewallError(allocator, structured_logging, "firewall.remote_failed", "firewall remote validation aborted (NVM4402)", 4402);
+            std.process.exit(1);
+        },
+    }
+}
+
 fn loadTrustedModules(allocator: std.mem.Allocator) ![]const []const u8 {
     const rules = module_firewall.loadMultiSzPolicy(allocator, module_firewall.reg_value_trusted_modules) catch &[_][]const u8{};
     if (rules.len == 0) {
@@ -1550,31 +1797,37 @@ fn loadTrustedModules(allocator: std.mem.Allocator) ![]const []const u8 {
 
 /// Local TrustedModules first; if untrusted and an HTTPS URL is configured, ask nvm check-remote-trust
 /// (HTTP only for modules not already trusted locally).
-fn isTrustedModule(allocator: std.mem.Allocator, command_name: []const u8, rules: []const []const u8) bool {
+const ModuleTrust = enum { trusted, remote_blocked, untrusted };
+
+fn classifyModuleTrust(allocator: std.mem.Allocator, command_name: []const u8, rules: []const []const u8) ModuleTrust {
     const pkg = module_firewall.PackageSpec{ .name = command_name, .version = "", .raw = command_name };
-    if (module_firewall.isPackageAllowed(pkg, rules) orelse false) return true;
-    if (module_firewall.extractHttpsUrl(rules) == null) return false;
+    if (module_firewall.isPackageAllowed(pkg, rules) orelse false) return .trusted;
+    if (module_firewall.extractHttpsUrl(rules) == null) return .untrusted;
     return evaluateRemoteTrust(allocator, command_name);
 }
 
-fn evaluateRemoteTrust(allocator: std.mem.Allocator, command_name: []const u8) bool {
+fn evaluateRemoteTrust(allocator: std.mem.Allocator, command_name: []const u8) ModuleTrust {
     const nvm_path = nodeversion.resolveNvmExePath(allocator) catch {
         std.debug.print("NVM Firewall: Remote trust service is unavailable or not responding (nvm.exe not found).\n", .{});
-        return false;
+        return .untrusted;
     };
     defer allocator.free(nvm_path);
 
-    var child = std.process.Child.init(&.{ nvm_path, "firewall", "check-remote-trust", command_name }, allocator);
+	var child = std.process.Child.init(&.{ nvm_path, "firewall", "check-remote-trust", "--shim", command_name, command_name }, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
     const term = child.spawnAndWait() catch {
         std.debug.print("NVM Firewall: Remote trust service is unavailable or not responding.\n", .{});
-        return false;
+        return .untrusted;
     };
     return switch (term) {
-        .Exited => |code| code == 0,
-        else => false,
+        .Exited => |code| switch (code) {
+            0 => .trusted,
+            1 => .remote_blocked,
+            else => .untrusted,
+        },
+        else => .untrusted,
     };
 }
 
@@ -1612,6 +1865,14 @@ fn logFirewallInfo(allocator: std.mem.Allocator, structured_logging: bool, event
     }
 }
 
+fn logFirewallError(allocator: std.mem.Allocator, structured_logging: bool, event_name: []const u8, plaintext: []const u8, code: u32) void {
+    if (structured_logging) {
+        eventlog.writeStructuredErrorCode(allocator, "proxy", event_name, .{ .message = plaintext }, code);
+    } else {
+        eventlog.writeInfoCode(allocator, "proxy", plaintext, code);
+    }
+}
+
 const ModuleChangeAudit = struct {
     path: []u8,
     before_digest: []u8,
@@ -1628,7 +1889,6 @@ const ModuleChangeAudit = struct {
 
 fn emptyOwned(allocator: std.mem.Allocator) []u8 {
     return allocator.alloc(u8, 0) catch {
-        // Extremely unlikely; prefer empty alloc so deinit stays safe.
         return allocator.dupe(u8, "") catch unreachable;
     };
 }
@@ -1844,13 +2104,18 @@ fn maybeReshimAfterSelfUpdate(
     const rules = try loadTrustedModules(allocator);
     defer module_firewall.freeMultiSz(allocator, rules);
 
-    const trusted = isTrustedModule(allocator, command_name, rules);
+    const trust = classifyModuleTrust(allocator, command_name, rules);
     const audit = firstChangedEntrypointAudit(allocator, snap_before, snap_after, command_path);
     defer audit.deinit(allocator);
-    if (trusted) {
+    if (trust == .trusted) {
         logFirewallInfo(allocator, structured_logging, "firewall.trusted_module_changed", "firewall trusted module changed; scheduling reshim");
         _ = resignScriptSync(allocator, command_path);
         runReshim(allocator, install_root, node_install_dir, true);
+        return;
+    }
+    if (trust == .remote_blocked) {
+        logUntrustedModuleChanged(allocator, structured_logging, command_name, "deny", "remote", "post_run", audit);
+        logFirewallInfo(allocator, structured_logging, "firewall.remote_blocked", "firewall remote policy blocked module; reshim not scheduled (no prompt)");
         return;
     }
     switch (untrustedHandlerAction(allocator)) {
@@ -1877,27 +2142,6 @@ fn maybeReshimAfterSelfUpdate(
             }
         },
     }
-}
-
-/// Returns true when the invoked package manager command is likely to install
-/// or remove a globally-visible executable that reshim needs to reconcile.
-fn detectReshimNeeded(command_name: []const u8, args: []const []const u8) bool {
-    if (std.ascii.eqlIgnoreCase(command_name, "npm") or
-        std.ascii.eqlIgnoreCase(command_name, "pnpm") or
-        std.ascii.eqlIgnoreCase(command_name, "vlt"))
-    {
-        return npmOrPnpmNeedsReshim(args);
-    }
-
-    if (std.ascii.eqlIgnoreCase(command_name, "yarn")) {
-        return yarnNeedsReshim(args);
-    }
-
-    if (std.ascii.eqlIgnoreCase(command_name, "corepack")) {
-        return corepackNeedsReshim(args);
-    }
-
-    return false;
 }
 
 /// npm/pnpm: reshim when -g / --global is present anywhere in the args.
