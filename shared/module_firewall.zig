@@ -197,18 +197,47 @@ pub fn nestedUnderNonPmShim(ancestor_images: []const []const u8, shim_dir: []con
     return false;
 }
 
-pub fn loadMultiSzPolicy(allocator: std.mem.Allocator, value_name: []const u8) ![]const []const u8 {
-    const policy_hives = [_]windows.HKEY{
-        windows.HKEY_LOCAL_MACHINE,
-        windows.HKEY_CURRENT_USER,
+pub const ListSource = enum {
+    machine_policy,
+    machine_settings,
+    your_settings,
+
+    pub fn label(self: ListSource) []const u8 {
+        return switch (self) {
+            .machine_policy => "machine policy",
+            .machine_settings => "machine settings",
+            .your_settings => "your settings",
+        };
+    }
+};
+
+pub const MultiSzList = struct {
+    values: []const []const u8,
+    source: ListSource,
+};
+
+/// HKLM policy, then HKLM preferences, then HKCU preferences.
+/// HKCU policy is skipped so a user cannot plant a fake policy.
+pub fn loadFirewallList(allocator: std.mem.Allocator, value_name: []const u8) MultiSzList {
+    const steps = [_]struct {
+        hive: windows.HKEY,
+        root: []const u8,
+        source: ListSource,
+    }{
+        .{ .hive = windows.HKEY_LOCAL_MACHINE, .root = config.policy_registry_root, .source = .machine_policy },
+        .{ .hive = windows.HKEY_LOCAL_MACHINE, .root = config.preference_registry_root, .source = .machine_settings },
+        .{ .hive = windows.HKEY_CURRENT_USER, .root = config.preference_registry_root, .source = .your_settings },
     };
-    if (registry.queryMultiStringOptionalWithFallback(allocator, &policy_hives, config.policy_registry_root, value_name) catch null) |vals| {
-        return vals;
+    for (steps) |step| {
+        if (registry.queryMultiStringOptional(allocator, step.hive, step.root, value_name) catch null) |vals| {
+            return .{ .values = vals, .source = step.source };
+        }
     }
-    if (registry.queryMultiStringOptionalWithFallback(allocator, registry.preferenceHives(), config.preference_registry_root, value_name) catch null) |vals| {
-        return vals;
-    }
-    return &[_][]const u8{};
+    return .{ .values = &.{}, .source = .your_settings };
+}
+
+pub fn loadMultiSzPolicy(allocator: std.mem.Allocator, value_name: []const u8) ![]const []const u8 {
+    return loadFirewallList(allocator, value_name).values;
 }
 
 pub fn freeMultiSz(allocator: std.mem.Allocator, vals: []const []const u8) void {
