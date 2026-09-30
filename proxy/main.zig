@@ -1635,7 +1635,8 @@ fn enforceModuleFirewall(allocator: std.mem.Allocator, structured_logging: bool,
 
     const global = npmOrPnpmNeedsReshim(args) or (std.ascii.eqlIgnoreCase(command_name, "yarn") and args.len > 0 and std.ascii.eqlIgnoreCase(args[0], "global"));
     const key = if (global) module_firewall.reg_value_approved_global_modules else module_firewall.reg_value_approved_modules;
-    const rules = module_firewall.loadMultiSzPolicy(allocator, key) catch &[_][]const u8{};
+    const loaded = module_firewall.loadFirewallList(allocator, key);
+    const rules = loaded.values;
     defer module_firewall.freeMultiSz(allocator, rules);
 
     // Empty list => default ALL (no enforcement).
@@ -1675,9 +1676,9 @@ fn enforceModuleFirewall(allocator: std.mem.Allocator, structured_logging: bool,
     var i: usize = 0;
     while (i < show) : (i += 1) {
         const raw = blocked_raws.items[i];
-        std.debug.print("NVM4403 {s} blocked by policy\n", .{raw});
+        std.debug.print("NVM Firewall: {s} blocked by {s}. (NVM4403)\n", .{ raw, loaded.source.label() });
         if (!structured_logging) {
-            const msg = std.fmt.allocPrint(allocator, "NVM4403 {s} blocked by policy", .{raw}) catch continue;
+            const msg = std.fmt.allocPrint(allocator, "NVM Firewall: {s} blocked by {s}. (NVM4403)", .{ raw, loaded.source.label() }) catch continue;
             defer allocator.free(msg);
             eventlog.writeInfoCode(allocator, "proxy", msg, code_module_firewall_blocked);
         }
