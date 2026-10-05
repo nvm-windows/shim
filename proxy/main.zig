@@ -300,6 +300,7 @@ pub fn main() !void {
         command_path,
         cfg.npm_module_minimum_age,
         cfg.npm_registry_fallback,
+        cfg.block_package_manager_lifecycle_scripts,
         parsed_args.forwarded,
     ) catch |err| blk: {
         std.debug.print("proxy failed to run {s}: {s}\n", .{ command_name, @errorName(err) });
@@ -781,12 +782,16 @@ fn runDelegatedCommand(
     command_path: []const u8,
     npm_module_minimum_age: ?u64,
     npm_registry_fallback: ?[]const u8,
+    block_lifecycle_scripts: bool,
     forwarded: []const []const u8,
 ) !u8 {
     var env_map = try std.process.getEnvMap(allocator);
     defer env_map.deinit();
 
-    const forwarded_args = try filterForwardedArgsForAgePolicy(allocator, command_name, npm_module_minimum_age, forwarded);
+    const locked = try prepareLifecycleScriptLock(allocator, &env_map, command_name, command_path, block_lifecycle_scripts, forwarded);
+    defer if (locked.owns_args) allocator.free(locked.args);
+
+    const forwarded_args = try filterForwardedArgsForAgePolicy(allocator, command_name, npm_module_minimum_age, locked.args);
     defer allocator.free(forwarded_args);
 
     const old_path = env_map.get("PATH") orelse "";
@@ -897,6 +902,208 @@ fn spawnArgvSlice(allocator: std.mem.Allocator, env_map: *std.process.EnvMap, ar
         .Exited => |code| code,
         else => 1,
     };
+}
+
+const LifecycleScriptAction = enum {
+    unchanged,
+    ignore_scripts_flag,
+    yarn_berry_env,
+};
+
+const PreparedLifecycleLock = struct {
+    args: []const []const u8,
+    owns_args: bool,
+};
+
+fn prepareLifecycleScriptLock(
+    allocator: std.mem.Allocator,
+    env_map: *std.process.EnvMap,
+    command_name: []const u8,
+    command_path: []const u8,
+    block_lifecycle_scripts: bool,
+    forwarded: []const []const u8,
+) !PreparedLifecycleLock {
+    if (!block_lifecycle_scripts) return .{ .args = forwarded, .owns_args = false };
+
+    const yarn_major = if (commandWantsYarnLock(command_name, forwarded))
+        detectYarnMajor(allocator, command_name, command_path)
+    else
+        null;
+    switch (lifecycleScriptAction(command_name, forwarded, yarn_major)) {
+        .unchanged => return .{ .args = forwarded, .owns_args = false },
+        .ignore_scripts_flag => return .{
+            .args = try rewriteIgnoreScriptsArgs(allocator, forwarded),
+            .owns_args = true,
+        },
+        .yarn_berry_env => {
+            try env_map.put("YARN_ENABLE_SCRIPTS", "false");
+            return .{ .args = forwarded, .owns_args = false };
+        },
+    }
+}
+
+fn lifecycleScriptAction(command_name: []const u8, forwarded: []const []const u8, yarn_major: ?u32) LifecycleScriptAction {
+    if (commandWantsIgnoreScriptsFlag(command_name, forwarded)) return .ignore_scripts_flag;
+    if (!commandWantsYarnLock(command_name, forwarded)) return .unchanged;
+    const major = yarn_major orelse return .unchanged;
+    if (major <= 1) return .ignore_scripts_flag;
+    return .yarn_berry_env;
+}
+
+fn commandWantsIgnoreScriptsFlag(command_name: []const u8, forwarded: []const []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(command_name, "npm") or
+        std.ascii.eqlIgnoreCase(command_name, "npx") or
+        std.ascii.eqlIgnoreCase(command_name, "pnpm") or
+        std.ascii.eqlIgnoreCase(command_name, "vlt"))
+    {
+        return true;
+    }
+    return std.ascii.eqlIgnoreCase(command_name, "corepack") and
+        forwarded.len > 0 and
+        std.ascii.eqlIgnoreCase(forwarded[0], "pnpm");
+}
+
+fn commandWantsYarnLock(command_name: []const u8, forwarded: []const []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(command_name, "yarn") or std.ascii.eqlIgnoreCase(command_name, "yarnpkg")) return true;
+    return std.ascii.eqlIgnoreCase(command_name, "corepack") and
+        forwarded.len > 0 and
+        (std.ascii.eqlIgnoreCase(forwarded[0], "yarn") or std.ascii.eqlIgnoreCase(forwarded[0], "yarnpkg"));
+}
+
+fn detectYarnMajor(allocator: std.mem.Allocator, command_name: []const u8, command_path: []const u8) ?u32 {
+    if (std.ascii.eqlIgnoreCase(command_name, "corepack") or isCorepackJsPath(command_path)) {
+        const cwd = std.process.getCwdAlloc(allocator) catch return null;
+        defer allocator.free(cwd);
+        return yarnMajorWalkingParents(allocator, cwd, .project_manager);
+    }
+    const start = std.fs.path.dirname(command_path) orelse return null;
+    return yarnMajorWalkingParents(allocator, start, .yarn_package);
+}
+
+const PackageJsonYarnKind = enum {
+    yarn_package,
+    project_manager,
+};
+
+fn yarnMajorWalkingParents(allocator: std.mem.Allocator, start_dir: []const u8, kind: PackageJsonYarnKind) ?u32 {
+    var current = allocator.dupe(u8, start_dir) catch return null;
+    defer allocator.free(current);
+
+    var hop: u8 = 0;
+    while (hop < 8) : (hop += 1) {
+        const package_json = std.fs.path.join(allocator, &.{ current, "package.json" }) catch return null;
+        defer allocator.free(package_json);
+        if (yarnMajorAtPackageJson(allocator, package_json, kind)) |major| return major;
+
+        const parent = std.fs.path.dirname(current) orelse break;
+        if (std.mem.eql(u8, parent, current)) break;
+        const next = allocator.dupe(u8, parent) catch return null;
+        allocator.free(current);
+        current = next;
+    }
+    return null;
+}
+
+fn yarnMajorAtPackageJson(allocator: std.mem.Allocator, package_json: []const u8, kind: PackageJsonYarnKind) ?u32 {
+    var file = std.fs.openFileAbsolute(package_json, .{}) catch return null;
+    defer file.close();
+    const bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch return null;
+    defer allocator.free(bytes);
+    return switch (kind) {
+        .yarn_package => yarnMajorFromYarnPackageJson(allocator, bytes),
+        .project_manager => yarnMajorFromProjectPackageJson(allocator, bytes),
+    };
+}
+
+fn yarnMajorFromYarnPackageJson(allocator: std.mem.Allocator, bytes: []const u8) ?u32 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return null;
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const name = obj.get("name") orelse return null;
+    if (name != .string or !std.mem.eql(u8, name.string, "yarn")) return null;
+    const version = obj.get("version") orelse return null;
+    if (version != .string) return null;
+    return majorFromVersionString(version.string);
+}
+
+fn yarnMajorFromProjectPackageJson(allocator: std.mem.Allocator, bytes: []const u8) ?u32 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return null;
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const package_manager = obj.get("packageManager") orelse return null;
+    if (package_manager != .string) return null;
+    return yarnMajorFromPackageManagerField(package_manager.string);
+}
+
+fn yarnMajorFromPackageManagerField(raw: []const u8) ?u32 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const prefix = "yarn@";
+    if (!std.ascii.startsWithIgnoreCase(trimmed, prefix)) return null;
+    return majorFromVersionString(trimmed[prefix.len..]);
+}
+
+fn majorFromVersionString(raw: []const u8) ?u32 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    var index: usize = if (trimmed[0] == 'v' or trimmed[0] == 'V') 1 else 0;
+    const start = index;
+    while (index < trimmed.len and std.ascii.isDigit(trimmed[index])) index += 1;
+    if (index == start) return null;
+    return std.fmt.parseInt(u32, trimmed[start..index], 10) catch null;
+}
+
+fn rewriteIgnoreScriptsArgs(allocator: std.mem.Allocator, args: []const []const u8) ![]const []const u8 {
+    const separator = passthroughSeparatorIndex(args);
+    var kept = std.ArrayListUnmanaged([]const u8){};
+    errdefer kept.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < separator) {
+        const arg = args[index];
+        if (isIgnoreScriptsDisabledFlag(arg)) {
+            index += 1;
+            continue;
+        }
+        if (isBareIgnoreScripts(arg) and index + 1 < separator and isFalseWord(args[index + 1])) {
+            index += 2;
+            continue;
+        }
+        try kept.append(allocator, arg);
+        index += 1;
+    }
+
+    try kept.append(allocator, "--ignore-scripts");
+    if (separator < args.len) {
+        try kept.appendSlice(allocator, args[separator..]);
+    }
+    return kept.toOwnedSlice(allocator);
+}
+
+fn passthroughSeparatorIndex(args: []const []const u8) usize {
+    for (args, 0..) |arg, index| {
+        if (std.mem.eql(u8, arg, "--")) return index;
+    }
+    return args.len;
+}
+
+fn isIgnoreScriptsDisabledFlag(arg: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(arg, "--ignore-scripts=false") or
+        std.ascii.eqlIgnoreCase(arg, "--no-ignore-scripts") or
+        std.ascii.eqlIgnoreCase(arg, "--config.ignore-scripts=false");
+}
+
+fn isBareIgnoreScripts(arg: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(arg, "--ignore-scripts");
+}
+
+fn isFalseWord(arg: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(arg, "false");
 }
 
 fn filterForwardedArgsForAgePolicy(
@@ -2261,6 +2468,62 @@ test "buildPackageManagerMinimumAgeGate emits pnpm and yarn formats" {
     defer yarn_gate.deinit(allocator);
     try std.testing.expectEqualStrings("YARN_NPM_MINIMAL_AGE_GATE", yarn_gate.key);
     try std.testing.expectEqualStrings("1440", yarn_gate.value);
+}
+
+fn expectArgStrings(args: []const []const u8, expected: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, args.len);
+    for (expected, args) |want, got| {
+        try std.testing.expectEqualStrings(want, got);
+    }
+}
+
+test "rewriteIgnoreScriptsArgs appends the flag before the passthrough separator" {
+    const allocator = std.testing.allocator;
+    const args = try rewriteIgnoreScriptsArgs(allocator, &.{ "install", "left-pad", "--", "--coverage" });
+    defer allocator.free(args);
+    try expectArgStrings(args, &.{ "install", "left-pad", "--ignore-scripts", "--", "--coverage" });
+}
+
+test "rewriteIgnoreScriptsArgs removes flags that turn scripts back on" {
+    const allocator = std.testing.allocator;
+    const args = try rewriteIgnoreScriptsArgs(allocator, &.{
+        "install",
+        "--ignore-scripts=false",
+        "--no-ignore-scripts",
+        "--config.ignore-scripts=false",
+        "--ignore-scripts",
+        "false",
+        "left-pad",
+    });
+    defer allocator.free(args);
+    try expectArgStrings(args, &.{ "install", "left-pad", "--ignore-scripts" });
+}
+
+test "lifecycleScriptAction selects the package manager lock" {
+    try std.testing.expectEqual(LifecycleScriptAction.ignore_scripts_flag, lifecycleScriptAction("npm", &.{ "install", "left-pad" }, null));
+    try std.testing.expectEqual(LifecycleScriptAction.ignore_scripts_flag, lifecycleScriptAction("pnpm", &.{"install"}, null));
+    try std.testing.expectEqual(LifecycleScriptAction.ignore_scripts_flag, lifecycleScriptAction("corepack", &.{ "pnpm", "install" }, null));
+    try std.testing.expectEqual(LifecycleScriptAction.ignore_scripts_flag, lifecycleScriptAction("yarn", &.{"install"}, 1));
+    try std.testing.expectEqual(LifecycleScriptAction.yarn_berry_env, lifecycleScriptAction("yarnpkg", &.{"install"}, 4));
+    try std.testing.expectEqual(LifecycleScriptAction.yarn_berry_env, lifecycleScriptAction("corepack", &.{ "yarn", "install" }, 3));
+    try std.testing.expectEqual(LifecycleScriptAction.unchanged, lifecycleScriptAction("yarn", &.{"install"}, null));
+    try std.testing.expectEqual(LifecycleScriptAction.unchanged, lifecycleScriptAction("corepack", &.{ "prepare", "yarn@stable" }, null));
+    try std.testing.expectEqual(LifecycleScriptAction.unchanged, lifecycleScriptAction("corepack", &.{"enable"}, 1));
+}
+
+test "yarn package json major comes from the yarn package version" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(@as(?u32, 1), yarnMajorFromYarnPackageJson(allocator, "{\"name\":\"yarn\",\"version\":\"1.22.22\"}"));
+    try std.testing.expectEqual(@as(?u32, 4), yarnMajorFromYarnPackageJson(allocator, "{\"name\":\"yarn\",\"version\":\"4.9.1\"}"));
+    try std.testing.expect(yarnMajorFromYarnPackageJson(allocator, "{\"name\":\"corepack\",\"version\":\"0.30.0\"}") == null);
+}
+
+test "project packageManager field selects the yarn major" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(@as(?u32, 1), yarnMajorFromProjectPackageJson(allocator, "{\"packageManager\":\"yarn@1.22.22\"}"));
+    try std.testing.expectEqual(@as(?u32, 4), yarnMajorFromProjectPackageJson(allocator, "{\"packageManager\":\"yarn@4.9.1+sha512.abc\"}"));
+    try std.testing.expect(yarnMajorFromProjectPackageJson(allocator, "{\"packageManager\":\"pnpm@9.0.0\"}") == null);
+    try std.testing.expectEqual(@as(?u32, 1), yarnMajorFromPackageManagerField("yarn@1"));
 }
 
 test "hasExplicitRegistryArgument detects registry flags" {

@@ -23,6 +23,7 @@ const reg_value_freeze_v8_global_objects = config.reg_value_freeze_v8_global_obj
 const reg_value_disable_eval_and_string_execution = config.reg_value_disable_eval_and_string_execution;
 const reg_value_package_manager_mismatch_action = config.reg_value_package_manager_mismatch_action;
 const reg_value_npm_module_minimum_age = config.reg_value_npm_module_minimum_age;
+const reg_value_block_package_manager_lifecycle_scripts = config.reg_value_block_package_manager_lifecycle_scripts;
 const reg_value_npm_mirror = config.reg_value_npm_mirror;
 const reg_nvm_cmd_path = config.reg_nvm_cmd_path;
 const default_root = config.default_install_root;
@@ -54,6 +55,7 @@ pub const ShimConfig = struct {
     package_manager_mismatch_action: PackageManagerMismatchAction,
     npm_module_minimum_age: ?u64,
     npm_registry_fallback: ?[]u8,
+    block_package_manager_lifecycle_scripts: bool,
 };
 
 pub const PackageManagerConstraint = struct {
@@ -168,6 +170,7 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
         try allocator.dupe(u8, "error");
     defer allocator.free(raw_package_manager_mismatch_action);
     const package_manager_mismatch_action = parsePackageManagerMismatchAction(raw_package_manager_mismatch_action);
+    const block_package_manager_lifecycle_scripts = try loadBlockPackageManagerLifecycleScripts();
 
     return .{
         .root = root,
@@ -185,7 +188,16 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
         .package_manager_mismatch_action = package_manager_mismatch_action,
         .npm_module_minimum_age = npm_module_minimum_age,
         .npm_registry_fallback = npm_registry_fallback,
+        .block_package_manager_lifecycle_scripts = block_package_manager_lifecycle_scripts,
     };
+}
+
+fn loadBlockPackageManagerLifecycleScripts() !bool {
+    // HKLM policy only. HKCU preferences must not enable or disable this.
+    if (try registry.queryDwordOptionalWithFallback(&policy_hives, policy_path, reg_value_block_package_manager_lifecycle_scripts)) |value| {
+        return value != 0;
+    }
+    return false;
 }
 
 fn allowsStructuredLogging(allocator: std.mem.Allocator, hives: []const windows.HKEY) bool {

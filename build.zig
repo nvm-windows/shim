@@ -198,6 +198,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }));
 
+    if (std.mem.eql(u8, app, "proxy")) {
+        const proxy_tests = b.addTest(.{
+            .root_module = exe.root_module,
+        });
+        const run_proxy_tests = b.addRunArtifact(proxy_tests);
+        test_step.dependOn(&run_proxy_tests.step);
+    }
+
     b.installArtifact(exe);
 
     // CycloneDX 1.6 via zig-build-sbom (compile graph + build.zig.zon).

@@ -19,6 +19,7 @@ pub const reg_value_freeze_v8_global_objects = "FreezeV8GlobalObjects";
 pub const reg_value_disable_eval_and_string_execution = "DisableEvalAndStringExecution";
 pub const reg_value_package_manager_mismatch_action = "PackageManagerMismatchAction";
 pub const reg_value_npm_module_minimum_age = "NpmModuleMinimumAge";
+pub const reg_value_block_package_manager_lifecycle_scripts = "BlockPackageManagerLifecycleScripts";
 pub const reg_value_npm_mirror = "MirrorNpm";
 pub const reg_nvm_cmd_path = "Software\\Classes\\nvm\\shell\\open\\command";
 pub const default_install_root = "%LOCALAPPDATA%\\Author Software\\nvm\\installs";
