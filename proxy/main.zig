@@ -266,7 +266,7 @@ pub fn main() !void {
     const snap_before = captureEntrypointSnapSet(allocator, command_path, command_name);
     defer snap_before.deinit(allocator);
 
-    if (cfg.log_executions) {
+    if (cfg.log_executions and build_options.certified) {
         const arguments = if (parsed_args.forwarded.len == 0)
             try allocator.dupe(u8, "")
         else
@@ -1601,6 +1601,8 @@ fn logPackageManagerInstallAudit(
     event_code: u32,
     denied: bool,
 ) void {
+    if (!build_options.certified) return;
+
     var audit_ctx = eventlog.captureAuditContext(allocator);
     defer audit_ctx.deinit(allocator);
 

@@ -134,8 +134,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const certified = b.option(bool, "certified", "Emit certified package-manager audit events") orelse false;
+
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
+    build_options.addOption(bool, "certified", certified);
     exe.root_module.addOptions("build_options", build_options);
 
     exe.root_module.addImport("registry", registry_module);
