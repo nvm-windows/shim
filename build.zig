@@ -184,6 +184,12 @@ pub fn build(b: *std.Build) void {
         module_firewall_tests.root_module.linkSystemLibrary("advapi32", .{});
         const run_module_firewall_tests = b.addRunArtifact(module_firewall_tests);
         test_step.dependOn(&run_module_firewall_tests.step);
+
+        const proxy_tests = b.addTest(.{
+            .root_module = exe.root_module,
+        });
+        const run_proxy_tests = b.addRunArtifact(proxy_tests);
+        test_step.dependOn(&run_proxy_tests.step);
     }
 
     exe.root_module.addImport("errors", b.createModule(.{
