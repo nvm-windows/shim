@@ -4,6 +4,7 @@ const registry = @import("registry");
 const config = @import("config");
 const resolver = @import("resolver");
 const cmd_spawn = @import("cmd_spawn");
+const errors = @import("errors");
 
 const reg_path = config.preference_registry_root;
 const policy_path = config.policy_registry_root;
@@ -626,27 +627,52 @@ pub fn selectEffectiveVersion(aliases: []const []const u8, requested: []const u8
     return resolveUserAlias(aliases, requested) orelse requested;
 }
 
-pub fn runNvmCommand(allocator: std.mem.Allocator, nvm_args: []const []const u8) !void {
-    simulateNvmCommandLookup(allocator);
+pub const NvmCommandOutcome = union(enum) {
+    ok,
+    exe_not_found,
+    spawn_failed: []u8,
+    install_failed: u32,
+};
 
-    const nvm_exe = try resolveNvmExePath(allocator);
-    defer allocator.free(nvm_exe);
+pub fn runNvmExecutable(allocator: std.mem.Allocator, exe_path: []const u8, nvm_args: []const []const u8) !NvmCommandOutcome {
+    std.fs.accessAbsolute(exe_path, .{}) catch return .exe_not_found;
 
     var argv = try allocator.alloc([]const u8, nvm_args.len + 1);
     defer allocator.free(argv);
-    argv[0] = nvm_exe;
+    argv[0] = exe_path;
     for (nvm_args, 0..) |arg, i| {
         argv[i + 1] = arg;
     }
 
     var child = std.process.Child.init(argv, allocator);
-    child.stdin_behavior = .Inherit;
+    child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
 
-    try child.spawn();
-    const term = try child.wait();
-    if (term != .Exited or term.Exited != 0) return error.AutoInstallFailed;
+    child.spawn() catch {
+        return .{ .spawn_failed = try allocator.dupe(u8, exe_path) };
+    };
+    const term = child.wait() catch {
+        return .{ .spawn_failed = try allocator.dupe(u8, exe_path) };
+    };
+    switch (term) {
+        .Exited => |code| {
+            if (code == 0) return .ok;
+            return .{ .install_failed = code };
+        },
+        else => return .{ .install_failed = 1 },
+    }
+}
+
+pub fn runNvmCommand(allocator: std.mem.Allocator, nvm_args: []const []const u8) !NvmCommandOutcome {
+    simulateNvmCommandLookup(allocator);
+
+    const nvm_exe = resolveNvmExePath(allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .exe_not_found,
+    };
+    defer allocator.free(nvm_exe);
+    return runNvmExecutable(allocator, nvm_exe, nvm_args);
 }
 
 /// ProgramRoot holds nvm.exe and utils\*. Prefer NVM_HOME, then self layout, then default LOCALAPPDATA path.
@@ -734,14 +760,14 @@ pub fn resolveReshimExePath(allocator: std.mem.Allocator) ![]u8 {
     return reshim;
 }
 
-pub fn autoInstallVersion(allocator: std.mem.Allocator, version: []const u8) !void {
-    try runNvmCommand(allocator, &.{ "install", version });
+pub fn autoInstallVersion(allocator: std.mem.Allocator, version: []const u8) !NvmCommandOutcome {
+    return runNvmCommand(allocator, &.{ "install", version });
 }
 
 pub const EnsureInstalledNodeError = error{
     NodeNotFound,
     AutoInstallCancelled,
-    AutoInstallFailed,
+    OutOfMemory,
 };
 
 /// Prompt/auto-install when the resolved Node is missing (shim + proxy).
@@ -773,15 +799,27 @@ fn autoInstallMissing(
 ) EnsureInstalledNodeError!void {
     if (!cfg.auto_install or override_version != null) return error.NodeNotFound;
     if (cfg.auto_install_prompt) {
-        const ok = confirmAutoInstall(allocator, version) catch return error.AutoInstallFailed;
+        const ok = confirmAutoInstall(allocator, version) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => errors.reportAutoInstallFailure(.{ .prompt_failed = version }),
+        };
         if (!ok) return error.AutoInstallCancelled;
     }
 
-    const install_version = allocator.dupe(u8, version) catch return error.AutoInstallFailed;
+    const install_version = try allocator.dupe(u8, version);
     defer allocator.free(install_version);
 
-    autoInstallVersion(allocator, install_version) catch return error.AutoInstallFailed;
-    const next = resolveConfiguredNode(allocator, cfg, override_version) catch return error.AutoInstallFailed;
+    switch (try autoInstallVersion(allocator, install_version)) {
+        .ok => {},
+        .exe_not_found => errors.reportAutoInstallFailure(.nvm_exe_not_found),
+        .spawn_failed => |path| {
+            defer allocator.free(path);
+            errors.reportAutoInstallFailure(.{ .spawn_failed = .{ .version = install_version, .path = path } });
+        },
+        .install_failed => |code| errors.reportAutoInstallFailure(.{ .install_failed = .{ .version = install_version, .exit_code = code } }),
+    }
+    const next = resolveConfiguredNode(allocator, cfg, override_version) catch
+        errors.reportAutoInstallFailure(.{ .unresolved_after_install = install_version });
     resolved.deinit(allocator);
     resolved.* = next;
 }
@@ -1175,4 +1213,93 @@ test "licenseVerifiedWithinMaxAge accepts fresh stamp and rejects stale" {
     try std.testing.expect(!licenseVerifiedWithinMaxAge(stamp, stamp_unix + (30 * 24 * 60 * 60) + 1));
     try std.testing.expect(!licenseVerifiedWithinMaxAge("", stamp_unix));
     try std.testing.expect(!licenseVerifiedWithinMaxAge("not-a-date", stamp_unix));
+}
+
+fn testShimConfig(auto_install: bool) ShimConfig {
+    return .{
+        .root = "",
+        .active_version = "",
+        .auto_use = false,
+        .auto_install = auto_install,
+        .auto_install_prompt = false,
+        .auto_detect = &.{},
+        .aliases = &.{},
+        .log_executions = false,
+        .structured_logging = false,
+        .enforce_permission_model = false,
+        .freeze_v8_global_objects = false,
+        .disable_eval_and_string_execution = false,
+        .package_manager_mismatch_action = .ignore,
+        .npm_module_minimum_age = null,
+        .npm_registry_fallback = null,
+    };
+}
+
+fn expectAutoInstallText(failure: errors.AutoInstallFailure, code: []const u8, needle: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const text = try errors.formatAutoInstallFailure(allocator, failure);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "AutoInstallFailed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, code) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, needle) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Event code: ") != null);
+}
+
+test "auto-install messages name the failing step and NVM code" {
+    try expectAutoInstallText(.{ .prompt_failed = "24.17.0" }, "NVM4307", "nvm install 24.17.0");
+    try expectAutoInstallText(.nvm_exe_not_found, "NVM4308", "NVM_HOME");
+    try expectAutoInstallText(.{ .spawn_failed = .{ .version = "24.17.0", .path = "C:\\Tools\\nvm.exe" } }, "NVM4309", "C:\\Tools\\nvm.exe");
+    try expectAutoInstallText(.{ .install_failed = .{ .version = "24.17.0", .exit_code = 9 } }, "NVM4310", "code 9");
+    try expectAutoInstallText(.{ .unresolved_after_install = "24.17.0" }, "NVM4311", "still not available");
+}
+
+test "disabled auto-install and an explicit version do not launch nvm" {
+    const allocator = std.testing.allocator;
+    var missing = ResolvedNode{
+        .requested_version = "24.17.0",
+        .effective_version = "24.17.0",
+        .version_source = "test",
+    };
+    try std.testing.expectError(error.NodeNotFound, ensureInstalledNode(allocator, testShimConfig(false), null, &missing));
+
+    var overridden = ResolvedNode{
+        .requested_version = "24.17.0",
+        .effective_version = "24.17.0",
+        .version_source = "test",
+    };
+    try std.testing.expectError(error.NodeNotFound, ensureInstalledNode(allocator, testShimConfig(true), "24.17.0", &overridden));
+}
+
+test "nvm command runner reports a missing executable, a bad spawn, and the exit code" {
+    const allocator = std.testing.allocator;
+
+    const missing = try runNvmExecutable(allocator, "C:\\__nvm_auto_install_missing__\\nvm.exe", &.{});
+    try std.testing.expect(missing == .exe_not_found);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "not-nvm.exe", .data = "not a program" });
+    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir);
+    const bad_exe = try std.fs.path.join(allocator, &.{ dir, "not-nvm.exe" });
+    defer allocator.free(bad_exe);
+    const spawned = try runNvmExecutable(allocator, bad_exe, &.{});
+    switch (spawned) {
+        .spawn_failed => |path| allocator.free(path),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const system_root = try std.process.getEnvVarOwned(allocator, "SystemRoot");
+    defer allocator.free(system_root);
+    const cmd = try std.fs.path.join(allocator, &.{ system_root, "System32", "cmd.exe" });
+    defer allocator.free(cmd);
+
+    const failed = try runNvmExecutable(allocator, cmd, &.{ "/c", "exit 9" });
+    switch (failed) {
+        .install_failed => |code| try std.testing.expectEqual(@as(u32, 9), code),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const ok = try runNvmExecutable(allocator, cmd, &.{ "/c", "exit 0" });
+    try std.testing.expect(ok == .ok);
 }

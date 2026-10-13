@@ -78,7 +78,7 @@ pub fn main() !void {
             std.debug.print("operation cancelled\n", .{});
             std.process.exit(1);
         },
-        error.AutoInstallFailed => return err,
+        error.OutOfMemory => return err,
     };
 
     if (parsed_args.nvm_use_debug) {

@@ -54,6 +54,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const errors_module = b.createModule(.{
+        .root_source_file = b.path(errors_path),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const nodeversion_module = b.createModule(.{
         .root_source_file = b.path(nodeversion_path),
         .target = target,
@@ -63,6 +69,7 @@ pub fn build(b: *std.Build) void {
     nodeversion_module.addImport("registry", registry_module);
     nodeversion_module.addImport("resolver", resolver_module);
     nodeversion_module.addImport("cmd_spawn", cmd_spawn_module);
+    nodeversion_module.addImport("errors", errors_module);
 
     const shimintegrity_module = b.createModule(.{
         .root_source_file = b.path(shimintegrity_path),
@@ -192,11 +199,7 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_proxy_tests.step);
     }
 
-    exe.root_module.addImport("errors", b.createModule(.{
-        .root_source_file = b.path(errors_path),
-        .target = target,
-        .optimize = optimize,
-    }));
+    exe.root_module.addImport("errors", errors_module);
 
     exe.root_module.addImport("eventlog", b.createModule(.{
         .root_source_file = b.path(eventlog_path),
