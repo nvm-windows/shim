@@ -69,7 +69,7 @@ pub fn main() !void {
     nodeversion.ensureInstalledNode(allocator, cfg, parsed_args.override_version, &resolved) catch |err| switch (err) {
         error.NodeNotFound => nodeNotFound(resolved.resolved_version orelse resolved.effective_version),
         error.AutoInstallCancelled => operationCancelled(),
-        error.AutoInstallFailed => return err,
+        error.OutOfMemory => return err,
     };
 
     if (parsed_args.nvm_use_debug) {

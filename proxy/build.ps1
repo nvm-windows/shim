@@ -81,6 +81,8 @@ if ($RegistryOverride) {
 	$registryOverridePath = [System.IO.Path]::GetFullPath($RegistryOverride)
 	$registryOverrideRelativePath = [System.IO.Path]::GetRelativePath($shimRoot, $registryOverridePath).Replace('\', '/')
 	$zigArgs += "-Dregistry_path=$registryOverrideRelativePath"
+	# Certified builds pass the registry override. Community builds do not.
+	$zigArgs += "-Dcertified=true"
 }
 
 Push-Location $scriptRoot

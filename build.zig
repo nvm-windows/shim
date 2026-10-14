@@ -54,6 +54,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const errors_module = b.createModule(.{
+        .root_source_file = b.path(errors_path),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const nodeversion_module = b.createModule(.{
         .root_source_file = b.path(nodeversion_path),
         .target = target,
@@ -63,6 +69,7 @@ pub fn build(b: *std.Build) void {
     nodeversion_module.addImport("registry", registry_module);
     nodeversion_module.addImport("resolver", resolver_module);
     nodeversion_module.addImport("cmd_spawn", cmd_spawn_module);
+    nodeversion_module.addImport("errors", errors_module);
 
     const shimintegrity_module = b.createModule(.{
         .root_source_file = b.path(shimintegrity_path),
@@ -134,8 +141,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const certified = b.option(bool, "certified", "Emit certified package-manager audit events") orelse false;
+
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
+    build_options.addOption(bool, "certified", certified);
     exe.root_module.addOptions("build_options", build_options);
 
     exe.root_module.addImport("registry", registry_module);
@@ -181,13 +191,15 @@ pub fn build(b: *std.Build) void {
         module_firewall_tests.root_module.linkSystemLibrary("advapi32", .{});
         const run_module_firewall_tests = b.addRunArtifact(module_firewall_tests);
         test_step.dependOn(&run_module_firewall_tests.step);
+
+        const proxy_tests = b.addTest(.{
+            .root_module = exe.root_module,
+        });
+        const run_proxy_tests = b.addRunArtifact(proxy_tests);
+        test_step.dependOn(&run_proxy_tests.step);
     }
 
-    exe.root_module.addImport("errors", b.createModule(.{
-        .root_source_file = b.path(errors_path),
-        .target = target,
-        .optimize = optimize,
-    }));
+    exe.root_module.addImport("errors", errors_module);
 
     exe.root_module.addImport("eventlog", b.createModule(.{
         .root_source_file = b.path(eventlog_path),

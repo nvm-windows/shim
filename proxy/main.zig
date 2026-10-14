@@ -78,7 +78,7 @@ pub fn main() !void {
             std.debug.print("operation cancelled\n", .{});
             std.process.exit(1);
         },
-        error.AutoInstallFailed => return err,
+        error.OutOfMemory => return err,
     };
 
     if (parsed_args.nvm_use_debug) {
@@ -266,7 +266,7 @@ pub fn main() !void {
     const snap_before = captureEntrypointSnapSet(allocator, command_path, command_name);
     defer snap_before.deinit(allocator);
 
-    if (cfg.log_executions) {
+    if (cfg.log_executions and build_options.certified) {
         const arguments = if (parsed_args.forwarded.len == 0)
             try allocator.dupe(u8, "")
         else
@@ -433,20 +433,346 @@ fn resolveDelegatedCommandPath(allocator: std.mem.Allocator, node_install_dir: [
 }
 
 fn resolveDelegatedOrCorepackPath(allocator: std.mem.Allocator, node_install_dir: []const u8, command_name: []const u8) ![]u8 {
-    if (resolveDelegatedCommandPath(allocator, node_install_dir, command_name)) |path| {
-        return path;
-    } else |err| {
-        if (err != error.CommandNotFound) return err;
+    if (isCorepackBackedCommand(command_name)) {
+        return resolveCorepackBackedCommand(allocator, node_install_dir, command_name);
     }
 
-    if (isCorepackBackedCommand(command_name)) {
-        if (try resolveCorepackJs(allocator, node_install_dir)) |corepack_js| {
-            return corepack_js;
+    return resolveDelegatedCommandPath(allocator, node_install_dir, command_name);
+}
+
+const LauncherClass = union(enum) {
+    package_js: []u8,
+    corepack_trampoline,
+    reject,
+};
+
+/// yarn/yarnpkg/pnpm. A version-directory .exe still runs as the native binary.
+/// A .cmd is only a pointer: npm's global shim must point at node_modules\<pkg>\
+/// or it is ignored. A Corepack trampoline keeps the corepack.js launch and
+/// blocks the npm prefix so `corepack enable` wins for that Node version.
+/// npm, npx, and corepack do not come through here.
+fn resolveCorepackBackedCommand(allocator: std.mem.Allocator, node_install_dir: []const u8, command_name: []const u8) ![]u8 {
+    if (try resolveVersionDirExecutable(allocator, node_install_dir, command_name)) |exe| {
+        return exe;
+    }
+
+    var skip_prefix = false;
+    if (try findLauncherCmd(allocator, node_install_dir, command_name)) |cmd_path| {
+        defer allocator.free(cmd_path);
+        switch (try classifyPackageLauncher(allocator, cmd_path, npmGlobalPackageName(command_name))) {
+            .package_js => |js_path| return js_path,
+            .corepack_trampoline => skip_prefix = true,
+            .reject => {},
         }
+    }
+
+    if (!skip_prefix) {
+        if (try resolveNpmPrefixPackageJs(allocator, node_install_dir, command_name)) |js_path| {
+            return js_path;
+        }
+    }
+
+    if (try resolveCorepackJs(allocator, node_install_dir)) |corepack_js| {
+        return corepack_js;
     }
 
     reportMissingPackageManager(command_name);
     return error.CommandNotFound;
+}
+
+fn npmGlobalPackageName(command_name: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(command_name, "pnpm")) return "pnpm";
+    return "yarn";
+}
+
+fn resolveVersionDirExecutable(allocator: std.mem.Allocator, node_install_dir: []const u8, command_name: []const u8) !?[]u8 {
+    const filename = try std.fmt.allocPrint(allocator, "{s}.exe", .{command_name});
+    defer allocator.free(filename);
+    const full = try std.fs.path.join(allocator, &.{ node_install_dir, filename });
+    errdefer allocator.free(full);
+    std.fs.cwd().access(full, .{}) catch {
+        allocator.free(full);
+        return null;
+    };
+    return full;
+}
+
+fn findLauncherCmd(allocator: std.mem.Allocator, dir_path: []const u8, command_name: []const u8) !?[]u8 {
+    const exts = [_][]const u8{ ".cmd", ".bat" };
+    for (exts) |ext| {
+        const filename = try std.fmt.allocPrint(allocator, "{s}{s}", .{ command_name, ext });
+        defer allocator.free(filename);
+        const full = try std.fs.path.join(allocator, &.{ dir_path, filename });
+        errdefer allocator.free(full);
+        std.fs.cwd().access(full, .{}) catch {
+            allocator.free(full);
+            continue;
+        };
+        return full;
+    }
+    return null;
+}
+
+fn resolveNpmPrefixPackageJs(allocator: std.mem.Allocator, node_install_dir: []const u8, command_name: []const u8) !?[]u8 {
+    const prefix = try npmGlobalPrefix(allocator, node_install_dir) orelse return null;
+    defer allocator.free(prefix);
+    const version_abs = std.fs.path.resolve(allocator, &.{node_install_dir}) catch return null;
+    defer allocator.free(version_abs);
+    const prefix_abs = std.fs.path.resolve(allocator, &.{prefix}) catch return null;
+    defer allocator.free(prefix_abs);
+    if (pathsEqualAscii(version_abs, prefix_abs)) return null;
+
+    const cmd_path = try findLauncherCmd(allocator, prefix_abs, command_name) orelse return null;
+    defer allocator.free(cmd_path);
+    switch (try classifyPackageLauncher(allocator, cmd_path, npmGlobalPackageName(command_name))) {
+        .package_js => |js_path| return js_path,
+        .corepack_trampoline, .reject => return null,
+    }
+}
+
+fn classifyPackageLauncher(allocator: std.mem.Allocator, cmd_path: []const u8, package_name: []const u8) !LauncherClass {
+    const contents = try readTextFileIfPresent(allocator, cmd_path) orelse return .reject;
+    defer allocator.free(contents);
+    if (contents.len > 64 * 1024) return .reject;
+
+    const cmd_dir = std.fs.path.dirname(cmd_path) orelse return .reject;
+    if (launcherMentionsCorepack(contents) and !launcherMentionsPackage(contents, package_name)) {
+        return .corepack_trampoline;
+    }
+    if (launcherMentionsCorepack(contents)) return .reject;
+
+    const token = launcherPackageToken(contents, package_name) orelse return .reject;
+    const expanded = try expandLauncherDp0(allocator, token, cmd_dir) orelse return .reject;
+    defer allocator.free(expanded);
+    if (std.mem.indexOfScalar(u8, expanded, '%') != null) return .reject;
+
+    const resolved = std.fs.path.resolve(allocator, &.{ expanded }) catch return .reject;
+    defer allocator.free(resolved);
+    if (!hasScriptExtension(resolved)) return .reject;
+
+    const package_root = std.fs.path.join(allocator, &.{ cmd_dir, "node_modules", package_name }) catch return .reject;
+    defer allocator.free(package_root);
+    const package_abs = std.fs.path.resolve(allocator, &.{package_root}) catch return .reject;
+    defer allocator.free(package_abs);
+    if (!pathIsInside(package_abs, resolved)) return .reject;
+    const node_modules = std.fs.path.join(allocator, &.{ cmd_dir, "node_modules" }) catch return .reject;
+    defer allocator.free(node_modules);
+    if (pathIsReparsePoint(allocator, cmd_dir)) return .reject;
+    if (pathIsReparsePoint(allocator, node_modules)) return .reject;
+    if (pathIsReparsePoint(allocator, package_abs)) return .reject;
+    if (pathIsReparsePoint(allocator, resolved)) return .reject;
+
+    std.fs.cwd().access(resolved, .{}) catch return .reject;
+    return .{ .package_js = try allocator.dupe(u8, resolved) };
+}
+
+fn launcherMentionsCorepack(contents: []const u8) bool {
+    return indexOfIgnoreCase(contents, "corepack.js") != null;
+}
+
+fn launcherMentionsPackage(contents: []const u8, package_name: []const u8) bool {
+    return launcherPackageToken(contents, package_name) != null;
+}
+
+fn launcherPackageToken(contents: []const u8, package_name: []const u8) ?[]const u8 {
+    const markers = [_][]const u8{ "node_modules\\", "node_modules/" };
+    var search_from: usize = 0;
+    while (search_from < contents.len) {
+        const rest = contents[search_from..];
+        var found: ?usize = null;
+        for (markers) |marker| {
+            const needle_len = marker.len + package_name.len;
+            var i: usize = 0;
+            while (i + needle_len <= rest.len) : (i += 1) {
+                if (!std.ascii.eqlIgnoreCase(rest[i .. i + marker.len], marker)) continue;
+                if (!std.ascii.eqlIgnoreCase(rest[i + marker.len .. i + needle_len], package_name)) continue;
+                const after = i + needle_len;
+                if (after >= rest.len) continue;
+                const sep = rest[after];
+                if (sep != '\\' and sep != '/') continue;
+                found = search_from + i;
+                break;
+            }
+            if (found != null) break;
+        }
+        const at = found orelse return null;
+        const token = quotedTokenAt(contents, at);
+        if (std.mem.indexOfScalar(u8, token, '.') != null) return token;
+        search_from = at + 1;
+    }
+    return null;
+}
+
+fn quotedTokenAt(contents: []const u8, at: usize) []const u8 {
+    var start = at;
+    while (start > 0) {
+        const ch = contents[start - 1];
+        if (ch == '"' or ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n' or ch == '=') break;
+        start -= 1;
+    }
+    var end = at;
+    while (end < contents.len) {
+        const ch = contents[end];
+        if (ch == '"' or ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n') break;
+        end += 1;
+    }
+    return contents[start..end];
+}
+
+fn expandLauncherDp0(allocator: std.mem.Allocator, token: []const u8, cmd_dir: []const u8) !?[]u8 {
+    const trimmed = std.mem.trim(u8, token, " \t\r\n\"");
+    const dir = std.mem.trimRight(u8, cmd_dir, "\\/");
+    const patterns = [_][]const u8{ "%~dp0%", "%dp0%", "%~dp0" };
+    for (patterns) |pattern| {
+        if (std.ascii.startsWithIgnoreCase(trimmed, pattern)) {
+            const rest = trimmed[pattern.len..];
+            const relative = std.mem.trimLeft(u8, rest, "\\/");
+            if (relative.len == 0) return null;
+            const joined = try std.fs.path.join(allocator, &.{ dir, relative });
+            return joined;
+        }
+    }
+    if (std.fs.path.isAbsolute(trimmed)) {
+        const owned = try allocator.dupe(u8, trimmed);
+        return owned;
+    }
+    const joined = try std.fs.path.join(allocator, &.{ dir, trimmed });
+    return joined;
+}
+
+fn hasScriptExtension(path: []const u8) bool {
+    const ext = std.fs.path.extension(path);
+    return std.ascii.eqlIgnoreCase(ext, ".js") or
+        std.ascii.eqlIgnoreCase(ext, ".cjs") or
+        std.ascii.eqlIgnoreCase(ext, ".mjs");
+}
+
+fn pathIsInside(parent: []const u8, child: []const u8) bool {
+    if (child.len <= parent.len) return false;
+    if (!std.ascii.eqlIgnoreCase(child[0..parent.len], parent)) return false;
+    const sep = child[parent.len];
+    return sep == '\\' or sep == '/';
+}
+
+fn pathsEqualAscii(left: []const u8, right: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.mem.trimRight(u8, left, "\\/"), std.mem.trimRight(u8, right, "\\/"));
+}
+
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or haystack.len < needle.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
+}
+
+fn pathIsReparsePoint(allocator: std.mem.Allocator, path: []const u8) bool {
+    const path_w = std.unicode.utf8ToUtf16LeAllocZ(allocator, path) catch return true;
+    defer allocator.free(path_w);
+    const attrs = std.os.windows.kernel32.GetFileAttributesW(path_w.ptr);
+    if (attrs == std.os.windows.INVALID_FILE_ATTRIBUTES) return true;
+    return (attrs & 0x400) != 0;
+}
+
+/// Windows global prefix from built-in, per-install, and user npmrc files.
+/// Project .npmrc and npm_config_prefix are ignored so a repo cannot aim this search.
+fn npmGlobalPrefix(allocator: std.mem.Allocator, node_install_dir: []const u8) !?[]u8 {
+    const appdata = std.process.getEnvVarOwned(allocator, "APPDATA") catch null;
+    defer if (appdata) |value| allocator.free(value);
+    var prefix: ?[]u8 = null;
+    errdefer if (prefix) |value| allocator.free(value);
+    if (appdata) |value| {
+        prefix = try std.fs.path.join(allocator, &.{ value, "npm" });
+    }
+
+    const builtin = try std.fs.path.join(allocator, &.{ node_install_dir, "node_modules", "npm", "npmrc" });
+    defer allocator.free(builtin);
+    try applyNpmrcPrefixFile(allocator, &prefix, builtin);
+
+    const install_etc = try std.fs.path.join(allocator, &.{ node_install_dir, "etc", "npmrc" });
+    defer allocator.free(install_etc);
+    try applyNpmrcPrefixFile(allocator, &prefix, install_etc);
+
+    if (prefix) |current| {
+        const prefix_etc = try std.fs.path.join(allocator, &.{ current, "etc", "npmrc" });
+        defer allocator.free(prefix_etc);
+        try applyNpmrcPrefixFile(allocator, &prefix, prefix_etc);
+    }
+
+    const user_profile = std.process.getEnvVarOwned(allocator, "USERPROFILE") catch null;
+    defer if (user_profile) |value| allocator.free(value);
+    if (user_profile) |value| {
+        const user_npmrc = try std.fs.path.join(allocator, &.{ value, ".npmrc" });
+        defer allocator.free(user_npmrc);
+        try applyNpmrcPrefixFile(allocator, &prefix, user_npmrc);
+    }
+
+    return prefix;
+}
+
+fn applyNpmrcPrefixFile(allocator: std.mem.Allocator, prefix: *?[]u8, path: []const u8) !void {
+    const contents = try readTextFileIfPresent(allocator, path) orelse return;
+    defer allocator.free(contents);
+    const value = lastNpmrcPrefix(contents) orelse return;
+    const owned = try expandKnownPrefixVars(allocator, value);
+    if (prefix.*) |previous| allocator.free(previous);
+    prefix.* = owned;
+}
+
+fn expandKnownPrefixVars(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    const pairs = [_]struct { token: []const u8, env_name: []const u8 }{
+        .{ .token = "%APPDATA%", .env_name = "APPDATA" },
+        .{ .token = "${APPDATA}", .env_name = "APPDATA" },
+        .{ .token = "%LOCALAPPDATA%", .env_name = "LOCALAPPDATA" },
+        .{ .token = "${LOCALAPPDATA}", .env_name = "LOCALAPPDATA" },
+        .{ .token = "%USERPROFILE%", .env_name = "USERPROFILE" },
+        .{ .token = "${USERPROFILE}", .env_name = "USERPROFILE" },
+    };
+    var current = try allocator.dupe(u8, value);
+    for (pairs) |pair| {
+        const env_value = std.process.getEnvVarOwned(allocator, pair.env_name) catch continue;
+        defer allocator.free(env_value);
+        const replaced = try replaceAllIgnoreCase(allocator, current, pair.token, env_value);
+        allocator.free(current);
+        current = replaced;
+    }
+    return current;
+}
+
+fn replaceAllIgnoreCase(allocator: std.mem.Allocator, haystack: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < haystack.len) {
+        if (i + needle.len <= haystack.len and std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) {
+            try out.appendSlice(allocator, replacement);
+            i += needle.len;
+            continue;
+        }
+        try out.append(allocator, haystack[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn lastNpmrcPrefix(contents: []const u8) ?[]const u8 {
+    var last: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == ';' or line[0] == '#') continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t");
+        if (!std.ascii.eqlIgnoreCase(key, "prefix")) continue;
+        var value = std.mem.trim(u8, line[eq + 1 ..], " \t");
+        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+            value = value[1 .. value.len - 1];
+        }
+        if (value.len == 0) continue;
+        last = value;
+    }
+    return last;
 }
 
 fn reportMissingPackageManager(command_name: []const u8) void {
@@ -577,7 +903,7 @@ fn enforceDelegatedCommandTrust(
         return;
     }
 
-    if (std.ascii.eqlIgnoreCase(ext, ".js") and isCorepackJsPath(command_path)) {
+    if (hasScriptExtension(command_path)) {
         const outcome = verifycache.ensureDelegatedScriptTrusted(allocator, cfg.root, command_path);
         if (outcome.result == .failed) {
             const reason = if (outcome.reason.len == 0) "delegated script trust verification failed" else outcome.reason;
@@ -806,6 +1132,9 @@ fn runDelegatedCommand(
         const argv = try corepackBackedArgv(allocator, node_bin, command_path, command_name, forwarded_args);
         defer allocator.free(argv);
         return spawnArgvSlice(allocator, &env_map, argv);
+    }
+    if (hasScriptExtension(command_path)) {
+        return spawnArgv(allocator, &env_map, node_bin, command_path, forwarded_args);
     }
 
     // Spawn the entrypoint directly. For .cmd/.bat, Zig's Child uses
@@ -1601,6 +1930,8 @@ fn logPackageManagerInstallAudit(
     event_code: u32,
     denied: bool,
 ) void {
+    if (!build_options.certified) return;
+
     var audit_ctx = eventlog.captureAuditContext(allocator);
     defer audit_ctx.deinit(allocator);
 
@@ -2345,4 +2676,129 @@ test "isCorepackBackedCommand covers yarn yarnpkg pnpm" {
     try std.testing.expect(isCorepackBackedCommand("pnpm"));
     try std.testing.expect(!isCorepackBackedCommand("npm"));
     try std.testing.expect(!isCorepackBackedCommand("corepack"));
+}
+
+test "lastNpmrcPrefix keeps the last prefix and skips comments" {
+    const contents =
+        \\; prefix=C:\ignored
+        \\registry=https://registry.npmjs.org/
+        \\prefix = "D:\first"
+        \\# prefix=C:\also-ignored
+        \\prefix=E:\global
+    ;
+    const got = lastNpmrcPrefix(contents) orelse return error.MissingPrefix;
+    try std.testing.expectEqualStrings("E:\\global", got);
+}
+
+test "classifyPackageLauncher accepts npm yarn shim and rejects traversal and corepack" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("prefix\\node_modules\\yarn\\bin");
+    try tmp.dir.makePath("prefix\\node_modules\\pnpm\\bin");
+    try tmp.dir.writeFile(.{ .sub_path = "prefix\\node_modules\\yarn\\bin\\yarn.js", .data = "#!/usr/bin/env node\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "prefix\\node_modules\\pnpm\\bin\\pnpm.cjs", .data = "#!/usr/bin/env node\n" });
+    try tmp.dir.writeFile(.{
+        .sub_path = "prefix\\yarn.cmd",
+        .data = "@ECHO off\r\n\"%_prog%\" \"%dp0%\\node_modules\\yarn\\bin\\yarn.js\" %*\r\n",
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "prefix\\yarnpkg.cmd",
+        .data = "@ECHO off\r\n\"%_prog%\" \"%~dp0\\node_modules\\yarn\\bin\\yarn.js\" %*\r\n",
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "prefix\\pnpm.cmd",
+        .data = "@ECHO off\r\n\"%_prog%\" \"%dp0%\\node_modules\\pnpm\\bin\\pnpm.cjs\" %*\r\n",
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "prefix\\yarn-corepack.cmd",
+        .data = "@ECHO off\r\nnode \"%~dp0%\\node_modules\\corepack\\dist\\corepack.js\" yarn %*\r\n",
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "prefix\\yarn-escape.cmd",
+        .data = "@ECHO off\r\nnode \"%dp0%\\node_modules\\yarn\\bin\\..\\..\\..\\outside.js\" %*\r\n",
+    });
+    try tmp.dir.writeFile(.{ .sub_path = "outside.js", .data = "nope\n" });
+    try tmp.dir.writeFile(.{
+        .sub_path = "prefix\\yarn-absolute.cmd",
+        .data = "@ECHO off\r\nnode \"C:\\evil\\node_modules\\yarn\\bin\\yarn.js\" %*\r\n",
+    });
+
+    const root = try tmp.dir.realpathAlloc(allocator, "prefix");
+    defer allocator.free(root);
+
+    const yarn_cmd = try std.fs.path.join(allocator, &.{ root, "yarn.cmd" });
+    defer allocator.free(yarn_cmd);
+    switch (try classifyPackageLauncher(allocator, yarn_cmd, "yarn")) {
+        .package_js => |js_path| {
+            defer allocator.free(js_path);
+            try std.testing.expect(std.ascii.endsWithIgnoreCase(js_path, "node_modules\\yarn\\bin\\yarn.js") or std.ascii.endsWithIgnoreCase(js_path, "node_modules/yarn/bin/yarn.js"));
+        },
+        else => return error.ExpectedPackageJs,
+    }
+
+    const yarnpkg_cmd = try std.fs.path.join(allocator, &.{ root, "yarnpkg.cmd" });
+    defer allocator.free(yarnpkg_cmd);
+    switch (try classifyPackageLauncher(allocator, yarnpkg_cmd, "yarn")) {
+        .package_js => |js_path| allocator.free(js_path),
+        else => return error.ExpectedPackageJs,
+    }
+
+    const pnpm_cmd = try std.fs.path.join(allocator, &.{ root, "pnpm.cmd" });
+    defer allocator.free(pnpm_cmd);
+    switch (try classifyPackageLauncher(allocator, pnpm_cmd, "pnpm")) {
+        .package_js => |js_path| allocator.free(js_path),
+        else => return error.ExpectedPackageJs,
+    }
+
+    const corepack_cmd = try std.fs.path.join(allocator, &.{ root, "yarn-corepack.cmd" });
+    defer allocator.free(corepack_cmd);
+    switch (try classifyPackageLauncher(allocator, corepack_cmd, "yarn")) {
+        .corepack_trampoline => {},
+        else => return error.ExpectedCorepackTrampoline,
+    }
+
+    const escape_cmd = try std.fs.path.join(allocator, &.{ root, "yarn-escape.cmd" });
+    defer allocator.free(escape_cmd);
+    switch (try classifyPackageLauncher(allocator, escape_cmd, "yarn")) {
+        .reject => {},
+        .package_js => |js_path| {
+            allocator.free(js_path);
+            return error.ExpectedReject;
+        },
+        else => return error.ExpectedReject,
+    }
+
+    const absolute_cmd = try std.fs.path.join(allocator, &.{ root, "yarn-absolute.cmd" });
+    defer allocator.free(absolute_cmd);
+    switch (try classifyPackageLauncher(allocator, absolute_cmd, "yarn")) {
+        .reject => {},
+        .package_js => |js_path| {
+            allocator.free(js_path);
+            return error.ExpectedReject;
+        },
+        else => return error.ExpectedReject,
+    }
+}
+
+test "version directory corepack trampoline does not use another yarn.js" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("node\\node_modules\\corepack\\dist");
+    try tmp.dir.makePath("node\\node_modules\\yarn\\bin");
+    try tmp.dir.writeFile(.{ .sub_path = "node\\node_modules\\corepack\\dist\\corepack.js", .data = "corepack\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "node\\node_modules\\yarn\\bin\\yarn.js", .data = "yarn\n" });
+    try tmp.dir.writeFile(.{
+        .sub_path = "node\\yarn.cmd",
+        .data = "@ECHO off\r\nnode \"%~dp0%\\node_modules\\corepack\\dist\\corepack.js\" yarn %*\r\n",
+    });
+
+    const version = try tmp.dir.realpathAlloc(allocator, "node");
+    defer allocator.free(version);
+    const resolved = try resolveCorepackBackedCommand(allocator, version, "yarn");
+    defer allocator.free(resolved);
+    try std.testing.expect(std.ascii.endsWithIgnoreCase(resolved, "corepack.js"));
 }
