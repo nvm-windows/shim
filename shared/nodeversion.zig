@@ -20,6 +20,7 @@ const reg_value_access_token = config.reg_value_access_token;
 const reg_value_last_license_verified_at = config.reg_value_last_license_verified_at;
 const reg_value_air_gapped = config.reg_value_air_gapped;
 const reg_value_enforce_permission_model = config.reg_value_enforce_permission_model;
+const reg_value_permission_grant_audit = config.reg_value_permission_grant_audit;
 const reg_value_freeze_v8_global_objects = config.reg_value_freeze_v8_global_objects;
 const reg_value_disable_eval_and_string_execution = config.reg_value_disable_eval_and_string_execution;
 const reg_value_package_manager_mismatch_action = config.reg_value_package_manager_mismatch_action;
@@ -50,6 +51,7 @@ pub const ShimConfig = struct {
     log_executions: bool,
     structured_logging: bool,
     enforce_permission_model: bool,
+    permission_grant_audit: bool,
     freeze_v8_global_objects: bool,
     disable_eval_and_string_execution: bool,
     package_manager_mismatch_action: PackageManagerMismatchAction,
@@ -145,6 +147,7 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
     const log_executions = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_log_executions)) orelse 0;
     const structured_logging = allowsStructuredLogging(allocator, config_hives);
     const enforce_permission_model = try loadPolicyOrPrefBool(config_hives, reg_value_enforce_permission_model);
+    const permission_grant_audit = try loadPolicyOrPrefBool(config_hives, reg_value_permission_grant_audit);
     const freeze_v8_global_objects = try loadPolicyOrPrefBool(config_hives, reg_value_freeze_v8_global_objects);
     const disable_eval_and_string_execution = try loadPolicyOrPrefBool(config_hives, reg_value_disable_eval_and_string_execution);
     const npm_registry_fallback = try loadFirstConfiguredRegistryValue(allocator, config_hives, reg_path, reg_value_npm_mirror);
@@ -181,6 +184,7 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
         .log_executions = log_executions != 0,
         .structured_logging = structured_logging,
         .enforce_permission_model = enforce_permission_model,
+        .permission_grant_audit = permission_grant_audit,
         .freeze_v8_global_objects = freeze_v8_global_objects,
         .disable_eval_and_string_execution = disable_eval_and_string_execution,
         .package_manager_mismatch_action = package_manager_mismatch_action,
@@ -394,6 +398,21 @@ fn loadPolicyOrPrefBool(config_hives: []const windows.HKEY, value_name: []const 
         return value != 0;
     }
     return false;
+}
+
+pub fn loadPolicyOrPrefMulti(allocator: std.mem.Allocator, value_name: []const u8) ![]const []const u8 {
+    if (try registry.queryMultiStringOptionalWithFallback(allocator, &policy_hives, policy_path, value_name)) |value| {
+        return value;
+    }
+    if (try registry.queryMultiStringOptionalWithFallback(allocator, registry.preferenceHives(), reg_path, value_name)) |value| {
+        return value;
+    }
+    return allocator.alloc([]const u8, 0);
+}
+
+pub fn freeMulti(allocator: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| allocator.free(value);
+    allocator.free(values);
 }
 
 /// Returns installs/vX for the configured active version, or null when unset/missing.
@@ -1227,6 +1246,7 @@ fn testShimConfig(auto_install: bool) ShimConfig {
         .log_executions = false,
         .structured_logging = false,
         .enforce_permission_model = false,
+        .permission_grant_audit = false,
         .freeze_v8_global_objects = false,
         .disable_eval_and_string_execution = false,
         .package_manager_mismatch_action = .ignore,
