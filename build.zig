@@ -113,6 +113,16 @@ pub fn build(b: *std.Build) void {
     const run_nodeversion_tests = b.addRunArtifact(nodeversion_tests);
     test_step.dependOn(&run_nodeversion_tests.step);
 
+    const permission_grants_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("shared/permission_grants.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_permission_grants_tests = b.addRunArtifact(permission_grants_tests);
+    test_step.dependOn(&run_permission_grants_tests.step);
+
     const install_safety_module = b.createModule(.{
         .root_source_file = b.path(install_safety_path),
         .target = target,
@@ -162,6 +172,14 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }));
         exe.root_module.linkSystemLibrary("kernel32", .{});
+    }
+
+    if (std.mem.eql(u8, app, "node")) {
+        exe.root_module.addImport("permission_grants", b.createModule(.{
+            .root_source_file = b.path("shared/permission_grants.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
     }
 
     if (std.mem.eql(u8, app, "node") or std.mem.eql(u8, app, "proxy")) {

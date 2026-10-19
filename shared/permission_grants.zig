@@ -1,0 +1,150 @@
+const std = @import("std");
+
+pub const Filtered = struct {
+    forwarded: []const []const u8,
+    owns_forwarded: bool,
+    dropped: []const []const u8,
+    defaults: []const []const u8,
+
+    pub fn deinit(self: Filtered, allocator: std.mem.Allocator) void {
+        if (self.owns_forwarded) allocator.free(self.forwarded);
+        allocator.free(self.dropped);
+        allocator.free(self.defaults);
+    }
+};
+
+pub fn isAllowFlag(arg: []const u8) bool {
+    return std.mem.startsWith(u8, arg, "--allow-");
+}
+
+pub fn isCallerGrant(arg: []const u8) bool {
+    return isAllowFlag(arg) or
+        std.mem.eql(u8, arg, "--permission") or
+        std.mem.eql(u8, arg, "--experimental-permission") or
+        std.mem.eql(u8, arg, "--permission-audit") or
+        std.mem.startsWith(u8, arg, "--permission=") or
+        std.mem.startsWith(u8, arg, "--experimental-permission=");
+}
+
+fn listed(allow: []const []const u8, arg: []const u8) bool {
+    for (allow) |item| {
+        if (std.mem.eql(u8, std.mem.trim(u8, item, " \t\r\n"), arg)) return true;
+    }
+    return false;
+}
+
+fn hasExact(args: []const []const u8, flag: []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, flag)) return true;
+    }
+    return false;
+}
+
+fn isSeparateValue(arg: []const u8) bool {
+    return arg.len > 0 and arg[0] != '-';
+}
+
+/// An empty allow list leaves caller arguments unchanged.
+/// Default grants are appended by the caller after the permission flag. Entries the caller already passed are omitted.
+pub fn apply(allocator: std.mem.Allocator, forwarded: []const []const u8, allow: []const []const u8, defaults: []const []const u8) !Filtered {
+    var dropped = std.ArrayListUnmanaged([]const u8){};
+    errdefer dropped.deinit(allocator);
+    var kept = std.ArrayListUnmanaged([]const u8){};
+    errdefer kept.deinit(allocator);
+
+    const filtering = allow.len != 0;
+    var i: usize = 0;
+    while (i < forwarded.len) : (i += 1) {
+        const arg = forwarded[i];
+        if (filtering and isAllowFlag(arg) and !listed(allow, arg)) {
+            try dropped.append(allocator, arg);
+            if (std.mem.indexOfScalar(u8, arg, '=') == null and i + 1 < forwarded.len and isSeparateValue(forwarded[i + 1])) {
+                i += 1;
+                try dropped.append(allocator, forwarded[i]);
+            }
+            continue;
+        }
+        try kept.append(allocator, arg);
+    }
+
+    const kept_slice = if (filtering) try kept.toOwnedSlice(allocator) else blk: {
+        kept.deinit(allocator);
+        break :blk forwarded;
+    };
+    errdefer if (filtering) allocator.free(kept_slice);
+
+    var added = std.ArrayListUnmanaged([]const u8){};
+    errdefer added.deinit(allocator);
+    for (defaults) |raw| {
+        const item = std.mem.trim(u8, raw, " \t\r\n");
+        if (item.len == 0) continue;
+        if (hasExact(kept_slice, item) or hasExact(added.items, item)) continue;
+        try added.append(allocator, item);
+    }
+
+    return .{
+        .forwarded = kept_slice,
+        .owns_forwarded = filtering,
+        .dropped = try dropped.toOwnedSlice(allocator),
+        .defaults = try added.toOwnedSlice(allocator),
+    };
+}
+
+pub fn joinCallerGrants(allocator: std.mem.Allocator, forwarded: []const []const u8) ![]u8 {
+    var parts = std.ArrayListUnmanaged([]const u8){};
+    defer parts.deinit(allocator);
+    var i: usize = 0;
+    while (i < forwarded.len) : (i += 1) {
+        const arg = forwarded[i];
+        if (!isCallerGrant(arg)) continue;
+        try parts.append(allocator, arg);
+        if (isAllowFlag(arg) and std.mem.indexOfScalar(u8, arg, '=') == null and i + 1 < forwarded.len and isSeparateValue(forwarded[i + 1])) {
+            i += 1;
+            try parts.append(allocator, forwarded[i]);
+        }
+    }
+    if (parts.items.len == 0) return allocator.dupe(u8, "");
+    return std.mem.join(allocator, " ", parts.items);
+}
+
+test "empty allow list keeps caller grants" {
+    const filtered = try apply(std.testing.allocator, &.{ "--allow-fs-read=*", "app.js" }, &.{}, &.{ "--allow-fs-read=*" });
+    defer filtered.deinit(std.testing.allocator);
+    try std.testing.expect(!filtered.owns_forwarded);
+    try std.testing.expectEqual(@as(usize, 2), filtered.forwarded.len);
+    try std.testing.expectEqualStrings("--allow-fs-read=*", filtered.forwarded[0]);
+    try std.testing.expectEqual(@as(usize, 0), filtered.dropped.len);
+    try std.testing.expectEqual(@as(usize, 0), filtered.defaults.len);
+}
+
+test "allow list drops unknown grants and the split value" {
+    const allow = [_][]const u8{"--allow-fs-read=*"};
+    const filtered = try apply(std.testing.allocator, &.{ "--allow-fs-read=*", "--allow-fs-write", "*", "app.js" }, &allow, &.{});
+    defer filtered.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), filtered.forwarded.len);
+    try std.testing.expectEqualStrings("--allow-fs-read=*", filtered.forwarded[0]);
+    try std.testing.expectEqualStrings("app.js", filtered.forwarded[1]);
+    try std.testing.expectEqual(@as(usize, 2), filtered.dropped.len);
+    try std.testing.expectEqualStrings("--allow-fs-write", filtered.dropped[0]);
+    try std.testing.expectEqualStrings("*", filtered.dropped[1]);
+}
+
+test "default grants skip flags the caller already passed" {
+    const defaults = [_][]const u8{ "--allow-fs-read=*", "--allow-child-process", "  " };
+    const filtered = try apply(std.testing.allocator, &.{ "--allow-fs-read=*", "app.js" }, &.{}, &defaults);
+    defer filtered.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), filtered.defaults.len);
+    try std.testing.expectEqualStrings("--allow-child-process", filtered.defaults[0]);
+}
+
+test "joinCallerGrants names permission and allow flags" {
+    const text = try joinCallerGrants(std.testing.allocator, &.{ "app.js", "--permission", "--allow-fs-read", "*" });
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("--permission --allow-fs-read *", text);
+}
+
+test "joinCallerGrants is empty when the caller passed no grants" {
+    const text = try joinCallerGrants(std.testing.allocator, &.{"app.js"});
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("", text);
+}

@@ -3,6 +3,8 @@ const build_options = @import("build_options");
 const registry = @import("registry");
 const nodeversion = @import("nodeversion");
 const eventlog = @import("eventlog");
+const permission_grants = @import("permission_grants");
+const config = @import("config");
 const errors = @import("errors");
 const shimintegrity = @import("shimintegrity");
 const verifycache = @import("verifycache");
@@ -82,6 +84,10 @@ pub fn main() !void {
     var audit_ctx = eventlog.captureAuditContext(allocator);
     defer audit_ctx.deinit(allocator);
 
+    const launch_forwarded: []const []const u8 = if (parsed_args.forwarded.len == 0) &.{} else parsed_args.forwarded;
+    var permission_launch = try preparePermissionLaunch(allocator, cfg, resolved.resolved_version.?, launch_forwarded);
+    defer permission_launch.deinit(allocator);
+
     if (cfg.log_executions) {
         const requested_command = std.fs.path.stem(std.fs.path.basename(args[0]));
         const arguments = if (parsed_args.forwarded.len == 0)
@@ -93,20 +99,7 @@ pub fn main() !void {
         const working_directory = std.process.getCwdAlloc(allocator) catch try allocator.dupe(u8, "");
         defer allocator.free(working_directory);
 
-        eventlog.writeStructuredInfo(allocator, "node-shim", "nodejs.executed", .{
-            .RequestedCommand = requested_command,
-            .ResolvedPath = resolved.node_bin.?,
-            .NodeVersion = resolved.resolved_version.?,
-            .Arguments = arguments,
-            .WorkingDirectory = working_directory,
-            .user = audit_ctx.user,
-            .sid = audit_ctx.sid,
-            .hostname = audit_ctx.hostname,
-            .parent_process = audit_ctx.parent_process,
-            .parent_pid = audit_ctx.parent_pid,
-            .project_name = audit_ctx.project_name,
-            .project_path = audit_ctx.project_path,
-        });
+        writeNodeExecuted(allocator, audit_ctx, requested_command, resolved.node_bin.?, resolved.resolved_version.?, arguments, working_directory, permission_launch);
     }
 
     const verify_outcome = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, resolved.node_bin.?);
@@ -211,11 +204,11 @@ pub fn main() !void {
     }
 
     if (parsed_args.forwarded.len == 0) {
-        try runNode(allocator, resolved.node_bin.?, resolved.resolved_version.?, cfg, &.{}, true);
+        try runNode(allocator, resolved.node_bin.?, resolved.resolved_version.?, cfg, true, permission_launch);
         return;
     }
 
-    try runNode(allocator, resolved.node_bin.?, resolved.resolved_version.?, cfg, parsed_args.forwarded, false);
+    try runNode(allocator, resolved.node_bin.?, resolved.resolved_version.?, cfg, false, permission_launch);
 }
 
 fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs {
@@ -316,12 +309,14 @@ fn collectSecurityFlags(
     version: []const u8,
     cfg: nodeversion.ShimConfig,
     forwarded: []const []const u8,
+    default_grants: []const []const u8,
 ) ![]const []const u8 {
     var flags = std.ArrayListUnmanaged([]const u8){};
     errdefer flags.deinit(allocator);
 
     if (permissionFlag(version, cfg.enforce_permission_model, forwarded)) |flag| {
         try flags.append(allocator, flag);
+        for (default_grants) |grant| try flags.append(allocator, grant);
     }
 
     // --frozen-intrinsics added in Node.js v11.12.0
@@ -342,13 +337,133 @@ fn collectSecurityFlags(
     return try flags.toOwnedSlice(allocator);
 }
 
+const PermissionLaunch = struct {
+    filtered: permission_grants.Filtered,
+    applied_filter: bool,
+    default_values: []const []const u8,
+    allow_values: []const []const u8,
+    loaded: bool,
+    supplied: []u8,
+    applied: []u8,
+    removed: []u8,
+
+    fn deinit(self: PermissionLaunch, allocator: std.mem.Allocator) void {
+        if (self.applied_filter) self.filtered.deinit(allocator);
+        if (self.loaded) {
+            nodeversion.freeMulti(allocator, self.default_values);
+            nodeversion.freeMulti(allocator, self.allow_values);
+        }
+        allocator.free(self.supplied);
+        allocator.free(self.applied);
+        allocator.free(self.removed);
+    }
+
+    fn active(self: PermissionLaunch) bool {
+        return self.supplied.len != 0 or self.applied.len != 0 or self.removed.len != 0;
+    }
+};
+
+fn preparePermissionLaunch(
+    allocator: std.mem.Allocator,
+    cfg: nodeversion.ShimConfig,
+    version: []const u8,
+    forwarded: []const []const u8,
+) !PermissionLaunch {
+    const supplied = try permission_grants.joinCallerGrants(allocator, forwarded);
+    errdefer allocator.free(supplied);
+    const injected = permissionFlag(version, cfg.enforce_permission_model, forwarded);
+    var default_values: []const []const u8 = &.{};
+    var allow_values: []const []const u8 = &.{};
+    var loaded_defaults = false;
+    var loaded_allow = false;
+    var filtered = permission_grants.Filtered{
+        .forwarded = forwarded,
+        .owns_forwarded = false,
+        .dropped = &.{},
+        .defaults = &.{},
+    };
+    var applied_filter = false;
+    errdefer if (loaded_defaults) nodeversion.freeMulti(allocator, default_values);
+    errdefer if (loaded_allow) nodeversion.freeMulti(allocator, allow_values);
+    errdefer if (applied_filter) filtered.deinit(allocator);
+    if (injected != null) {
+        default_values = try nodeversion.loadPolicyOrPrefMulti(allocator, config.reg_value_default_permission_grants);
+        loaded_defaults = true;
+        allow_values = try nodeversion.loadPolicyOrPrefMulti(allocator, config.reg_value_allowed_permission_grants);
+        loaded_allow = true;
+        filtered = try permission_grants.apply(allocator, forwarded, allow_values, default_values);
+        applied_filter = true;
+    }
+    const applied = try std.mem.join(allocator, " ", filtered.defaults);
+    errdefer allocator.free(applied);
+    const removed = try std.mem.join(allocator, " ", filtered.dropped);
+    return .{
+        .filtered = filtered,
+        .applied_filter = applied_filter,
+        .default_values = default_values,
+        .allow_values = allow_values,
+        .loaded = loaded_defaults and loaded_allow,
+        .supplied = supplied,
+        .applied = applied,
+        .removed = removed,
+    };
+}
+
+fn writeNodeExecuted(
+    allocator: std.mem.Allocator,
+    audit_ctx: eventlog.AuditContext,
+    requested_command: []const u8,
+    resolved_path: []const u8,
+    node_version: []const u8,
+    arguments: []const u8,
+    working_directory: []const u8,
+    launch: PermissionLaunch,
+) void {
+    if (!launch.active()) {
+        eventlog.writeStructuredInfo(allocator, "node-shim", "nodejs.executed", .{
+            .RequestedCommand = requested_command,
+            .ResolvedPath = resolved_path,
+            .NodeVersion = node_version,
+            .Arguments = arguments,
+            .WorkingDirectory = working_directory,
+            .user = audit_ctx.user,
+            .sid = audit_ctx.sid,
+            .hostname = audit_ctx.hostname,
+            .parent_process = audit_ctx.parent_process,
+            .parent_pid = audit_ctx.parent_pid,
+            .project_name = audit_ctx.project_name,
+            .project_path = audit_ctx.project_path,
+        });
+        return;
+    }
+    eventlog.writeStructuredInfo(allocator, "node-shim", "nodejs.executed", .{
+        .RequestedCommand = requested_command,
+        .ResolvedPath = resolved_path,
+        .NodeVersion = node_version,
+        .Arguments = arguments,
+        .WorkingDirectory = working_directory,
+        .permission_allow = .{
+            .supplied = launch.supplied,
+            .applied = launch.applied,
+            .removed = launch.removed,
+        },
+        .user = audit_ctx.user,
+        .sid = audit_ctx.sid,
+        .hostname = audit_ctx.hostname,
+        .parent_process = audit_ctx.parent_process,
+        .parent_pid = audit_ctx.parent_pid,
+        .project_name = audit_ctx.project_name,
+        .project_path = audit_ctx.project_path,
+    });
+}
+
 fn runNode(
     allocator: std.mem.Allocator,
     node_bin: []const u8,
     version: []const u8,
     cfg: nodeversion.ShimConfig,
-    forwarded: []const []const u8,
     force_repl_console: bool,
+    launch: PermissionLaunch,
 ) !void {
     const node_dir = std.fs.path.dirname(node_bin) orelse ".";
 
@@ -361,8 +476,10 @@ fn runNode(
 
     try env_map.put("PATH", child_path);
 
-    const security_forwarded = if (force_repl_console) &.{} else forwarded;
-    const security_flags = try collectSecurityFlags(allocator, version, cfg, security_forwarded);
+    if (cfg.permission_grant_audit or cfg.enforce_permission_model) {
+        logPermissionGrants(allocator, cfg, launch) catch {};
+    }
+    const security_flags = try collectSecurityFlags(allocator, version, cfg, launch.filtered.forwarded, launch.filtered.defaults);
     defer allocator.free(security_flags);
     const extra = security_flags.len;
 
@@ -384,13 +501,13 @@ fn runNode(
         return;
     }
 
-    var argv = try allocator.alloc([]const u8, forwarded.len + 1 + extra);
+    var argv = try allocator.alloc([]const u8, launch.filtered.forwarded.len + 1 + extra);
     defer allocator.free(argv);
     argv[0] = node_bin;
     for (security_flags, 0..) |f, i| {
         argv[1 + i] = f;
     }
-    for (forwarded, 0..) |a, i| {
+    for (launch.filtered.forwarded, 0..) |a, i| {
         argv[1 + extra + i] = a;
     }
 
@@ -401,6 +518,37 @@ fn runNode(
     child.env_map = &env_map;
 
     try waitAndExit(&child);
+}
+
+fn logPermissionGrants(
+    allocator: std.mem.Allocator,
+    cfg: nodeversion.ShimConfig,
+    launch: PermissionLaunch,
+) !void {
+    if (!launch.active()) return;
+    const plaintext = try std.fmt.allocPrint(
+        allocator,
+        "nodejs.permission_grants supplied {s} applied {s} removed {s}",
+        .{ launch.supplied, launch.applied, launch.removed },
+    );
+    defer allocator.free(plaintext);
+
+    var audit_ctx = eventlog.captureAuditContext(allocator);
+    defer audit_ctx.deinit(allocator);
+    eventlog.writeLicensedSecurityInfo(allocator, cfg.structured_logging, "node-shim", "nodejs.permission_grants", .{
+        .permission_allow = .{
+            .supplied = launch.supplied,
+            .applied = launch.applied,
+            .removed = launch.removed,
+        },
+        .user = audit_ctx.user,
+        .sid = audit_ctx.sid,
+        .hostname = audit_ctx.hostname,
+        .parent_process = audit_ctx.parent_process,
+        .parent_pid = audit_ctx.parent_pid,
+        .project_name = audit_ctx.project_name,
+        .project_path = audit_ctx.project_path,
+    }, plaintext, 0);
 }
 
 fn waitAndExit(child: *std.process.Child) !void {
