@@ -202,6 +202,17 @@ pub fn build(b: *std.Build) void {
         module_firewall_module.addImport("config", config_module);
         module_firewall_module.addImport("registry", registry_module);
         exe.root_module.addImport("module_firewall", module_firewall_module);
+        const malware_module = b.createModule(.{
+            .root_source_file = b.path("shared/malware.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        exe.root_module.addImport("malware", malware_module);
+        const malware_tests = b.addTest(.{
+            .root_module = malware_module,
+        });
+        const run_malware_tests = b.addRunArtifact(malware_tests);
+        test_step.dependOn(&run_malware_tests.step);
         exe.root_module.addImport("cmd_spawn", cmd_spawn_module);
         const module_firewall_tests = b.addTest(.{
             .root_module = module_firewall_module,

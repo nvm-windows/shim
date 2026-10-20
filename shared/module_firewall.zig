@@ -168,6 +168,26 @@ pub fn isPackageAllowed(pkg: PackageSpec, rules: []const []const u8) ?bool {
     return true;
 }
 
+/// True only for an explicit local grant. Empty lists, ALL, NOT ALL, and the
+/// bundled package-manager names do not count.
+pub fn explicitModuleGrant(pkg: PackageSpec, rules: []const []const u8) bool {
+    const bundled = [_][]const u8{ "npm", "npx", "yarn", "yarnpkg", "corepack", "pnpm" };
+    for (rules) |raw| {
+        const e = trimAscii(raw);
+        if (startsWithIgnoreCase(e, "https://")) continue;
+        const norm = normalizeRule(raw);
+        if (norm.negated or norm.entry.len == 0) continue;
+        if (eqlIgnoreCase(norm.entry, "all")) continue;
+        var skip = false;
+        for (bundled) |name| {
+            if (eqlIgnoreCase(norm.entry, name)) skip = true;
+        }
+        if (skip) continue;
+        if (ruleMatches(norm.entry, pkg)) return true;
+    }
+    return false;
+}
+
 fn pathHasPrefixIgnoreCase(path: []const u8, prefix: []const u8) bool {
     if (prefix.len == 0 or path.len < prefix.len) return false;
     if (!std.ascii.eqlIgnoreCase(path[0..prefix.len], prefix)) return false;
@@ -464,7 +484,7 @@ fn lockPackageNameFromKey(key: []const u8) []const u8 {
     return trimAscii(std.mem.trim(u8, k, "/\\"));
 }
 
-fn parseLockPackagesFromContent(allocator: std.mem.Allocator, content: []const u8) ![]PackageSpec {
+pub fn parseLockPackagesFromContent(allocator: std.mem.Allocator, content: []const u8) ![]PackageSpec {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
     defer parsed.deinit();
     const root = switch (parsed.value) {
@@ -723,7 +743,7 @@ fn parseYarnLockContent(allocator: std.mem.Allocator, content: []const u8) ![]Pa
     return try list.toOwnedSlice(allocator);
 }
 
-fn loadLockPackagesBesidePackageJson(allocator: std.mem.Allocator, package_json_path: []const u8, command_name: []const u8) ![]PackageSpec {
+pub fn loadLockPackagesBesidePackageJson(allocator: std.mem.Allocator, package_json_path: []const u8, command_name: []const u8) ![]PackageSpec {
     const dir = std.fs.path.dirname(package_json_path) orelse return error.InvalidPath;
     const lock_names = lockfileCandidates(command_name);
     for (lock_names) |lock_name| {
