@@ -11,6 +11,7 @@ const module_firewall = @import("module_firewall");
 const config = @import("config");
 const registry = @import("registry");
 const cmd_spawn = @import("cmd_spawn");
+const malware_scan = @import("malware_scan.zig");
 
 const ParsedArgs = struct {
     override_version: ?[]const u8,
@@ -259,6 +260,26 @@ pub fn main() !void {
 
     try enforceDelegatedCommandTrust(allocator, cfg, command_name, command_path, resolved.node_bin.?, resolved.resolved_version.?, node_install_dir_abs);
 
+    var bare_install = false;
+    const pm_ctx = PmCtx{
+        .allocator = allocator,
+        .node_install_dir = node_install_dir_abs,
+        .node_bin = resolved.node_bin.?,
+        .command_name = command_name,
+        .command_path = command_path,
+        .npm_module_minimum_age = cfg.npm_module_minimum_age,
+        .npm_registry_fallback = cfg.npm_registry_fallback,
+    };
+    try malware_scan.enforce(
+        allocator,
+        cfg.structured_logging,
+        command_name,
+        parsed_args.forwarded,
+        cfg.root,
+        .{ .ctx = @ptrCast(@constCast(&pm_ctx)), .run = runPm },
+        &bare_install,
+    );
+
     try enforceModuleFirewall(allocator, cfg.structured_logging, command_name, parsed_args.forwarded);
 
     const needs_reshim = detectReshimNeeded(command_name, parsed_args.forwarded);
@@ -292,6 +313,7 @@ pub fn main() !void {
         }, 0);
     }
 
+    const forwarded = if (bare_install) dropPackageArgs(allocator, parsed_args.forwarded) else parsed_args.forwarded;
     const process_exit_code = runDelegatedCommand(
         allocator,
         node_install_dir_abs,
@@ -300,7 +322,7 @@ pub fn main() !void {
         command_path,
         cfg.npm_module_minimum_age,
         cfg.npm_registry_fallback,
-        parsed_args.forwarded,
+        forwarded,
     ) catch |err| blk: {
         std.debug.print("proxy failed to run {s}: {s}\n", .{ command_name, @errorName(err) });
         break :blk 1;
@@ -1097,6 +1119,43 @@ fn reportDelegatedTrustFailure(
         \\
     , .{ command_name, command_path, detail, command_name });
     std.process.exit(1);
+}
+
+const PmCtx = struct {
+    allocator: std.mem.Allocator,
+    node_install_dir: []const u8,
+    node_bin: []const u8,
+    command_name: []const u8,
+    command_path: []const u8,
+    npm_module_minimum_age: ?u64,
+    npm_registry_fallback: ?[]const u8,
+};
+
+fn runPm(ctx: *anyopaque, args: []const []const u8) u8 {
+    const pm: *PmCtx = @ptrCast(@alignCast(ctx));
+    return runDelegatedCommand(
+        pm.allocator,
+        pm.node_install_dir,
+        pm.node_bin,
+        pm.command_name,
+        pm.command_path,
+        pm.npm_module_minimum_age,
+        pm.npm_registry_fallback,
+        args,
+    ) catch 1;
+}
+
+fn dropPackageArgs(allocator: std.mem.Allocator, args: []const []const u8) []const []const u8 {
+    var out = std.ArrayListUnmanaged([]const u8){};
+    for (args) |arg| {
+        if (arg.len == 0) continue;
+        if (arg[0] == '-') {
+            out.append(allocator, arg) catch return args;
+            continue;
+        }
+        if (out.items.len == 0) out.append(allocator, arg) catch return args;
+    }
+    return out.toOwnedSlice(allocator) catch args;
 }
 
 fn runDelegatedCommand(
