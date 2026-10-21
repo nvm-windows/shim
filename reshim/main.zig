@@ -7,6 +7,7 @@ const nodeversion = @import("nodeversion");
 const eventlog = @import("eventlog");
 const shimintegrity = @import("shimintegrity");
 const jobobject = @import("jobobject");
+const shim_bun = @import("shim_bun");
 
 const shim_version = build_options.version;
 
@@ -726,6 +727,10 @@ fn appendDefaultPackageManagerShims(
     try appendUniqueCommandName(allocator, dedupe, names, "pnpm");
     try appendUniqueCommandName(allocator, dedupe, names, "yarn");
     try appendUniqueCommandName(allocator, dedupe, names, "yarnpkg");
+    if (shim_bun.enabled(build_options.certified)) {
+        try appendUniqueCommandName(allocator, dedupe, names, "bun");
+        try appendUniqueCommandName(allocator, dedupe, names, "bunx");
+    }
 }
 
 fn collectCmdNamesFromCommandDirectory(

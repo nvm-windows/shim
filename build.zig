@@ -78,6 +78,14 @@ pub fn build(b: *std.Build) void {
     });
     shimintegrity_module.addImport("nodeversion", nodeversion_module);
 
+    const shim_bun_module = b.createModule(.{
+        .root_source_file = b.path("shared/shim_bun.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    shim_bun_module.addImport("config", config_module);
+    shim_bun_module.addImport("registry", registry_module);
+
     const wintrust_module = b.createModule(.{
         .root_source_file = b.path(wintrust_path),
         .target = target,
@@ -171,7 +179,9 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }));
+        exe.root_module.addImport("shim_bun", shim_bun_module);
         exe.root_module.linkSystemLibrary("kernel32", .{});
+        exe.root_module.linkSystemLibrary("advapi32", .{});
     }
 
     if (std.mem.eql(u8, app, "node")) {
@@ -214,12 +224,26 @@ pub fn build(b: *std.Build) void {
         const run_malware_tests = b.addRunArtifact(malware_tests);
         test_step.dependOn(&run_malware_tests.step);
         exe.root_module.addImport("cmd_spawn", cmd_spawn_module);
+        exe.root_module.addImport("shim_bun", shim_bun_module);
         const module_firewall_tests = b.addTest(.{
             .root_module = module_firewall_module,
         });
         module_firewall_tests.root_module.linkSystemLibrary("advapi32", .{});
         const run_module_firewall_tests = b.addRunArtifact(module_firewall_tests);
         test_step.dependOn(&run_module_firewall_tests.step);
+
+        const shim_bun_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("shared/shim_bun.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        shim_bun_tests.root_module.addImport("config", config_module);
+        shim_bun_tests.root_module.addImport("registry", registry_module);
+        shim_bun_tests.root_module.linkSystemLibrary("advapi32", .{});
+        const run_shim_bun_tests = b.addRunArtifact(shim_bun_tests);
+        test_step.dependOn(&run_shim_bun_tests.step);
 
         const proxy_tests = b.addTest(.{
             .root_module = exe.root_module,

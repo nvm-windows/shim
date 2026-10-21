@@ -281,8 +281,125 @@ pub fn loadFirewallSkipLockfile(allocator: std.mem.Allocator) bool {
     return false;
 }
 
-fn skipCliFlag(arg: []const u8) bool {
-    return arg.len >= 1 and arg[0] == '-';
+const PackageFlag = union(enum) {
+    none,
+    next,
+    value: []const u8,
+};
+
+fn parsePackageFlag(arg: []const u8) PackageFlag {
+    if (eqlIgnoreCase(arg, "-p") or eqlIgnoreCase(arg, "--package")) return .next;
+    if (startsWithIgnoreCase(arg, "--package=")) return .{ .value = arg["--package=".len..] };
+    if (startsWithIgnoreCase(arg, "-p=")) return .{ .value = arg["-p=".len..] };
+    return .none;
+}
+
+fn flagTakesValue(arg: []const u8) bool {
+    const flags = [_][]const u8{
+        "--prefix", "--workspace", "-w", "--omit", "--include", "--tag", "--registry",
+        "-c", "--call", "--shell", "--filter", "--dir", "--folder", "-C",
+        "--cwd", "--config",
+    };
+    for (flags) |flag| {
+        if (eqlIgnoreCase(arg, flag)) return true;
+    }
+    return false;
+}
+
+fn isNpmInstallSub(sub: []const u8) bool {
+    const names = [_][]const u8{
+        "install", "i", "add", "in", "ins", "inst", "insta", "instal", "isnt", "isntal", "isntall",
+        "exec", "ci", "create", "init",
+    };
+    for (names) |name| {
+        if (eqlIgnoreCase(sub, name)) return true;
+    }
+    return false;
+}
+
+fn firstSubcommand(args: []const []const u8) []const u8 {
+    var skip_next = false;
+    for (args) |arg| {
+        if (skip_next) {
+            skip_next = false;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--")) return "";
+        switch (parsePackageFlag(arg)) {
+            .next => {
+                skip_next = true;
+                continue;
+            },
+            .value => continue,
+            .none => {},
+        }
+        if (arg.len >= 1 and arg[0] == '-') {
+            if (flagTakesValue(arg)) skip_next = true;
+            continue;
+        }
+        return arg;
+    }
+    return "";
+}
+
+pub fn commandInstallLike(command_name: []const u8, args: []const []const u8) bool {
+    if (eqlIgnoreCase(command_name, "npx") or eqlIgnoreCase(command_name, "bunx")) return true;
+    if ((eqlIgnoreCase(command_name, "yarn") or eqlIgnoreCase(command_name, "yarnpkg")) and args.len == 0) return true;
+    const sub = firstSubcommand(args);
+    if (sub.len == 0) return false;
+    if (eqlIgnoreCase(command_name, "npm")) return isNpmInstallSub(sub);
+    if (eqlIgnoreCase(command_name, "pnpm") or eqlIgnoreCase(command_name, "vlt")) {
+        return eqlIgnoreCase(sub, "install") or eqlIgnoreCase(sub, "i") or eqlIgnoreCase(sub, "add") or
+            eqlIgnoreCase(sub, "exec") or eqlIgnoreCase(sub, "dlx") or eqlIgnoreCase(sub, "ci") or
+            eqlIgnoreCase(sub, "create");
+    }
+    if (eqlIgnoreCase(command_name, "yarn") or eqlIgnoreCase(command_name, "yarnpkg")) {
+        return eqlIgnoreCase(sub, "add") or eqlIgnoreCase(sub, "install") or eqlIgnoreCase(sub, "global") or
+            eqlIgnoreCase(sub, "dlx") or eqlIgnoreCase(sub, "create") or eqlIgnoreCase(sub, "ci");
+    }
+    if (eqlIgnoreCase(command_name, "bun")) {
+        return eqlIgnoreCase(sub, "install") or eqlIgnoreCase(sub, "i") or eqlIgnoreCase(sub, "add") or
+            eqlIgnoreCase(sub, "x") or eqlIgnoreCase(sub, "create") or eqlIgnoreCase(sub, "update");
+    }
+    return false;
+}
+
+fn isExecLike(command_name: []const u8, sub: []const u8) bool {
+    if (eqlIgnoreCase(command_name, "npx") or eqlIgnoreCase(command_name, "bunx")) return true;
+    if (eqlIgnoreCase(command_name, "npm")) {
+        return eqlIgnoreCase(sub, "exec") or eqlIgnoreCase(sub, "create") or eqlIgnoreCase(sub, "init");
+    }
+    if (eqlIgnoreCase(command_name, "pnpm") or eqlIgnoreCase(command_name, "vlt")) {
+        return eqlIgnoreCase(sub, "exec") or eqlIgnoreCase(sub, "dlx") or eqlIgnoreCase(sub, "create");
+    }
+    if (eqlIgnoreCase(command_name, "yarn") or eqlIgnoreCase(command_name, "yarnpkg")) {
+        return eqlIgnoreCase(sub, "dlx") or eqlIgnoreCase(sub, "create");
+    }
+    if (eqlIgnoreCase(command_name, "bun")) {
+        return eqlIgnoreCase(sub, "x") or eqlIgnoreCase(sub, "create");
+    }
+    return false;
+}
+
+fn mapCreateStarter(allocator: std.mem.Allocator, starter: []const u8) ![]u8 {
+    const nv = splitNameVersion(starter);
+    var mapped: []const u8 = nv.name;
+    var owned: ?[]u8 = null;
+    if (nv.name.len > 0 and nv.name[0] == '@') {
+        if (std.mem.lastIndexOfScalar(u8, nv.name, '/')) |slash| {
+            const pkg = nv.name[slash + 1 ..];
+            if (!std.mem.startsWith(u8, pkg, "create-")) {
+                owned = try std.fmt.allocPrint(allocator, "{s}/create-{s}", .{ nv.name[0..slash], pkg });
+                mapped = owned.?;
+            }
+        }
+    } else if (!std.mem.startsWith(u8, nv.name, "create-")) {
+        owned = try std.fmt.allocPrint(allocator, "create-{s}", .{nv.name});
+        mapped = owned.?;
+    }
+    defer if (owned) |buf| allocator.free(buf);
+    if (nv.version.len == 0) return allocator.dupe(u8, mapped);
+    return std.fmt.allocPrint(allocator, "{s}@{s}", .{ mapped, nv.version });
 }
 
 fn appendOwnedSpec(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(PackageSpec), name: []const u8, version: []const u8) !void {
@@ -431,8 +548,54 @@ fn manifestExpandable(command_name: []const u8, args: []const []const u8) bool {
     return false;
 }
 
-/// Package positional tokens from install-like argv (owned PackageSpec slices).
+/// Package tokens from install/exec argv (owned PackageSpec slices).
 pub fn collectPackageTokensFromArgs(allocator: std.mem.Allocator, command_name: []const u8, args: []const []const u8) ![]PackageSpec {
+    var from_flags = std.ArrayListUnmanaged([]const u8){};
+    defer from_flags.deinit(allocator);
+    var positionals = std.ArrayListUnmanaged([]const u8){};
+    defer positionals.deinit(allocator);
+
+    var skip_next = false;
+    for (args, 0..) |arg, idx| {
+        if (skip_next) {
+            skip_next = false;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--")) break;
+        switch (parsePackageFlag(arg)) {
+            .next => {
+                if (idx + 1 < args.len) {
+                    try from_flags.append(allocator, args[idx + 1]);
+                    skip_next = true;
+                }
+                continue;
+            },
+            .value => |value| {
+                if (value.len > 0) try from_flags.append(allocator, value);
+                continue;
+            },
+            .none => {},
+        }
+        if (arg.len >= 1 and arg[0] == '-') {
+            if (flagTakesValue(arg)) skip_next = true;
+            continue;
+        }
+        try positionals.append(allocator, arg);
+    }
+
+    var sub: []const u8 = "";
+    var rest: []const []const u8 = positionals.items;
+    if (!eqlIgnoreCase(command_name, "npx") and !eqlIgnoreCase(command_name, "bunx") and rest.len > 0) {
+        sub = rest[0];
+        rest = rest[1..];
+        if ((eqlIgnoreCase(command_name, "yarn") or eqlIgnoreCase(command_name, "yarnpkg")) and
+            eqlIgnoreCase(sub, "global") and rest.len > 0)
+        {
+            sub = rest[0];
+            rest = rest[1..];
+        }
+    }
+
     var list = std.ArrayListUnmanaged(PackageSpec){};
     errdefer {
         for (list.items) |pkg| {
@@ -442,22 +605,35 @@ pub fn collectPackageTokensFromArgs(allocator: std.mem.Allocator, command_name: 
         }
         list.deinit(allocator);
     }
-    var i: usize = 0;
-    if (eqlIgnoreCase(command_name, "npx")) {
-        // all positionals
-    } else if (args.len > 0) {
-        i = 1;
-        if (eqlIgnoreCase(command_name, "yarn") and eqlIgnoreCase(args[0], "global") and args.len > 1) {
-            i = 2;
+
+    if (isExecLike(command_name, sub)) {
+        if (from_flags.items.len > 0) {
+            for (from_flags.items) |raw| try appendToken(allocator, &list, raw);
+            return try list.toOwnedSlice(allocator);
         }
+        if (rest.len == 0) return try list.toOwnedSlice(allocator);
+        var first = rest[0];
+        var mapped: ?[]u8 = null;
+        defer if (mapped) |buf| allocator.free(buf);
+        if (eqlIgnoreCase(sub, "create") or eqlIgnoreCase(sub, "init")) {
+            mapped = try mapCreateStarter(allocator, first);
+            first = mapped.?;
+        }
+        try appendToken(allocator, &list, first);
+        return try list.toOwnedSlice(allocator);
     }
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (skipCliFlag(arg)) continue;
-        const nv = splitNameVersion(arg);
-        try appendOwnedSpec(allocator, &list, nv.name, nv.version);
-    }
+
+    for (from_flags.items) |raw| try appendToken(allocator, &list, raw);
+    for (rest) |raw| try appendToken(allocator, &list, raw);
     return try list.toOwnedSlice(allocator);
+}
+
+fn appendToken(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(PackageSpec), raw: []const u8) !void {
+    const trimmed = trimAscii(raw);
+    if (trimmed.len == 0) return;
+    const nv = splitNameVersion(trimmed);
+    if (nv.name.len == 0) return;
+    try appendOwnedSpec(allocator, list, nv.name, nv.version);
 }
 
 fn lockPackageNameFromKey(key: []const u8) []const u8 {
@@ -959,4 +1135,64 @@ test "productionOmit flags" {
     try std.testing.expect(productionOmit(&[_][]const u8{"install", "--production"}));
     try std.testing.expect(productionOmit(&[_][]const u8{"install", "--omit=dev"}));
     try std.testing.expect(!productionOmit(&[_][]const u8{"install", "--omit=optional"}));
+}
+
+fn expectPkgRaws(allocator: std.mem.Allocator, command_name: []const u8, args: []const []const u8, want: []const []const u8) !void {
+    const pkgs = try collectPackageTokensFromArgs(allocator, command_name, args);
+    defer freePackageSpecs(allocator, pkgs);
+    try std.testing.expectEqual(want.len, pkgs.len);
+    for (want, pkgs) |raw, pkg| {
+        try std.testing.expectEqualStrings(raw, pkg.raw);
+    }
+}
+
+test "collect npx package flags and first positional" {
+    const allocator = std.testing.allocator;
+    try expectPkgRaws(allocator, "npx", &.{ "-y", "evil" }, &.{"evil"});
+    try expectPkgRaws(allocator, "npx", &.{ "cowsay", "hello" }, &.{"cowsay"});
+    try expectPkgRaws(allocator, "npx", &.{ "--package=evil", "cowsay" }, &.{"evil"});
+    try expectPkgRaws(allocator, "npx", &.{ "-p", "evil", "cowsay", "hi" }, &.{"evil"});
+    try expectPkgRaws(allocator, "npx", &.{ "-p", "one", "--package", "two", "bin" }, &.{ "one", "two" });
+    try expectPkgRaws(allocator, "npx", &.{ "evil@1.2.3" }, &.{"evil@1.2.3"});
+}
+
+test "collect pnpm dlx exec and yarn create" {
+    const allocator = std.testing.allocator;
+    try expectPkgRaws(allocator, "pnpm", &.{ "dlx", "create-vite" }, &.{"create-vite"});
+    try expectPkgRaws(allocator, "pnpm", &.{ "--package=evil", "dlx", "cowsay" }, &.{"evil"});
+    try expectPkgRaws(allocator, "pnpm", &.{ "exec", "eslint", "--", "fix" }, &.{"eslint"});
+    try expectPkgRaws(allocator, "pnpm", &.{ "create", "vite" }, &.{"create-vite"});
+    try expectPkgRaws(allocator, "yarn", &.{ "dlx", "create-vite@latest" }, &.{"create-vite@latest"});
+    try expectPkgRaws(allocator, "yarn", &.{ "create", "vite" }, &.{"create-vite"});
+    try expectPkgRaws(allocator, "yarn", &.{ "create", "@scope/app" }, &.{"@scope/create-app"});
+    try expectPkgRaws(allocator, "npm", &.{ "exec", "--package=evil", "--", "cowsay" }, &.{"evil"});
+    try expectPkgRaws(allocator, "npm", &.{ "install", "-g", "eslint", "porthog" }, &.{ "eslint", "porthog" });
+}
+
+test "commandInstallLike skips leading flags" {
+    try std.testing.expect(commandInstallLike("npx", &.{ "-y", "evil" }));
+    try std.testing.expect(commandInstallLike("pnpm", &.{ "--silent", "dlx", "foo" }));
+    try std.testing.expect(commandInstallLike("pnpm", &.{ "--package=evil", "dlx", "cowsay" }));
+    try std.testing.expect(commandInstallLike("yarn", &.{ "create", "vite" }));
+    try std.testing.expect(commandInstallLike("npm", &.{ "--registry", "https://example.invalid", "install", "foo" }));
+    try std.testing.expect(!commandInstallLike("npm", &.{ "list" }));
+    try std.testing.expect(!commandInstallLike("pnpm", &.{ "run", "test" }));
+    try std.testing.expect(commandInstallLike("bunx", &.{ "cowsay" }));
+    try std.testing.expect(commandInstallLike("bun", &.{ "install", "left-pad" }));
+    try std.testing.expect(commandInstallLike("bun", &.{ "x", "cowsay" }));
+    try std.testing.expect(commandInstallLike("bun", &.{ "create", "vite" }));
+    try std.testing.expect(commandInstallLike("bun", &.{ "update" }));
+    try std.testing.expect(!commandInstallLike("bun", &.{ "test" }));
+    try std.testing.expect(!commandInstallLike("bun", &.{ "run", "dev" }));
+}
+
+test "collect bun and bunx package tokens" {
+    const allocator = std.testing.allocator;
+    try expectPkgRaws(allocator, "bunx", &.{ "cowsay", "hello" }, &.{"cowsay"});
+    try expectPkgRaws(allocator, "bunx", &.{ "--bun", "evil@1.0.0" }, &.{"evil@1.0.0"});
+    try expectPkgRaws(allocator, "bun", &.{ "x", "cowsay" }, &.{"cowsay"});
+    try expectPkgRaws(allocator, "bun", &.{ "install", "left-pad" }, &.{"left-pad"});
+    try expectPkgRaws(allocator, "bun", &.{ "add", "eslint@9" }, &.{"eslint@9"});
+    try expectPkgRaws(allocator, "bun", &.{ "create", "vite" }, &.{"create-vite"});
+    try expectPkgRaws(allocator, "bun", &.{ "--cwd", "C:\\tmp", "add", "left-pad" }, &.{"left-pad"});
 }
