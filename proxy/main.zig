@@ -471,20 +471,24 @@ const LauncherClass = union(enum) {
     reject,
 };
 
-/// yarn/yarnpkg/pnpm. A version-directory .exe still runs as the native binary.
-/// A .cmd is only a pointer: npm's global shim must point at node_modules\<pkg>\
-/// or it is ignored. A Corepack trampoline keeps the corepack.js launch and
-/// blocks the npm prefix so `corepack enable` wins for that Node version.
+/// yarn/yarnpkg/pnpm. A `{name}.exe` next to Node (or in the npm prefix /
+/// PNPM_HOME\bin for pnpm) is the native binary. Authenticode must match.
+/// Do not fall through to JS when that .exe exists.
+///
+/// If no `{name}.exe`, treat the npm global the same as other module CLIs:
+/// follow the `.cmd` into `node_modules\<pkg>\` (js/cjs/mjs or extensionless
+/// script). Corepack is last, and only when no module entry exists.
 /// npm, npx, and corepack do not come through here.
 fn resolveCorepackBackedCommand(allocator: std.mem.Allocator, node_install_dir: []const u8, command_name: []const u8) ![]u8 {
-    if (try resolveVersionDirExecutable(allocator, node_install_dir, command_name)) |exe| {
+    if (try resolveNativeCommandExe(allocator, node_install_dir, command_name)) |exe| {
         return exe;
     }
 
+    const package_name = npmGlobalPackageName(command_name);
     var skip_prefix = false;
     if (try findLauncherCmd(allocator, node_install_dir, command_name)) |cmd_path| {
         defer allocator.free(cmd_path);
-        switch (try classifyPackageLauncher(allocator, cmd_path, npmGlobalPackageName(command_name))) {
+        switch (try classifyPackageLauncher(allocator, cmd_path, package_name)) {
             .package_js => |js_path| return js_path,
             .corepack_trampoline => skip_prefix = true,
             .reject => {},
@@ -492,8 +496,14 @@ fn resolveCorepackBackedCommand(allocator: std.mem.Allocator, node_install_dir: 
     }
 
     if (!skip_prefix) {
+        if (try resolvePackageModuleEntry(allocator, node_install_dir, package_name, command_name)) |entry| {
+            return entry;
+        }
         if (try resolveNpmPrefixPackageJs(allocator, node_install_dir, command_name)) |js_path| {
             return js_path;
+        }
+        if (try resolveNpmPrefixModuleEntry(allocator, node_install_dir, command_name)) |entry| {
+            return entry;
         }
     }
 
@@ -520,6 +530,93 @@ fn resolveVersionDirExecutable(allocator: std.mem.Allocator, node_install_dir: [
         return null;
     };
     return full;
+}
+
+/// `{command}.exe` only. `.cmd`/`.ps1` stay off PATH; they are pointers, not the CLI.
+fn resolveNativeCommandExe(allocator: std.mem.Allocator, node_install_dir: []const u8, command_name: []const u8) !?[]u8 {
+    if (try resolveVersionDirExecutable(allocator, node_install_dir, command_name)) |exe| {
+        return exe;
+    }
+    if (try npmGlobalPrefix(allocator, node_install_dir)) |prefix| {
+        defer allocator.free(prefix);
+        const version_abs = std.fs.path.resolve(allocator, &.{node_install_dir}) catch null;
+        defer if (version_abs) |value| allocator.free(value);
+        const prefix_abs = std.fs.path.resolve(allocator, &.{prefix}) catch null;
+        defer if (prefix_abs) |value| allocator.free(value);
+        const same = if (version_abs) |v| if (prefix_abs) |p| pathsEqualAscii(v, p) else true else true;
+        if (!same) {
+            if (try resolveVersionDirExecutable(allocator, prefix_abs orelse prefix, command_name)) |exe| {
+                return exe;
+            }
+        }
+    }
+    if (std.ascii.eqlIgnoreCase(command_name, "pnpm")) {
+        if (try pnpmHomeExeDir(allocator)) |home| {
+            defer allocator.free(home);
+            if (try resolveVersionDirExecutable(allocator, home, command_name)) |exe| {
+                return exe;
+            }
+            const bin_dir = try std.fs.path.join(allocator, &.{ home, "bin" });
+            defer allocator.free(bin_dir);
+            if (try resolveVersionDirExecutable(allocator, bin_dir, command_name)) |exe| {
+                return exe;
+            }
+        }
+    }
+    return null;
+}
+
+fn pnpmHomeExeDir(allocator: std.mem.Allocator) !?[]u8 {
+    const home = std.process.getEnvVarOwned(allocator, "PNPM_HOME") catch return null;
+    if (home.len == 0) {
+        allocator.free(home);
+        return null;
+    }
+    return home;
+}
+
+fn resolvePackageModuleEntry(allocator: std.mem.Allocator, dir_path: []const u8, package_name: []const u8, command_name: []const u8) !?[]u8 {
+    for (packageModuleRelPaths(package_name, command_name)) |rel| {
+        const full = try std.fs.path.join(allocator, &.{ dir_path, "node_modules", rel });
+        errdefer allocator.free(full);
+        std.fs.cwd().access(full, .{}) catch {
+            allocator.free(full);
+            continue;
+        };
+        return full;
+    }
+    return null;
+}
+
+fn resolveNpmPrefixModuleEntry(allocator: std.mem.Allocator, node_install_dir: []const u8, command_name: []const u8) !?[]u8 {
+    const prefix = try npmGlobalPrefix(allocator, node_install_dir) orelse return null;
+    defer allocator.free(prefix);
+    const version_abs = std.fs.path.resolve(allocator, &.{node_install_dir}) catch return null;
+    defer allocator.free(version_abs);
+    const prefix_abs = std.fs.path.resolve(allocator, &.{prefix}) catch return null;
+    defer allocator.free(prefix_abs);
+    if (pathsEqualAscii(version_abs, prefix_abs)) return null;
+    return resolvePackageModuleEntry(allocator, prefix_abs, npmGlobalPackageName(command_name), command_name);
+}
+
+const pnpm_module_rel_paths = [_][]const u8{
+    "pnpm\\bin\\pnpm.mjs",
+    "pnpm\\bin\\pnpm.cjs",
+    "pnpm\\bin\\pnpm.js",
+    "pnpm\\pnpm",
+};
+
+const yarn_module_rel_paths = [_][]const u8{
+    "yarn\\bin\\yarn.js",
+    "yarn\\bin\\yarn.cjs",
+    "yarn\\bin\\yarn.mjs",
+};
+
+fn packageModuleRelPaths(package_name: []const u8, command_name: []const u8) []const []const u8 {
+    if (std.ascii.eqlIgnoreCase(command_name, "pnpm") or std.ascii.eqlIgnoreCase(package_name, "pnpm")) {
+        return &pnpm_module_rel_paths;
+    }
+    return &yarn_module_rel_paths;
 }
 
 fn findLauncherCmd(allocator: std.mem.Allocator, dir_path: []const u8, command_name: []const u8) !?[]u8 {
@@ -573,7 +670,7 @@ fn classifyPackageLauncher(allocator: std.mem.Allocator, cmd_path: []const u8, p
 
     const resolved = std.fs.path.resolve(allocator, &.{ expanded }) catch return .reject;
     defer allocator.free(resolved);
-    if (!hasScriptExtension(resolved)) return .reject;
+    if (!isDelegatedScript(resolved)) return .reject;
 
     const package_root = std.fs.path.join(allocator, &.{ cmd_dir, "node_modules", package_name }) catch return .reject;
     defer allocator.free(package_root);
@@ -622,7 +719,7 @@ fn launcherPackageToken(contents: []const u8, package_name: []const u8) ?[]const
         }
         const at = found orelse return null;
         const token = quotedTokenAt(contents, at);
-        if (std.mem.indexOfScalar(u8, token, '.') != null) return token;
+        if (token.len != 0) return token;
         search_from = at + 1;
     }
     return null;
@@ -670,6 +767,22 @@ fn hasScriptExtension(path: []const u8) bool {
     return std.ascii.eqlIgnoreCase(ext, ".js") or
         std.ascii.eqlIgnoreCase(ext, ".cjs") or
         std.ascii.eqlIgnoreCase(ext, ".mjs");
+}
+
+fn fileStartsWithMz(path: []const u8) bool {
+    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
+    defer file.close();
+    var buf: [2]u8 = undefined;
+    const n = file.read(&buf) catch return false;
+    return n == 2 and buf[0] == 'M' and buf[1] == 'Z';
+}
+
+/// JS global modules: `.js`/`.cjs`/`.mjs`, or an extensionless non-PE file
+/// (pnpm 12 `bin.pnpm` = `"pnpm"`). PE files are native, not scripts.
+fn isDelegatedScript(path: []const u8) bool {
+    if (hasScriptExtension(path)) return true;
+    if (std.fs.path.extension(path).len != 0) return false;
+    return !fileStartsWithMz(path);
 }
 
 fn pathIsInside(parent: []const u8, child: []const u8) bool {
@@ -881,7 +994,7 @@ fn enforceDelegatedCommandTrust(
     }
 
     const ext = std.fs.path.extension(command_path);
-    if (std.ascii.eqlIgnoreCase(ext, ".exe")) {
+    if (std.ascii.eqlIgnoreCase(ext, ".exe") or (ext.len == 0 and fileStartsWithMz(command_path))) {
         // Same TPM verify-cache as node.exe — never full Authenticode on warm path.
         const outcome = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, command_path);
         if (outcome.result == .failed) {
@@ -928,7 +1041,7 @@ fn enforceDelegatedCommandTrust(
         return;
     }
 
-    if (hasScriptExtension(command_path)) {
+    if (isDelegatedScript(command_path)) {
         const outcome = verifycache.ensureDelegatedScriptTrusted(allocator, cfg.root, command_path);
         if (outcome.result == .failed) {
             const reason = if (outcome.reason.len == 0) "delegated script trust verification failed" else outcome.reason;
@@ -1195,7 +1308,7 @@ fn runDelegatedCommand(
         defer allocator.free(argv);
         return spawnArgvSlice(allocator, &env_map, argv);
     }
-    if (hasScriptExtension(command_path)) {
+    if (isDelegatedScript(command_path)) {
         return spawnArgv(allocator, &env_map, node_bin, command_path, forwarded_args);
     }
 
@@ -2846,4 +2959,114 @@ test "version directory corepack trampoline does not use another yarn.js" {
     const resolved = try resolveCorepackBackedCommand(allocator, version, "yarn");
     defer allocator.free(resolved);
     try std.testing.expect(std.ascii.endsWithIgnoreCase(resolved, "corepack.js"));
+}
+
+test "classifyPackageLauncher accepts pnpm 12 extensionless bin" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("prefix\\node_modules\\pnpm");
+    try tmp.dir.writeFile(.{ .sub_path = "prefix\\node_modules\\pnpm\\pnpm", .data = "#!/usr/bin/env node\n" });
+    try tmp.dir.writeFile(.{
+        .sub_path = "prefix\\pnpm.cmd",
+        .data = "@ECHO off\r\n\"%_prog%\" \"%dp0%\\node_modules\\pnpm\\pnpm\" %*\r\n",
+    });
+
+    const root = try tmp.dir.realpathAlloc(allocator, "prefix");
+    defer allocator.free(root);
+    const pnpm_cmd = try std.fs.path.join(allocator, &.{ root, "pnpm.cmd" });
+    defer allocator.free(pnpm_cmd);
+    switch (try classifyPackageLauncher(allocator, pnpm_cmd, "pnpm")) {
+        .package_js => |js_path| {
+            defer allocator.free(js_path);
+            try std.testing.expect(std.ascii.endsWithIgnoreCase(js_path, "node_modules\\pnpm\\pnpm") or std.ascii.endsWithIgnoreCase(js_path, "node_modules/pnpm/pnpm"));
+        },
+        else => return error.ExpectedPackageJs,
+    }
+}
+
+test "classifyPackageLauncher rejects extensionless PE as a script" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("prefix\\node_modules\\pnpm");
+    try tmp.dir.writeFile(.{ .sub_path = "prefix\\node_modules\\pnpm\\pnpm", .data = "MZ\x90\x00native" });
+    try tmp.dir.writeFile(.{
+        .sub_path = "prefix\\pnpm.cmd",
+        .data = "@ECHO off\r\n\"%_prog%\" \"%dp0%\\node_modules\\pnpm\\pnpm\" %*\r\n",
+    });
+
+    const root = try tmp.dir.realpathAlloc(allocator, "prefix");
+    defer allocator.free(root);
+    const pnpm_cmd = try std.fs.path.join(allocator, &.{ root, "pnpm.cmd" });
+    defer allocator.free(pnpm_cmd);
+    switch (try classifyPackageLauncher(allocator, pnpm_cmd, "pnpm")) {
+        .reject => {},
+        .package_js => |js_path| {
+            allocator.free(js_path);
+            return error.ExpectedReject;
+        },
+        else => return error.ExpectedReject,
+    }
+}
+
+test "resolvePackageModuleEntry prefers pnpm.mjs over extensionless bin" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("node\\node_modules\\pnpm\\bin");
+    try tmp.dir.writeFile(.{ .sub_path = "node\\node_modules\\pnpm\\bin\\pnpm.mjs", .data = "export {}\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "node\\node_modules\\pnpm\\pnpm", .data = "#!/usr/bin/env node\n" });
+
+    const version = try tmp.dir.realpathAlloc(allocator, "node");
+    defer allocator.free(version);
+    const entry = try resolvePackageModuleEntry(allocator, version, "pnpm", "pnpm") orelse return error.MissingEntry;
+    defer allocator.free(entry);
+    try std.testing.expect(std.ascii.endsWithIgnoreCase(entry, "pnpm.mjs"));
+}
+
+test "pnpm.exe in version dir wins over module js" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("node\\node_modules\\pnpm\\bin");
+    try tmp.dir.writeFile(.{ .sub_path = "node\\pnpm.exe", .data = "MZ\x90\x00" });
+    try tmp.dir.writeFile(.{ .sub_path = "node\\node_modules\\pnpm\\bin\\pnpm.mjs", .data = "export {}\n" });
+    try tmp.dir.writeFile(.{
+        .sub_path = "node\\pnpm.cmd",
+        .data = "@ECHO off\r\n\"%_prog%\" \"%dp0%\\node_modules\\pnpm\\bin\\pnpm.mjs\" %*\r\n",
+    });
+
+    const version = try tmp.dir.realpathAlloc(allocator, "node");
+    defer allocator.free(version);
+    const resolved = try resolveCorepackBackedCommand(allocator, version, "pnpm");
+    defer allocator.free(resolved);
+    try std.testing.expect(std.ascii.endsWithIgnoreCase(resolved, "pnpm.exe"));
+}
+
+test "pnpm without exe uses global module js" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("node\\node_modules\\pnpm\\bin");
+    try tmp.dir.writeFile(.{ .sub_path = "node\\node_modules\\pnpm\\bin\\pnpm.mjs", .data = "export {}\n" });
+    try tmp.dir.writeFile(.{
+        .sub_path = "node\\pnpm.cmd",
+        .data = "@ECHO off\r\n\"%_prog%\" \"%dp0%\\node_modules\\pnpm\\bin\\pnpm.mjs\" %*\r\n",
+    });
+
+    const version = try tmp.dir.realpathAlloc(allocator, "node");
+    defer allocator.free(version);
+    const resolved = try resolveCorepackBackedCommand(allocator, version, "pnpm");
+    defer allocator.free(resolved);
+    if (std.ascii.endsWithIgnoreCase(resolved, "pnpm.exe")) {
+        try std.testing.expect(!std.ascii.startsWithIgnoreCase(resolved, version));
+        return;
+    }
+    try std.testing.expect(std.ascii.endsWithIgnoreCase(resolved, "pnpm.mjs"));
 }
