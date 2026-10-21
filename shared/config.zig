@@ -21,6 +21,7 @@ pub const reg_value_allowed_permission_grants = "AllowedPermissionGrants";
 pub const reg_value_freeze_v8_global_objects = "FreezeV8GlobalObjects";
 pub const reg_value_disable_eval_and_string_execution = "DisableEvalAndStringExecution";
 pub const reg_value_package_manager_mismatch_action = "PackageManagerMismatchAction";
+pub const reg_value_shim_bun = "ShimBun";
 pub const reg_value_npm_module_minimum_age = "NpmModuleMinimumAge";
 pub const reg_value_npm_mirror = "MirrorNpm";
 pub const reg_nvm_cmd_path = "Software\\Classes\\nvm\\shell\\open\\command";

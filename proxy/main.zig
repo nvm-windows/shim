@@ -12,6 +12,7 @@ const config = @import("config");
 const registry = @import("registry");
 const cmd_spawn = @import("cmd_spawn");
 const malware_scan = @import("malware_scan.zig");
+const bun_lane = @import("bun_lane.zig");
 
 const ParsedArgs = struct {
     override_version: ?[]const u8,
@@ -59,6 +60,8 @@ pub fn main() !void {
 
     const cfg = try nodeversion.loadConfig(allocator);
     defer nodeversion.deinitConfig(allocator, cfg);
+
+    try bun_lane.runIfBun(allocator, cfg, command_name, parsed_args.forwarded);
 
     var resolved = nodeversion.resolveConfiguredNode(allocator, cfg, parsed_args.override_version) catch |err| switch (err) {
         error.NoActiveVersion => noActiveVersionConfigured(),
@@ -1957,24 +1960,7 @@ fn entrypointSnapSetChanged(before: EntrypointSnapSet, after: EntrypointSnapSet)
 }
 
 fn pmInstallLike(command_name: []const u8, args: []const []const u8) bool {
-    if (std.ascii.eqlIgnoreCase(command_name, "npx")) return true;
-    if (args.len == 0) return false;
-    const sub = args[0];
-    if (std.ascii.eqlIgnoreCase(command_name, "npm")) {
-        return std.ascii.eqlIgnoreCase(sub, "install") or std.ascii.eqlIgnoreCase(sub, "i") or
-            std.ascii.eqlIgnoreCase(sub, "add") or std.ascii.eqlIgnoreCase(sub, "exec") or
-            std.ascii.eqlIgnoreCase(sub, "ci");
-    }
-    if (std.ascii.eqlIgnoreCase(command_name, "pnpm") or std.ascii.eqlIgnoreCase(command_name, "vlt")) {
-        return std.ascii.eqlIgnoreCase(sub, "install") or std.ascii.eqlIgnoreCase(sub, "i") or
-            std.ascii.eqlIgnoreCase(sub, "add") or std.ascii.eqlIgnoreCase(sub, "exec") or
-            std.ascii.eqlIgnoreCase(sub, "dlx") or std.ascii.eqlIgnoreCase(sub, "ci");
-    }
-    if (std.ascii.eqlIgnoreCase(command_name, "yarn")) {
-        return std.ascii.eqlIgnoreCase(sub, "add") or std.ascii.eqlIgnoreCase(sub, "install") or
-            std.ascii.eqlIgnoreCase(sub, "global") or std.ascii.eqlIgnoreCase(sub, "dlx");
-    }
-    return false;
+    return module_firewall.commandInstallLike(command_name, args);
 }
 
 const code_module_firewall_blocked: u32 = 4403;
