@@ -779,6 +779,15 @@ pub fn resolveReshimExePath(allocator: std.mem.Allocator) ![]u8 {
     return reshim;
 }
 
+pub fn resolveSyncExePath(allocator: std.mem.Allocator) ![]u8 {
+    const root = try resolveProgramRoot(allocator);
+    defer allocator.free(root);
+    const sync_exe = try std.fs.path.join(allocator, &.{ root, "utils", "sync.exe" });
+    errdefer allocator.free(sync_exe);
+    try std.fs.accessAbsolute(sync_exe, .{});
+    return sync_exe;
+}
+
 pub fn autoInstallVersion(allocator: std.mem.Allocator, version: []const u8) !NvmCommandOutcome {
     return runNvmCommand(allocator, &.{ "install", version });
 }
