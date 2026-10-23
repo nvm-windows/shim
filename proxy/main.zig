@@ -976,9 +976,7 @@ fn enforceDelegatedCommandTrust(
         const outcome = verifycache.ensureDelegatedScriptTrusted(allocator, cfg.root, cli_js);
         if (outcome.result == .failed) {
             const reason = if (outcome.reason.len == 0) "delegated package-manager entrypoint trust verification failed" else outcome.reason;
-            if (!tryRecoverDelegatedTrustFailure(allocator, cfg.root, node_install_dir, command_name, cli_js, reason, cfg.structured_logging)) {
-                reportDelegatedTrustFailure(allocator, cfg, command_name, cli_js, node_bin, node_version, reason);
-            }
+            recoverDelegatedTrustOrReport(allocator, cfg, node_install_dir, command_name, cli_js, node_bin, node_version, reason);
             const retry = verifycache.ensureDelegatedScriptTrusted(allocator, cfg.root, cli_js);
             if (retry.result == .failed) {
                 reportDelegatedTrustFailure(
@@ -1001,9 +999,7 @@ fn enforceDelegatedCommandTrust(
         const outcome = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, command_path);
         if (outcome.result == .failed) {
             const reason = if (outcome.reason.len == 0) "delegated executable trust verification failed" else outcome.reason;
-            if (!tryRecoverDelegatedTrustFailure(allocator, cfg.root, node_install_dir, command_name, command_path, reason, cfg.structured_logging)) {
-                reportDelegatedTrustFailure(allocator, cfg, command_name, command_path, node_bin, node_version, reason);
-            }
+            recoverDelegatedTrustOrReport(allocator, cfg, node_install_dir, command_name, command_path, node_bin, node_version, reason);
             const retry = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, command_path);
             if (retry.result == .failed) {
                 reportDelegatedTrustFailure(
@@ -1024,9 +1020,7 @@ fn enforceDelegatedCommandTrust(
         const outcome = verifycache.ensureDelegatedScriptTrusted(allocator, cfg.root, command_path);
         if (outcome.result == .failed) {
             const reason = if (outcome.reason.len == 0) "delegated script trust verification failed" else outcome.reason;
-            if (!tryRecoverDelegatedTrustFailure(allocator, cfg.root, node_install_dir, command_name, command_path, reason, cfg.structured_logging)) {
-                reportDelegatedTrustFailure(allocator, cfg, command_name, command_path, node_bin, node_version, reason);
-            }
+            recoverDelegatedTrustOrReport(allocator, cfg, node_install_dir, command_name, command_path, node_bin, node_version, reason);
             const retry = verifycache.ensureDelegatedScriptTrusted(allocator, cfg.root, command_path);
             if (retry.result == .failed) {
                 reportDelegatedTrustFailure(
@@ -1047,9 +1041,7 @@ fn enforceDelegatedCommandTrust(
         const outcome = verifycache.ensureDelegatedScriptTrusted(allocator, cfg.root, command_path);
         if (outcome.result == .failed) {
             const reason = if (outcome.reason.len == 0) "delegated script trust verification failed" else outcome.reason;
-            if (!tryRecoverDelegatedTrustFailure(allocator, cfg.root, node_install_dir, command_name, command_path, reason, cfg.structured_logging)) {
-                reportDelegatedTrustFailure(allocator, cfg, command_name, command_path, node_bin, node_version, reason);
-            }
+            recoverDelegatedTrustOrReport(allocator, cfg, node_install_dir, command_name, command_path, node_bin, node_version, reason);
             const retry = verifycache.ensureDelegatedScriptTrusted(allocator, cfg.root, command_path);
             if (retry.result == .failed) {
                 reportDelegatedTrustFailure(
@@ -1080,6 +1072,27 @@ fn isMissingDelegatedTrust(reason: []const u8) bool {
     return std.mem.indexOf(u8, reason, "is not trusted") != null;
 }
 
+const TrustRecover = enum { recovered, blocked, no_answer };
+
+const no_trust_answer_reason = "No trust answer (toast timeout / no console)";
+
+fn recoverDelegatedTrustOrReport(
+    allocator: std.mem.Allocator,
+    cfg: nodeversion.ShimConfig,
+    node_install_dir: []const u8,
+    command_name: []const u8,
+    command_path: []const u8,
+    node_bin: []const u8,
+    node_version: []const u8,
+    reason: []const u8,
+) void {
+    switch (tryRecoverDelegatedTrustFailure(allocator, cfg.root, node_install_dir, command_name, command_path, reason, cfg.structured_logging)) {
+        .recovered => return,
+        .blocked => reportDelegatedTrustFailure(allocator, cfg, command_name, command_path, node_bin, node_version, reason),
+        .no_answer => reportDelegatedTrustFailure(allocator, cfg, command_name, command_path, node_bin, node_version, no_trust_answer_reason),
+    }
+}
+
 /// Prompt/trust+reshim when an untrusted module's entrypoint changed under us.
 fn tryRecoverDelegatedTrustFailure(
     allocator: std.mem.Allocator,
@@ -1089,10 +1102,10 @@ fn tryRecoverDelegatedTrustFailure(
     command_path: []const u8,
     reason: []const u8,
     structured_logging: bool,
-) bool {
+) TrustRecover {
     const self_update = isSelfUpdateTrustFailure(reason);
     const missing = isMissingDelegatedTrust(reason);
-    if (!self_update and !missing) return false;
+    if (!self_update and !missing) return .blocked;
 
     // npm/npx ship with Node. A 2.0.0 upgrade has no script-trust row for them.
     // Re-sign that miss even when TrustedModules is still the old NOT ALL seed.
@@ -1100,10 +1113,10 @@ fn tryRecoverDelegatedTrustFailure(
         logFirewallInfo(allocator, structured_logging, "firewall.builtin_pm_unsigned", "firewall unsigned npm/npx entrypoint after upgrade; re-signing");
         _ = resignScriptSync(allocator, command_path);
         runReshim(allocator, install_root, node_install_dir, true);
-        return true;
+        return .recovered;
     }
 
-    const rules = loadTrustedModules(allocator) catch return false;
+    const rules = loadTrustedModules(allocator) catch return .blocked;
     defer module_firewall.freeMultiSz(allocator, rules);
 
     const trust = classifyModuleTrust(allocator, command_name, rules);
@@ -1113,15 +1126,15 @@ fn tryRecoverDelegatedTrustFailure(
         logFirewallInfo(allocator, structured_logging, "firewall.trusted_module_stale", "firewall trusted module VerifyCache stale; scheduling reshim");
         _ = resignScriptSync(allocator, command_path);
         runReshim(allocator, install_root, node_install_dir, true);
-        return true;
+        return .recovered;
     }
-    if (!self_update) return false;
+    if (!self_update) return .blocked;
     if (trust == .remote_blocked) {
         const audit = auditFromVerifyCache(allocator, command_path);
         defer audit.deinit(allocator);
         logUntrustedModuleChanged(allocator, structured_logging, command_name, "deny", "remote", "verify_cache", audit);
         logFirewallInfo(allocator, structured_logging, "firewall.remote_blocked", "firewall remote policy blocked module; deny (no prompt)");
-        return false;
+        return .blocked;
     }
     switch (untrustedHandlerAction(allocator)) {
         .deny => {
@@ -1129,7 +1142,7 @@ fn tryRecoverDelegatedTrustFailure(
             defer audit.deinit(allocator);
             logUntrustedModuleChanged(allocator, structured_logging, command_name, "deny", "deny", "verify_cache", audit);
             logFirewallInfo(allocator, structured_logging, "firewall.untrusted_deny", "firewall untrusted module VerifyCache stale; deny (no prompt)");
-            return false;
+            return .blocked;
         },
         .allow => {
             const audit = auditFromVerifyCache(allocator, command_path);
@@ -1139,23 +1152,34 @@ fn tryRecoverDelegatedTrustFailure(
             notifyModuleAutoTrusted(allocator, command_name);
             _ = resignScriptSync(allocator, command_path);
             runReshim(allocator, install_root, node_install_dir, true);
-            return true;
+            return .recovered;
         },
         .prompt => {
-            if (promptTrustChange(allocator, command_name)) {
-                const audit = auditFromVerifyCache(allocator, command_path);
-                defer audit.deinit(allocator);
-                logUntrustedModuleChanged(allocator, structured_logging, command_name, "prompt_accepted", "prompt", "verify_cache", audit);
-                logFirewallInfo(allocator, structured_logging, "firewall.prompt_accepted", "firewall trust prompt accepted on VerifyCache miss; scheduling reshim");
-                _ = resignScriptSync(allocator, command_path);
-                runReshim(allocator, install_root, node_install_dir, true);
-                return true;
+            switch (promptTrustChange(allocator, command_name)) {
+                .accepted => {
+                    const audit = auditFromVerifyCache(allocator, command_path);
+                    defer audit.deinit(allocator);
+                    logUntrustedModuleChanged(allocator, structured_logging, command_name, "prompt_accepted", "prompt", "verify_cache", audit);
+                    logFirewallInfo(allocator, structured_logging, "firewall.prompt_accepted", "firewall trust prompt accepted on VerifyCache miss; scheduling reshim");
+                    _ = resignScriptSync(allocator, command_path);
+                    runReshim(allocator, install_root, node_install_dir, true);
+                    return .recovered;
+                },
+                .declined => {
+                    const audit = auditFromVerifyCache(allocator, command_path);
+                    defer audit.deinit(allocator);
+                    logUntrustedModuleChanged(allocator, structured_logging, command_name, "prompt_declined", "prompt", "verify_cache", audit);
+                    logFirewallInfo(allocator, structured_logging, "firewall.prompt_declined", "firewall trust prompt declined on VerifyCache miss");
+                    return .blocked;
+                },
+                .no_answer => {
+                    const audit = auditFromVerifyCache(allocator, command_path);
+                    defer audit.deinit(allocator);
+                    logUntrustedModuleChanged(allocator, structured_logging, command_name, "prompt_timeout", "prompt", "verify_cache", audit);
+                    logFirewallInfo(allocator, structured_logging, "firewall.prompt_timeout", "firewall trust prompt timed out on VerifyCache miss");
+                    return .no_answer;
+                },
             }
-            const audit = auditFromVerifyCache(allocator, command_path);
-            defer audit.deinit(allocator);
-            logUntrustedModuleChanged(allocator, structured_logging, command_name, "prompt_declined", "prompt", "verify_cache", audit);
-            logFirewallInfo(allocator, structured_logging, "firewall.prompt_declined", "firewall trust prompt declined on VerifyCache miss");
-            return false;
         },
     }
 }
@@ -1231,7 +1255,8 @@ fn reportDelegatedTrustFailure(
         \\Command: {s}
         \\File: {s}
         \\Reason: {s}
-        \\Action: If you trust this change, run `nvm firewall trust module {s}` then `nvm reshim`.
+        \\Action: If you trust this change, run `nvm firewall trust module {s}`.
+        \\`nvm reshim` alone will not keep this module trusted after the next self-update.
         \\If this change was unexpected, contact your administrator and review NVM event logs.
         \\Event code: NVM4306
         \\
@@ -2555,6 +2580,16 @@ fn notifyModuleAutoTrusted(allocator: std.mem.Allocator, command_name: []const u
     _ = child.spawnAndWait() catch {};
 }
 
+fn notifyUntrustedModuleChangedInfo(allocator: std.mem.Allocator, command_name: []const u8) void {
+    const msg = std.fmt.allocPrint(
+        allocator,
+        "Untrusted module '{s}' changed after running. Next launch will ask whether to trust it.\nTo allow self-updates now: nvm firewall trust module {s}\n",
+        .{ command_name, command_name },
+    ) catch return;
+    defer allocator.free(msg);
+    std.debug.print("{s}", .{msg});
+}
+
 const untrusted_module_changed_code: u32 = 4406;
 
 fn logFirewallInfo(allocator: std.mem.Allocator, structured_logging: bool, event_name: []const u8, plaintext: []const u8) void {
@@ -2737,7 +2772,9 @@ fn logUntrustedModuleChanged(
     }
 }
 
-fn promptTrustChange(allocator: std.mem.Allocator, command_name: []const u8) bool {
+const PromptTrustResult = enum { accepted, declined, no_answer };
+
+fn promptTrustChange(allocator: std.mem.Allocator, command_name: []const u8) PromptTrustResult {
     const nvm_path = nodeversion.resolveNvmExePath(allocator) catch {
         return promptTrustChangeConsoleOnly(allocator, command_name, null);
     };
@@ -2751,21 +2788,31 @@ fn promptTrustChange(allocator: std.mem.Allocator, command_name: []const u8) boo
         return promptTrustChangeConsoleOnly(allocator, command_name, nvm_path);
     };
     return switch (term) {
-        .Exited => |code| code == 0,
-        else => false,
+        .Exited => |code| switch (code) {
+            0 => .accepted,
+            2 => .no_answer,
+            else => .declined,
+        },
+        else => .no_answer,
     };
 }
 
-fn promptTrustChangeConsoleOnly(allocator: std.mem.Allocator, command_name: []const u8, nvm_path: ?[]const u8) bool {
-    const msg = std.fmt.allocPrint(allocator, "Untrusted module '{s}' changed after running. Do you trust this module? [y/N]: ", .{command_name}) catch {
-        return false;
+fn promptTrustChangeConsoleOnly(allocator: std.mem.Allocator, command_name: []const u8, nvm_path: ?[]const u8) PromptTrustResult {
+    const msg = std.fmt.allocPrint(allocator, "Untrusted module '{s}' changed. Do you trust this module? [y/N]: ", .{command_name}) catch {
+        return .no_answer;
     };
     defer allocator.free(msg);
     std.debug.print("{s}", .{msg});
     var stdin_buffer: [16]u8 = undefined;
     const stdin = std.fs.File.stdin();
-    const n = stdin.read(stdin_buffer[0..]) catch return false;
-    if (n == 0) return false;
+    const n = stdin.read(stdin_buffer[0..]) catch {
+        std.debug.print("No trust answer for '{s}' (no console). NVM moved on. If you trust this: nvm firewall trust module {s}\n", .{ command_name, command_name });
+        return .no_answer;
+    };
+    if (n == 0) {
+        std.debug.print("No trust answer for '{s}' (no console). NVM moved on. If you trust this: nvm firewall trust module {s}\n", .{ command_name, command_name });
+        return .no_answer;
+    }
     const answer = std.mem.trim(u8, stdin_buffer[0..n], " \t\r\n");
     const ok = answer.len > 0 and (answer[0] == 'y' or answer[0] == 'Y');
     if (ok) {
@@ -2777,10 +2824,10 @@ fn promptTrustChangeConsoleOnly(allocator: std.mem.Allocator, command_name: []co
             _ = trust.spawnAndWait() catch {};
             std.debug.print("{s} is now trusted\n", .{command_name});
         }
-    } else {
-        std.debug.print("{s} is not trusted\n", .{command_name});
+        return .accepted;
     }
-    return ok;
+    std.debug.print("{s} is not trusted\n", .{command_name});
+    return .declined;
 }
 
 fn maybeReshimAfterSelfUpdate(
@@ -2831,15 +2878,9 @@ fn maybeReshimAfterSelfUpdate(
             runReshim(allocator, install_root, node_install_dir, true);
         },
         .prompt => {
-            if (promptTrustChange(allocator, command_name)) {
-                logUntrustedModuleChanged(allocator, structured_logging, command_name, "prompt_accepted", "prompt", "post_run", audit);
-                logFirewallInfo(allocator, structured_logging, "firewall.prompt_accepted", "firewall trust prompt accepted; trusted modules updated; scheduling reshim");
-                _ = resignScriptSync(allocator, command_path);
-                runReshim(allocator, install_root, node_install_dir, true);
-            } else {
-                logUntrustedModuleChanged(allocator, structured_logging, command_name, "prompt_declined", "prompt", "post_run", audit);
-                logFirewallInfo(allocator, structured_logging, "firewall.prompt_declined", "firewall trust prompt declined; VerifyCache left stale");
-            }
+            logUntrustedModuleChanged(allocator, structured_logging, command_name, "prompt_deferred", "prompt", "post_run", audit);
+            logFirewallInfo(allocator, structured_logging, "firewall.prompt_deferred", "firewall untrusted module changed after run; prompt deferred to next launch");
+            notifyUntrustedModuleChangedInfo(allocator, command_name);
         },
     }
 }
