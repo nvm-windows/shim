@@ -2174,11 +2174,26 @@ fn spawnNvmReshimChild(
 fn resignScriptSync(allocator: std.mem.Allocator, script_path: []const u8) bool {
     const nvm_path = nodeversion.resolveNvmExePath(allocator) catch return false;
     defer allocator.free(nvm_path);
-    var child = std.process.Child.init(&.{ nvm_path, "--sign-script", script_path }, allocator);
-    child.stdin_behavior = .Ignore;
+    var child = std.process.Child.init(&.{ nvm_path, "--sign-script" }, allocator);
+    child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
-    const term = child.spawnAndWait() catch return false;
+    child.spawn() catch return false;
+    if (child.stdin) |stdin| {
+        const write_ok = if (stdin.writeAll(script_path)) |_| true else |_| false;
+        stdin.close();
+        child.stdin = null;
+        if (!write_ok) {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return false;
+        }
+    } else {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return false;
+    }
+    const term = child.wait() catch return false;
     return switch (term) {
         .Exited => |code| code == 0,
         else => false,
