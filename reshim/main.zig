@@ -686,6 +686,7 @@ fn collectCmdNamesFromInstallRoot(allocator: std.mem.Allocator, install_root: []
     }
 
     try appendPnpmHomeBinCmdNames(allocator, &dedupe, &names);
+    try appendYarnClassicBinCmdNames(allocator, &dedupe, &names);
     try appendDefaultPackageManagerShims(allocator, &dedupe, &names);
 
     std.mem.sort([]const u8, names.items, {}, lessThanIgnoreCase);
@@ -712,6 +713,7 @@ fn collectCmdNamesFromVersionDir(allocator: std.mem.Allocator, version_dir_path:
 
     try collectCmdNamesFromCommandDirectory(allocator, &version_dir, &dedupe, &names);
     try appendPnpmHomeBinCmdNames(allocator, &dedupe, &names);
+    try appendYarnClassicBinCmdNames(allocator, &dedupe, &names);
     try appendDefaultPackageManagerShims(allocator, &dedupe, &names);
 
     std.mem.sort([]const u8, names.items, {}, lessThanIgnoreCase);
@@ -769,6 +771,30 @@ fn appendPnpmHomeBinCmdNames(
     defer pnpm_bin_dir.close();
 
     try collectCmdNamesFromCommandDirectory(allocator, &pnpm_bin_dir, dedupe, names);
+}
+
+fn yarnClassicGlobalBinDir(allocator: std.mem.Allocator) !?[]u8 {
+    const local = (try getOptionalEnvVarOwned(allocator, "LOCALAPPDATA")) orelse return null;
+    defer allocator.free(local);
+    return try std.fs.path.join(allocator, &.{ local, "Yarn", "bin" });
+}
+
+fn appendYarnClassicBinCmdNames(
+    allocator: std.mem.Allocator,
+    dedupe: *std.StringHashMap(void),
+    names: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    const yarn_bin = (try yarnClassicGlobalBinDir(allocator)) orelse return;
+    defer allocator.free(yarn_bin);
+
+    const is_abs = std.fs.path.isAbsolute(yarn_bin);
+    var yarn_bin_dir = if (is_abs)
+        std.fs.openDirAbsolute(yarn_bin, .{ .iterate = true }) catch return
+    else
+        std.fs.cwd().openDir(yarn_bin, .{ .iterate = true }) catch return;
+    defer yarn_bin_dir.close();
+
+    try collectCmdNamesFromCommandDirectory(allocator, &yarn_bin_dir, dedupe, names);
 }
 
 fn appendUniqueCommandName(
@@ -864,4 +890,52 @@ fn isVersionDirName(name: []const u8) bool {
     }
 
     return segment_count == 3;
+}
+
+test "collectCmdNamesFromVersionDir includes Yarn Classic global cmds" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("node");
+    try tmp.dir.makePath("Yarn\\bin");
+    try tmp.dir.writeFile(.{ .sub_path = "Yarn\\bin\\vue.cmd", .data = "@ECHO off\r\n" });
+
+    const version_dir = try tmp.dir.realpathAlloc(allocator, "node");
+    defer allocator.free(version_dir);
+    const fake_local = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(fake_local);
+
+    const Env = struct {
+        extern "kernel32" fn SetEnvironmentVariableW(
+            lpName: [*:0]const u16,
+            lpValue: ?[*:0]const u16,
+        ) callconv(.winapi) std.os.windows.BOOL;
+
+        fn setLocalAppData(gpa: std.mem.Allocator, value: []const u8) !void {
+            const name_w = try std.unicode.utf8ToUtf16LeAllocZ(gpa, "LOCALAPPDATA");
+            defer gpa.free(name_w);
+            const value_w = try std.unicode.utf8ToUtf16LeAllocZ(gpa, value);
+            defer gpa.free(value_w);
+            if (SetEnvironmentVariableW(name_w, value_w) == 0) return error.SetEnvironmentVariableFailed;
+        }
+    };
+
+    const previous = std.process.getEnvVarOwned(allocator, "LOCALAPPDATA") catch null;
+    defer if (previous) |value| allocator.free(value);
+    try Env.setLocalAppData(allocator, fake_local);
+    defer {
+        if (previous) |value| {
+            Env.setLocalAppData(allocator, value) catch {};
+        }
+    }
+
+    const names = try collectCmdNamesFromVersionDir(allocator, version_dir);
+    defer freeNameList(allocator, names);
+
+    var found_vue = false;
+    for (names) |name| {
+        if (std.ascii.eqlIgnoreCase(name, "vue")) found_vue = true;
+    }
+    try std.testing.expect(found_vue);
 }
