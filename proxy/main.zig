@@ -150,7 +150,15 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    const command_path = try resolveDelegatedOrCorepackPath(allocator, node_install_dir_abs, command_name);
+    const command_path = resolveDelegatedOrCorepackPath(
+        allocator,
+        node_install_dir_abs,
+        command_name,
+        resolved.resolved_version.?,
+    ) catch |err| switch (err) {
+        error.CommandNotFound => std.process.exit(1),
+        else => return err,
+    };
     defer allocator.free(command_path);
 
     if (!try enforcePackageManagerConstraint(allocator, cfg, resolved.version_source, command_name, resolved.node_bin.?, command_path)) {
@@ -459,12 +467,32 @@ fn resolveDelegatedCommandPath(allocator: std.mem.Allocator, node_install_dir: [
     return error.CommandNotFound;
 }
 
-fn resolveDelegatedOrCorepackPath(allocator: std.mem.Allocator, node_install_dir: []const u8, command_name: []const u8) ![]u8 {
+fn resolveDelegatedOrCorepackPath(
+    allocator: std.mem.Allocator,
+    node_install_dir: []const u8,
+    command_name: []const u8,
+    node_version: []const u8,
+) ![]u8 {
     if (isCorepackBackedCommand(command_name)) {
         return resolveCorepackBackedCommand(allocator, node_install_dir, command_name);
     }
+    if (std.ascii.eqlIgnoreCase(command_name, "corepack")) {
+        return resolveCorepackCommand(allocator, node_install_dir, node_version);
+    }
 
     return resolveDelegatedCommandPath(allocator, node_install_dir, command_name);
+}
+
+fn resolveCorepackCommand(allocator: std.mem.Allocator, node_install_dir: []const u8, node_version: []const u8) ![]u8 {
+    if (resolveDelegatedCommandPath(allocator, node_install_dir, "corepack")) |path| {
+        return path;
+    } else |err| switch (err) {
+        error.CommandNotFound => {
+            reportMissingCorepack(node_version);
+            return error.CommandNotFound;
+        },
+        else => return err,
+    }
 }
 
 const LauncherClass = union(enum) {
@@ -924,6 +952,51 @@ fn reportMissingPackageManager(command_name: []const u8) void {
         \\      corepack prepare {s}@stable --activate
         \\
     , .{ command_name, prepare_name });
+}
+
+const bundled_corepack_range = "14.19.0-14.x and 16.9.0-24.x";
+
+fn stripNodeVersionPrefix(version: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, version, " \t");
+    if (trimmed.len > 0 and (trimmed[0] == 'v' or trimmed[0] == 'V')) {
+        return trimmed[1..];
+    }
+    return trimmed;
+}
+
+fn parseNodeVersion(version: []const u8) ?struct { major: u32, minor: u32 } {
+    const shown = stripNodeVersionPrefix(version);
+    if (shown.len == 0) return null;
+    var it = std.mem.splitScalar(u8, shown, '.');
+    const major_s = it.next() orelse return null;
+    const minor_s = it.next() orelse "0";
+    const major = std.fmt.parseInt(u32, major_s, 10) catch return null;
+    var minor_tok = minor_s;
+    if (std.mem.indexOfAny(u8, minor_tok, "-+")) |i| minor_tok = minor_tok[0..i];
+    const minor = std.fmt.parseInt(u32, minor_tok, 10) catch return null;
+    return .{ .major = major, .minor = minor };
+}
+
+/// Bundled Corepack: 14.19.0-14.x and 16.9.0-24.x. Not 15.x. Not 25+.
+fn nodeShipsBundledCorepack(version: []const u8) bool {
+    const parsed = parseNodeVersion(version) orelse return false;
+    if (parsed.major == 14) return parsed.minor >= 19;
+    if (parsed.major == 15) return false;
+    if (parsed.major == 16) return parsed.minor >= 9;
+    return parsed.major >= 17 and parsed.major <= 24;
+}
+
+fn reportMissingCorepack(node_version: []const u8) void {
+    const shown = stripNodeVersionPrefix(node_version);
+    if (nodeShipsBundledCorepack(shown)) return;
+    const display = if (shown.len == 0) "this version" else shown;
+    std.debug.print(
+        \\corepack is not installed for Node.js {s}.
+        \\
+        \\Corepack only shipped with Node.js {s}. Install it for {s}:
+        \\  npm install -g corepack
+        \\
+    , .{ display, bundled_corepack_range, display });
 }
 
 fn isCorepackBackedCommand(command_name: []const u8) bool {
@@ -3141,6 +3214,49 @@ test "isCorepackBackedCommand covers yarn yarnpkg pnpm" {
     try std.testing.expect(isCorepackBackedCommand("pnpm"));
     try std.testing.expect(!isCorepackBackedCommand("npm"));
     try std.testing.expect(!isCorepackBackedCommand("corepack"));
+}
+
+test "nodeShipsBundledCorepack matches Node shipping windows" {
+    try std.testing.expect(!nodeShipsBundledCorepack("12.22.12"));
+    try std.testing.expect(!nodeShipsBundledCorepack("14.18.3"));
+    try std.testing.expect(nodeShipsBundledCorepack("v14.19.0"));
+    try std.testing.expect(nodeShipsBundledCorepack("14.21.3"));
+    try std.testing.expect(!nodeShipsBundledCorepack("15.14.0"));
+    try std.testing.expect(!nodeShipsBundledCorepack("16.8.0"));
+    try std.testing.expect(nodeShipsBundledCorepack("16.9.0"));
+    try std.testing.expect(nodeShipsBundledCorepack("18.20.4"));
+    try std.testing.expect(nodeShipsBundledCorepack("24.11.0"));
+    try std.testing.expect(!nodeShipsBundledCorepack("25.0.0"));
+    try std.testing.expect(!nodeShipsBundledCorepack("25.2.1"));
+    try std.testing.expect(!nodeShipsBundledCorepack(""));
+}
+
+test "resolveCorepackCommand uses corepack.cmd when present" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("node");
+    try tmp.dir.writeFile(.{ .sub_path = "node\\corepack.cmd", .data = "@ECHO off\r\n" });
+
+    const version_dir = try tmp.dir.realpathAlloc(allocator, "node");
+    defer allocator.free(version_dir);
+    const resolved = try resolveCorepackCommand(allocator, version_dir, "25.0.0");
+    defer allocator.free(resolved);
+    try std.testing.expect(std.ascii.endsWithIgnoreCase(resolved, "corepack.cmd"));
+}
+
+test "resolveCorepackCommand notes unbundled Node when missing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("node");
+    const version_dir = try tmp.dir.realpathAlloc(allocator, "node");
+    defer allocator.free(version_dir);
+    try std.testing.expectError(error.CommandNotFound, resolveCorepackCommand(allocator, version_dir, "25.0.0"));
+    try std.testing.expectError(error.CommandNotFound, resolveDelegatedOrCorepackPath(allocator, version_dir, "corepack", "v15.14.0"));
+    try std.testing.expectError(error.CommandNotFound, resolveCorepackCommand(allocator, version_dir, "22.11.0"));
 }
 
 test "lastNpmrcPrefix keeps the last prefix and skips comments" {
