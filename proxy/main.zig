@@ -446,14 +446,14 @@ fn isConstrainedPackageManagerHardlink(command_name: []const u8) bool {
         std.ascii.eqlIgnoreCase(command_name, "yarn");
 }
 
-fn resolveDelegatedCommandPath(allocator: std.mem.Allocator, node_install_dir: []const u8, command_name: []const u8) ![]u8 {
+fn resolveCommandInDir(allocator: std.mem.Allocator, dir_path: []const u8, command_name: []const u8) !?[]u8 {
     const exts = [_][]const u8{ ".exe", ".cmd", ".bat" };
 
     for (exts) |ext| {
         const filename = try std.fmt.allocPrint(allocator, "{s}{s}", .{ command_name, ext });
         defer allocator.free(filename);
 
-        const full = try std.fs.path.join(allocator, &.{ node_install_dir, filename });
+        const full = try std.fs.path.join(allocator, &.{ dir_path, filename });
         errdefer allocator.free(full);
 
         std.fs.cwd().access(full, .{}) catch {
@@ -464,7 +464,24 @@ fn resolveDelegatedCommandPath(allocator: std.mem.Allocator, node_install_dir: [
         return full;
     }
 
-    return error.CommandNotFound;
+    return null;
+}
+
+fn yarnClassicGlobalBinDir(allocator: std.mem.Allocator) !?[]u8 {
+    const local = std.process.getEnvVarOwned(allocator, "LOCALAPPDATA") catch return null;
+    defer allocator.free(local);
+    if (local.len == 0) return null;
+    return try std.fs.path.join(allocator, &.{ local, "Yarn", "bin" });
+}
+
+fn resolveYarnClassicGlobalCommand(allocator: std.mem.Allocator, command_name: []const u8) !?[]u8 {
+    const bin = try yarnClassicGlobalBinDir(allocator) orelse return null;
+    defer allocator.free(bin);
+    return resolveCommandInDir(allocator, bin, command_name);
+}
+
+fn resolveDelegatedCommandPath(allocator: std.mem.Allocator, node_install_dir: []const u8, command_name: []const u8) ![]u8 {
+    return (try resolveCommandInDir(allocator, node_install_dir, command_name)) orelse error.CommandNotFound;
 }
 
 fn resolveDelegatedOrCorepackPath(
@@ -480,7 +497,13 @@ fn resolveDelegatedOrCorepackPath(
         return resolveCorepackCommand(allocator, node_install_dir, node_version);
     }
 
-    return resolveDelegatedCommandPath(allocator, node_install_dir, command_name);
+    if (try resolveCommandInDir(allocator, node_install_dir, command_name)) |path| {
+        return path;
+    }
+    if (try resolveYarnClassicGlobalCommand(allocator, command_name)) |path| {
+        return path;
+    }
+    return error.CommandNotFound;
 }
 
 fn resolveCorepackCommand(allocator: std.mem.Allocator, node_install_dir: []const u8, node_version: []const u8) ![]u8 {
@@ -3257,6 +3280,61 @@ test "resolveCorepackCommand notes unbundled Node when missing" {
     try std.testing.expectError(error.CommandNotFound, resolveCorepackCommand(allocator, version_dir, "25.0.0"));
     try std.testing.expectError(error.CommandNotFound, resolveDelegatedOrCorepackPath(allocator, version_dir, "corepack", "v15.14.0"));
     try std.testing.expectError(error.CommandNotFound, resolveCorepackCommand(allocator, version_dir, "22.11.0"));
+}
+
+test "yarnClassicGlobalBinDir joins LocalAppData Yarn bin" {
+    const allocator = std.testing.allocator;
+    const dir = try yarnClassicGlobalBinDir(allocator) orelse return error.SkipZigTest;
+    defer allocator.free(dir);
+    try std.testing.expect(std.ascii.endsWithIgnoreCase(dir, "Yarn\\bin") or std.ascii.endsWithIgnoreCase(dir, "Yarn/bin"));
+}
+
+test "resolveDelegatedOrCorepackPath uses Yarn Classic global bin" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("node");
+    try tmp.dir.makePath("Yarn\\bin");
+    try tmp.dir.writeFile(.{ .sub_path = "Yarn\\bin\\vue.cmd", .data = "@ECHO off\r\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "node\\tsc.cmd", .data = "@ECHO off\r\n" });
+
+    const version_dir = try tmp.dir.realpathAlloc(allocator, "node");
+    defer allocator.free(version_dir);
+    const fake_local = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(fake_local);
+
+    const Env = struct {
+        extern "kernel32" fn SetEnvironmentVariableW(
+            lpName: [*:0]const u16,
+            lpValue: ?[*:0]const u16,
+        ) callconv(.winapi) std.os.windows.BOOL;
+
+        fn setLocalAppData(gpa: std.mem.Allocator, value: []const u8) !void {
+            const name_w = try std.unicode.utf8ToUtf16LeAllocZ(gpa, "LOCALAPPDATA");
+            defer gpa.free(name_w);
+            const value_w = try std.unicode.utf8ToUtf16LeAllocZ(gpa, value);
+            defer gpa.free(value_w);
+            if (SetEnvironmentVariableW(name_w, value_w) == 0) return error.SetEnvironmentVariableFailed;
+        }
+    };
+
+    const previous = std.process.getEnvVarOwned(allocator, "LOCALAPPDATA") catch null;
+    defer if (previous) |value| allocator.free(value);
+    try Env.setLocalAppData(allocator, fake_local);
+    defer {
+        if (previous) |value| {
+            Env.setLocalAppData(allocator, value) catch {};
+        }
+    }
+
+    const vue_path = try resolveDelegatedOrCorepackPath(allocator, version_dir, "vue", "24.21.0");
+    defer allocator.free(vue_path);
+    try std.testing.expect(std.ascii.endsWithIgnoreCase(vue_path, "Yarn\\bin\\vue.cmd") or std.ascii.endsWithIgnoreCase(vue_path, "Yarn/bin/vue.cmd"));
+
+    const tsc_path = try resolveDelegatedOrCorepackPath(allocator, version_dir, "tsc", "24.21.0");
+    defer allocator.free(tsc_path);
+    try std.testing.expect(std.ascii.endsWithIgnoreCase(tsc_path, "node\\tsc.cmd") or std.ascii.endsWithIgnoreCase(tsc_path, "node/tsc.cmd"));
 }
 
 test "lastNpmrcPrefix keeps the last prefix and skips comments" {

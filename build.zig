@@ -182,6 +182,11 @@ pub fn build(b: *std.Build) void {
         exe.root_module.addImport("shim_bun", shim_bun_module);
         exe.root_module.linkSystemLibrary("kernel32", .{});
         exe.root_module.linkSystemLibrary("advapi32", .{});
+        const reshim_tests = b.addTest(.{
+            .root_module = exe.root_module,
+        });
+        const run_reshim_tests = b.addRunArtifact(reshim_tests);
+        test_step.dependOn(&run_reshim_tests.step);
     }
 
     if (std.mem.eql(u8, app, "node")) {
