@@ -228,6 +228,19 @@ pub fn build(b: *std.Build) void {
         });
         const run_malware_tests = b.addRunArtifact(malware_tests);
         test_step.dependOn(&run_malware_tests.step);
+        const cose_sign1_module = b.createModule(.{
+            .root_source_file = b.path("shared/cose_sign1.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        exe.root_module.addImport("cose_sign1", cose_sign1_module);
+        const cose_sign1_tests = b.addTest(.{
+            .root_module = cose_sign1_module,
+        });
+        cose_sign1_tests.root_module.linkSystemLibrary("bcrypt", .{});
+        cose_sign1_tests.root_module.linkSystemLibrary("crypt32", .{});
+        const run_cose_sign1_tests = b.addRunArtifact(cose_sign1_tests);
+        test_step.dependOn(&run_cose_sign1_tests.step);
         exe.root_module.addImport("cmd_spawn", cmd_spawn_module);
         exe.root_module.addImport("shim_bun", shim_bun_module);
         const module_firewall_tests = b.addTest(.{
