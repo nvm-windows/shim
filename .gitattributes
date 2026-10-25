@@ -1,0 +1,4 @@
+# Cross-language verify-cache fixtures: payload bytes must match Go canonicalPayload exactly.
+testdata/verifycache/payload.txt text eol=lf
+testdata/verifycache/*.bin binary
+testdata/verifycache/*.cer binary
