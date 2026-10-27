@@ -121,6 +121,12 @@ pub fn build(b: *std.Build) void {
     const run_nodeversion_tests = b.addRunArtifact(nodeversion_tests);
     test_step.dependOn(&run_nodeversion_tests.step);
 
+    const resolver_tests = b.addTest(.{
+        .root_module = resolver_module,
+    });
+    const run_resolver_tests = b.addRunArtifact(resolver_tests);
+    test_step.dependOn(&run_resolver_tests.step);
+
     const permission_grants_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("shared/permission_grants.zig"),
