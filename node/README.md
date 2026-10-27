@@ -9,7 +9,7 @@ Historically, NVM for Windows only supported symlinks. Symlinks and shims each h
 The shim supports NVM for Windows automatic version detection. Users can configure their own detection files, but nvm-windows defaults to `.nvmrc`, `.node-version`, and `package.json`.
 
 > [!TIP]
-> Add `--nvm-which` to any `node` or proxy command to print how the version was resolved (registry preference, detection file, alias, etc.) before the command runs.
+> Add `--nvm-which` to any `node` or proxy command to print how the version was resolved (detect file, default, or `--nvm-use` override) before the command runs. There is no `--nvm-use-which` flag. `--nvm-use` only overrides the version for that invocation.
 
 ```sh
 node --version --nvm-which

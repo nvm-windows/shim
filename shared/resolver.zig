@@ -81,7 +81,7 @@ pub fn resolveInstalledVersionSpec(
             if (available_versions_text) |catalog| {
                 if (try resolveNamedAliasSpec(allocator, normalized, catalog, active_version)) |concrete| {
                     const exact_req = try exactRequirementFromVersion(concrete);
-                    if (try findBestInstalledVersion(allocator, root, &.{exact_req})) |installed| {
+                    if (try findBestInstalledVersion(allocator, root, &.{exact_req}, active_version)) |installed| {
                         allocator.free(concrete);
                         return installed;
                     }
@@ -94,7 +94,7 @@ pub fn resolveInstalledVersionSpec(
     };
     defer allocator.free(req_set.alternatives);
 
-    if (try findBestInstalledVersion(allocator, root, req_set.alternatives)) |installed| {
+    if (try findBestInstalledVersion(allocator, root, req_set.alternatives, active_version)) |installed| {
         return installed;
     }
 
@@ -225,9 +225,15 @@ const RequirementSet = struct {
     prefer_oldest_when_no_installed: bool,
 };
 
-fn findBestInstalledVersion(allocator: std.mem.Allocator, root: []const u8, reqs: []const Requirement) !?[]u8 {
+fn findBestInstalledVersion(allocator: std.mem.Allocator, root: []const u8, reqs: []const Requirement, preferred: ?[]const u8) !?[]u8 {
     var best_ver: ?SemVer = null;
     var best_name: ?[]u8 = null;
+    errdefer if (best_name) |old| allocator.free(old);
+
+    var preferred_ver: ?SemVer = null;
+    if (preferred) |raw| {
+        preferred_ver = parseFullSemver(raw) catch null;
+    }
 
     var dir = std.fs.openDirAbsolute(root, .{ .iterate = true }) catch return null;
     defer dir.close();
@@ -240,6 +246,13 @@ fn findBestInstalledVersion(allocator: std.mem.Allocator, root: []const u8, reqs
         const cand = entry.name[1..];
         const parsed = parseFullSemver(cand) catch continue;
         if (!matchesAnyRequirement(parsed, reqs)) continue;
+
+        if (preferred_ver) |pref| {
+            if (compareSemver(parsed, pref) == 0) {
+                if (best_name) |old| allocator.free(old);
+                return try allocator.dupe(u8, cand);
+            }
+        }
 
         if (best_ver == null or compareSemver(parsed, best_ver.?) > 0) {
             if (best_name) |old| allocator.free(old);
@@ -899,6 +912,36 @@ test "installed versions prefer newest match before fallback behavior" {
     defer allocator.free(resolved);
 
     try std.testing.expectEqualStrings("23.1.4", resolved);
+}
+
+test "installed range keeps default when default satisfies" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("v13.14.0");
+    try tmp.dir.makeDir("v24.22.1");
+    try tmp.dir.makeDir("v26.11.1");
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    const keep_default = (try resolveInstalledVersionSpec(allocator, root, ">=8.9", null, "13.14.0")).?;
+    defer allocator.free(keep_default);
+    try std.testing.expectEqualStrings("13.14.0", keep_default);
+
+    const keep_v_prefix = (try resolveInstalledVersionSpec(allocator, root, ">=8.9", null, "v13.14.0")).?;
+    defer allocator.free(keep_v_prefix);
+    try std.testing.expectEqualStrings("13.14.0", keep_v_prefix);
+
+    const newest_when_default_misses = (try resolveInstalledVersionSpec(allocator, root, ">=20", null, "13.14.0")).?;
+    defer allocator.free(newest_when_default_misses);
+    try std.testing.expectEqualStrings("26.11.1", newest_when_default_misses);
+
+    const newest_without_default = (try resolveInstalledVersionSpec(allocator, root, ">=8.9", null, null)).?;
+    defer allocator.free(newest_without_default);
+    try std.testing.expectEqualStrings("26.11.1", newest_without_default);
 }
 
 test "npm engines parity matrix for supported grammar" {
