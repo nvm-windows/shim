@@ -203,12 +203,32 @@ pub fn main() !void {
         },
     }
 
-    if (parsed_args.forwarded.len == 0) {
-        try runNode(allocator, resolved.node_bin.?, resolved.resolved_version.?, cfg, true, permission_launch);
-        return;
-    }
+    try runNode(
+        allocator,
+        resolved.node_bin.?,
+        resolved.resolved_version.?,
+        cfg,
+        shouldForceRepl(parsed_args.forwarded.len == 0, stdinIsConsole()),
+        permission_launch,
+    );
+}
 
-    try runNode(allocator, resolved.node_bin.?, resolved.resolved_version.?, cfg, false, permission_launch);
+const std_input_handle: u32 = @bitCast(@as(i32, -10));
+
+extern "kernel32" fn GetStdHandle(nStdHandle: u32) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GetConsoleMode(hConsoleHandle: ?*anyopaque, lpMode: *u32) callconv(.winapi) i32;
+
+fn stdinIsConsole() bool {
+    const handle = GetStdHandle(std_input_handle) orelse return false;
+    if (@intFromPtr(handle) == std.math.maxInt(usize)) return false;
+    var mode: u32 = 0;
+    return GetConsoleMode(handle, &mode) != 0;
+}
+
+// Bare `node` must open a REPL in a console. Piped/redirected stdin is not a
+// TTY; injecting -i forces the REPL, drops async work, and breaks `node < file`.
+fn shouldForceRepl(no_forwarded_args: bool, stdin_is_console: bool) bool {
+    return no_forwarded_args and stdin_is_console;
 }
 
 fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedArgs {
@@ -588,6 +608,22 @@ test "parseArgs accepts nvm-which after forwarded args" {
     try std.testing.expect(parsed.nvm_use_debug);
     try std.testing.expectEqual(@as(usize, 1), parsed.forwarded.len);
     try std.testing.expectEqualStrings("--version", parsed.forwarded[0]);
+}
+
+test "shouldForceRepl only when bare and stdin is console" {
+    try std.testing.expect(shouldForceRepl(true, true));
+    try std.testing.expect(!shouldForceRepl(true, false));
+    try std.testing.expect(!shouldForceRepl(false, true));
+    try std.testing.expect(!shouldForceRepl(false, false));
+}
+
+test "parseArgs nvm-which alone leaves forwarded empty" {
+    const allocator = std.testing.allocator;
+    const parsed = try parseArgs(allocator, &.{ "--nvm-which" });
+    defer allocator.free(parsed.forwarded);
+
+    try std.testing.expect(parsed.nvm_use_debug);
+    try std.testing.expectEqual(@as(usize, 0), parsed.forwarded.len);
 }
 
 test "parseArgs detects nvm shim version flag" {

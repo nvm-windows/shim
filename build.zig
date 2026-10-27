@@ -284,6 +284,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }));
 
+    if (std.mem.eql(u8, app, "node")) {
+        const node_tests = b.addTest(.{
+            .root_module = exe.root_module,
+        });
+        const run_node_tests = b.addRunArtifact(node_tests);
+        test_step.dependOn(&run_node_tests.step);
+    }
+
     b.installArtifact(exe);
 
     // CycloneDX 1.6 via zig-build-sbom (compile graph + build.zig.zon).
