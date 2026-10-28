@@ -3,6 +3,7 @@ const windows = std.os.windows;
 const config = @import("config");
 const registry = @import("registry");
 const wintrust = @import("wintrust");
+const pe_version = @import("pe_version");
 
 const bcrypt_ms_primitive_provider = "Microsoft Primitive Provider";
 const bcrypt_ecdsa_p256 = "ECDSA_P256";
@@ -103,6 +104,7 @@ const kernel32 = struct {
 pub const VerifyResult = enum {
     trusted_cache,
     verified_full,
+    version_mismatch,
     failed,
 };
 
@@ -292,6 +294,7 @@ pub fn ensureResolvedNodeTrusted(
     allocator: std.mem.Allocator,
     install_root: []const u8,
     node_exe_path: []const u8,
+    expected_version: ?[]const u8,
 ) VerifyOutcome {
     const data_root = resolveDataRoot(allocator, install_root) catch {
         return VerifyOutcome.failedStatic("invalid install root configuration");
@@ -303,11 +306,11 @@ pub fn ensureResolvedNodeTrusted(
             return VerifyOutcome.failedStatic("unable to load allowed code signers");
         };
         defer freeAllowedSigners(allocator, defaults);
-        return ensureNodeTrusted(allocator, data_root, node_exe_path, defaults);
+        return ensureNodeTrusted(allocator, data_root, node_exe_path, defaults, expected_version);
     };
     defer freeAllowedSigners(allocator, allowed_signers);
 
-    return ensureNodeTrusted(allocator, data_root, node_exe_path, allowed_signers);
+    return ensureNodeTrusted(allocator, data_root, node_exe_path, allowed_signers, expected_version);
 }
 
 pub fn ensureNodeTrusted(
@@ -315,6 +318,7 @@ pub fn ensureNodeTrusted(
     data_root: []const u8,
     node_exe_path: []const u8,
     allowed_signers: ?[]const []const u8,
+    expected_version: ?[]const u8,
 ) VerifyOutcome {
     const stat = nodeFileTimes(node_exe_path) catch |err| switch (err) {
         error.FileNotFound => return VerifyOutcome.failedStatic("Node.js executable not found or inaccessible"),
@@ -322,20 +326,20 @@ pub fn ensureNodeTrusted(
     };
 
     const pubkey = loadTrustedPublicKey(allocator, data_root) catch {
-        return runFullVerify(allocator, node_exe_path, allowed_signers);
+        return runFullVerify(allocator, node_exe_path, allowed_signers, expected_version);
     };
     defer allocator.free(pubkey);
 
     const cache_key = cacheKeyForPath(allocator, node_exe_path) catch {
-        return runFullVerify(allocator, node_exe_path, allowed_signers);
+        return runFullVerify(allocator, node_exe_path, allowed_signers, expected_version);
     };
     defer allocator.free(cache_key);
 
     const entry_opt = loadCacheEntry(allocator, cache_key) catch {
-        return runFullVerify(allocator, node_exe_path, allowed_signers);
+        return runFullVerify(allocator, node_exe_path, allowed_signers, expected_version);
     };
     const entry = entry_opt orelse {
-        return runFullVerify(allocator, node_exe_path, allowed_signers);
+        return runFullVerify(allocator, node_exe_path, allowed_signers, expected_version);
     };
     defer entry.deinit(allocator);
 
@@ -345,23 +349,23 @@ pub fn ensureNodeTrusted(
     defer allocator.free(normalized);
 
     if (!pathsEqual(normalized, entry.path)) {
-        return runFullVerifyAfterCacheChange(allocator, node_exe_path, allowed_signers, .path_changed);
+        return runFullVerifyAfterCacheChange(allocator, node_exe_path, allowed_signers, .path_changed, expected_version);
     }
     if (entry.size != stat.size or entry.mtime != stat.mtime) {
-        return runFullVerifyAfterCacheChange(allocator, node_exe_path, allowed_signers, .metadata_changed);
+        return runFullVerifyAfterCacheChange(allocator, node_exe_path, allowed_signers, .metadata_changed, expected_version);
     }
     if (entry.version != config.verify_cache_schema_version) {
-        return runFullVerify(allocator, node_exe_path, allowed_signers);
+        return runFullVerify(allocator, node_exe_path, allowed_signers, expected_version);
     }
 
     const live_state = nodeFileSecurityState(node_exe_path) catch {
-        return runFullVerify(allocator, node_exe_path, allowed_signers);
+        return runFullVerify(allocator, node_exe_path, allowed_signers, expected_version);
     };
     if (live_state.volume_serial != entry.volume_serial or
         live_state.file_id != entry.file_id or
         live_state.usn != entry.usn)
     {
-        return runFullVerifyAfterCacheChange(allocator, node_exe_path, allowed_signers, .identity_changed);
+        return runFullVerifyAfterCacheChange(allocator, node_exe_path, allowed_signers, .identity_changed, expected_version);
     }
 
     const payload = canonicalPayload(
@@ -378,13 +382,18 @@ pub fn ensureNodeTrusted(
     defer allocator.free(payload);
 
     verifyCacheSignature(pubkey, payload, entry.sig) catch {
-        return runFullVerifyAfterCacheChange(allocator, node_exe_path, allowed_signers, .signature_invalid);
+        return runFullVerifyAfterCacheChange(allocator, node_exe_path, allowed_signers, .signature_invalid, expected_version);
     };
 
     return .{ .result = .trusted_cache };
 }
 
-fn runFullVerify(allocator: std.mem.Allocator, node_exe_path: []const u8, allowed_signers: ?[]const []const u8) VerifyOutcome {
+fn runFullVerify(
+    allocator: std.mem.Allocator,
+    node_exe_path: []const u8,
+    allowed_signers: ?[]const []const u8,
+    expected_version: ?[]const u8,
+) VerifyOutcome {
     const mode = loadRuntimeRevocationMode(allocator);
     wintrust.verifyAuthenticodeChain(node_exe_path, mode) catch {
         return VerifyOutcome.failedStatic("authenticode signature verification failed");
@@ -425,6 +434,21 @@ fn runFullVerify(allocator: std.mem.Allocator, node_exe_path: []const u8, allowe
         }
     }
 
+    if (expected_version) |folder_version| {
+        const pe = pe_version.readFileVersion(allocator, node_exe_path) catch {
+            var outcome = VerifyOutcome{};
+            outcome.setReason("missing", .{});
+            outcome.result = .version_mismatch;
+            return outcome;
+        };
+        if (!pe_version.coreVersionsEqual(pe, folder_version)) {
+            var outcome = VerifyOutcome{};
+            outcome.setReason("{d}.{d}.{d}", .{ pe.major, pe.minor, pe.patch });
+            outcome.result = .version_mismatch;
+            return outcome;
+        }
+    }
+
     return .{ .result = .verified_full };
 }
 
@@ -433,8 +457,9 @@ fn runFullVerifyAfterCacheChange(
     node_exe_path: []const u8,
     allowed_signers: ?[]const []const u8,
     cache_status: CacheStatus,
+    expected_version: ?[]const u8,
 ) VerifyOutcome {
-    var outcome = runFullVerify(allocator, node_exe_path, allowed_signers);
+    var outcome = runFullVerify(allocator, node_exe_path, allowed_signers, expected_version);
     outcome.cache_status = cache_status;
     return outcome;
 }

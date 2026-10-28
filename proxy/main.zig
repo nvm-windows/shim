@@ -6,6 +6,7 @@ const eventlog = @import("eventlog");
 const errors = @import("errors");
 const shimintegrity = @import("shimintegrity");
 const verifycache = @import("verifycache");
+const version_firewall = @import("version_firewall");
 const install_safety = @import("install_safety");
 const module_firewall = @import("module_firewall");
 const config = @import("config");
@@ -84,6 +85,11 @@ pub fn main() !void {
         },
         error.OutOfMemory => return err,
     };
+
+    switch (try version_firewall.evaluate(allocator, resolved.resolved_version.?, build_options.certified)) {
+        .allow => {},
+        .deny => |denied| errors.versionFirewallBlocked(denied.version, denied.source),
+    }
 
     if (parsed_args.nvm_use_debug) {
         std.debug.print(
@@ -165,7 +171,7 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
-    const verify_outcome = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, resolved.node_bin.?);
+    const verify_outcome = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, resolved.node_bin.?, resolved.resolved_version.?);
     switch (verify_outcome.result) {
         .trusted_cache => {},
         .verified_full => {
@@ -232,6 +238,42 @@ pub fn main() !void {
                 );
             }
         },
+        .version_mismatch => {
+            const actual = if (verify_outcome.reason.len == 0) "missing" else verify_outcome.reason;
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "NVM4314 Node.js execution blocked because FileVersion {s} does not match folder {s}: {s}",
+                .{ actual, resolved.resolved_version.?, resolved.node_bin.? },
+            );
+            defer allocator.free(message);
+            eventlog.writeLicensedSecurityError(
+                allocator,
+                cfg.structured_logging,
+                "proxy",
+                "node.security.version_mismatch",
+                .{
+                    .action = "execution_blocked",
+                    .cache_status = @tagName(verify_outcome.cache_status),
+                    .command = command_name,
+                    .detail = actual,
+                    .failure_kind = "file_version_mismatch",
+                    .node_path = resolved.node_bin.?,
+                    .node_version = resolved.resolved_version.?,
+                    .source = "proxy",
+                    .verification_result = "version_mismatch",
+                    .user = audit_ctx.user,
+                    .sid = audit_ctx.sid,
+                    .hostname = audit_ctx.hostname,
+                    .parent_process = audit_ctx.parent_process,
+                    .parent_pid = audit_ctx.parent_pid,
+                    .project_name = audit_ctx.project_name,
+                    .project_path = audit_ctx.project_path,
+                },
+                message,
+                4314,
+            );
+            errors.nodeVersionMismatch(resolved.node_bin.?, resolved.resolved_version.?, actual);
+        },
         .failed => {
             const message = try std.fmt.allocPrint(
                 allocator,
@@ -272,13 +314,16 @@ pub fn main() !void {
     try enforceDelegatedCommandTrust(allocator, cfg, command_name, command_path, resolved.node_bin.?, resolved.resolved_version.?, node_install_dir_abs);
 
     var bare_install = false;
+    const npm_module_minimum_age = nodeversion.effectiveNpmModuleMinimumAge(cfg.npm_module_minimum_age, build_options.certified);
+    const npm_module_minimum_age_forced = cfg.npm_module_minimum_age_machine_policy;
     const pm_ctx = PmCtx{
         .allocator = allocator,
         .node_install_dir = node_install_dir_abs,
         .node_bin = resolved.node_bin.?,
         .command_name = command_name,
         .command_path = command_path,
-        .npm_module_minimum_age = cfg.npm_module_minimum_age,
+        .npm_module_minimum_age = npm_module_minimum_age,
+        .npm_module_minimum_age_forced = npm_module_minimum_age_forced,
         .npm_registry_fallback = cfg.npm_registry_fallback,
         .block_lifecycle_scripts = cfg.block_package_manager_lifecycle_scripts,
     };
@@ -332,7 +377,8 @@ pub fn main() !void {
         resolved.node_bin.?,
         command_name,
         command_path,
-        cfg.npm_module_minimum_age,
+        npm_module_minimum_age,
+        npm_module_minimum_age_forced,
         cfg.npm_registry_fallback,
         cfg.block_package_manager_lifecycle_scripts,
         forwarded,
@@ -1092,11 +1138,11 @@ fn enforceDelegatedCommandTrust(
     const ext = std.fs.path.extension(command_path);
     if (std.ascii.eqlIgnoreCase(ext, ".exe") or (ext.len == 0 and fileStartsWithMz(command_path))) {
         // Same TPM verify-cache as node.exe — never full Authenticode on warm path.
-        const outcome = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, command_path);
-        if (outcome.result == .failed) {
+        const outcome = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, command_path, null);
+        if (outcome.result == .failed or outcome.result == .version_mismatch) {
             const reason = if (outcome.reason.len == 0) "delegated executable trust verification failed" else outcome.reason;
             recoverDelegatedTrustOrReport(allocator, cfg, node_install_dir, command_name, command_path, node_bin, node_version, reason);
-            const retry = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, command_path);
+            const retry = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, command_path, null);
             if (retry.result == .failed) {
                 reportDelegatedTrustFailure(
                     allocator,
@@ -1367,6 +1413,7 @@ const PmCtx = struct {
     command_name: []const u8,
     command_path: []const u8,
     npm_module_minimum_age: ?u64,
+    npm_module_minimum_age_forced: bool,
     npm_registry_fallback: ?[]const u8,
     block_lifecycle_scripts: bool,
 };
@@ -1380,6 +1427,7 @@ fn runPm(ctx: *anyopaque, args: []const []const u8) u8 {
         pm.command_name,
         pm.command_path,
         pm.npm_module_minimum_age,
+        pm.npm_module_minimum_age_forced,
         pm.npm_registry_fallback,
         pm.block_lifecycle_scripts,
         args,
@@ -1406,6 +1454,7 @@ fn runDelegatedCommand(
     command_name: []const u8,
     command_path: []const u8,
     npm_module_minimum_age: ?u64,
+    npm_module_minimum_age_forced: bool,
     npm_registry_fallback: ?[]const u8,
     block_lifecycle_scripts: bool,
     forwarded: []const []const u8,
@@ -1416,7 +1465,7 @@ fn runDelegatedCommand(
     const locked = try prepareLifecycleScriptLock(allocator, &env_map, command_name, command_path, block_lifecycle_scripts, forwarded);
     defer if (locked.owns_args) allocator.free(locked.args);
 
-    const forwarded_args = try filterForwardedArgsForAgePolicy(allocator, command_name, npm_module_minimum_age, locked.args);
+    const forwarded_args = try filterForwardedArgsForAgePolicy(allocator, command_name, npm_module_minimum_age, npm_module_minimum_age_forced, locked.args);
     defer allocator.free(forwarded_args);
 
     const old_path = env_map.get("PATH") orelse "";
@@ -1738,21 +1787,86 @@ fn filterForwardedArgsForAgePolicy(
     allocator: std.mem.Allocator,
     command_name: []const u8,
     npm_module_minimum_age: ?u64,
+    forced: bool,
     forwarded: []const []const u8,
 ) ![]const []const u8 {
+    if (forced) return stripAgeOverrideFlags(allocator, forwarded);
+
     if (!(std.ascii.eqlIgnoreCase(command_name, "yarn") and (npm_module_minimum_age orelse 0) != 0)) {
         return allocator.dupe([]const u8, forwarded);
     }
 
+    return stripMatchingArgs(allocator, forwarded, isYarnBypassAgePolicyFlag);
+}
+
+fn stripAgeOverrideFlags(allocator: std.mem.Allocator, forwarded: []const []const u8) ![]const []const u8 {
+    const separator = passthroughSeparatorIndex(forwarded);
+    var filtered = std.ArrayListUnmanaged([]const u8){};
+    errdefer filtered.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < separator) {
+        const arg = forwarded[index];
+        if (isAgeOverrideEqualsFlag(arg) or isYarnBypassAgePolicyFlag(arg) or isYarnNoTimeGateFlag(arg)) {
+            index += 1;
+            continue;
+        }
+        if (isAgeOverrideBareFlag(arg)) {
+            index += 1;
+            if (index < separator and forwarded[index].len > 0 and forwarded[index][0] != '-') {
+                index += 1;
+            }
+            continue;
+        }
+        try filtered.append(allocator, arg);
+        index += 1;
+    }
+
+    if (separator < forwarded.len) {
+        try filtered.appendSlice(allocator, forwarded[separator..]);
+    }
+    return filtered.toOwnedSlice(allocator);
+}
+
+fn stripMatchingArgs(
+    allocator: std.mem.Allocator,
+    forwarded: []const []const u8,
+    comptime matches: fn ([]const u8) bool,
+) ![]const []const u8 {
     var filtered = std.ArrayListUnmanaged([]const u8){};
     defer filtered.deinit(allocator);
 
     for (forwarded) |arg| {
-        if (std.ascii.eqlIgnoreCase(arg, "--bypass-age-policy")) continue;
+        if (matches(arg)) continue;
         try filtered.append(allocator, arg);
     }
 
     return filtered.toOwnedSlice(allocator);
+}
+
+fn isYarnBypassAgePolicyFlag(arg: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(arg, "--bypass-age-policy");
+}
+
+fn isYarnNoTimeGateFlag(arg: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(arg, "--no-time-gate");
+}
+
+fn isAgeOverrideBareFlag(arg: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(arg, "--min-release-age") or
+        std.ascii.eqlIgnoreCase(arg, "--minimum-release-age") or
+        std.ascii.eqlIgnoreCase(arg, "--config.min-release-age");
+}
+
+fn isAgeOverrideEqualsFlag(arg: []const u8) bool {
+    return startsWithIgnoreCase(arg, "--min-release-age=") or
+        startsWithIgnoreCase(arg, "--minimum-release-age=") or
+        startsWithIgnoreCase(arg, "--config.min-release-age=");
+}
+
+fn startsWithIgnoreCase(haystack: []const u8, prefix: []const u8) bool {
+    if (haystack.len < prefix.len) return false;
+    return std.ascii.eqlIgnoreCase(haystack[0..prefix.len], prefix);
 }
 
 const PackageManagerAgeGateEnv = struct {
@@ -3208,7 +3322,7 @@ test "filterForwardedArgsForAgePolicy strips yarn bypass flag when minutes is no
     const allocator = std.testing.allocator;
     const original = [_][]const u8{ "add", "left-pad", "--bypass-age-policy", "--dev", "--BYPASS-AGE-POLICY" };
 
-    const filtered = try filterForwardedArgsForAgePolicy(allocator, "yarn", 1440, &original);
+    const filtered = try filterForwardedArgsForAgePolicy(allocator, "yarn", 1440, false, &original);
     defer allocator.free(filtered);
 
     try std.testing.expectEqual(@as(usize, 3), filtered.len);
@@ -3221,15 +3335,59 @@ test "filterForwardedArgsForAgePolicy keeps yarn bypass flag when minutes is zer
     const allocator = std.testing.allocator;
     const original = [_][]const u8{ "add", "--bypass-age-policy" };
 
-    const missing = try filterForwardedArgsForAgePolicy(allocator, "yarn", null, &original);
+    const missing = try filterForwardedArgsForAgePolicy(allocator, "yarn", null, false, &original);
     defer allocator.free(missing);
     try std.testing.expectEqual(@as(usize, 2), missing.len);
     try std.testing.expectEqualStrings("--bypass-age-policy", missing[1]);
 
-    const zero = try filterForwardedArgsForAgePolicy(allocator, "yarn", 0, &original);
+    const zero = try filterForwardedArgsForAgePolicy(allocator, "yarn", 0, false, &original);
     defer allocator.free(zero);
     try std.testing.expectEqual(@as(usize, 2), zero.len);
     try std.testing.expectEqualStrings("--bypass-age-policy", zero[1]);
+}
+
+test "filterForwardedArgsForAgePolicy keeps npm min-release-age when not forced" {
+    const allocator = std.testing.allocator;
+    const original = [_][]const u8{ "install", "left-pad", "--min-release-age=0" };
+
+    const filtered = try filterForwardedArgsForAgePolicy(allocator, "npm", 2880, false, &original);
+    defer allocator.free(filtered);
+
+    try std.testing.expectEqual(@as(usize, 3), filtered.len);
+    try std.testing.expectEqualStrings("--min-release-age=0", filtered[2]);
+}
+
+test "filterForwardedArgsForAgePolicy strips age flags when HKLM policy is forced" {
+    const allocator = std.testing.allocator;
+    const original = [_][]const u8{
+        "install",
+        "left-pad",
+        "--min-release-age=0",
+        "--min-release-age",
+        "0",
+        "--config.min-release-age=0",
+        "--minimum-release-age",
+        "0",
+        "--no-time-gate",
+        "--bypass-age-policy",
+        "--",
+        "--min-release-age=0",
+    };
+
+    const filtered = try filterForwardedArgsForAgePolicy(allocator, "npm", 2880, true, &original);
+    defer allocator.free(filtered);
+
+    try expectArgStrings(filtered, &.{ "install", "left-pad", "--", "--min-release-age=0" });
+}
+
+test "filterForwardedArgsForAgePolicy forced DWORD 0 still strips CLI age flags" {
+    const allocator = std.testing.allocator;
+    const original = [_][]const u8{ "install", "left-pad", "--min-release-age=3" };
+
+    const filtered = try filterForwardedArgsForAgePolicy(allocator, "npm", 0, true, &original);
+    defer allocator.free(filtered);
+
+    try expectArgStrings(filtered, &.{ "install", "left-pad" });
 }
 
 test "corepackBackedArgv prefixes command name" {

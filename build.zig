@@ -98,9 +98,25 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const pe_version_module = b.createModule(.{
+        .root_source_file = b.path("shared/pe_version.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const version_firewall_module = b.createModule(.{
+        .root_source_file = b.path("shared/version_firewall.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    version_firewall_module.addImport("config", config_module);
+    version_firewall_module.addImport("registry", registry_module);
+    version_firewall_module.addImport("resolver", resolver_module);
+
     verifycache_module.addImport("config", config_module);
     verifycache_module.addImport("registry", registry_module);
     verifycache_module.addImport("wintrust", wintrust_module);
+    verifycache_module.addImport("pe_version", pe_version_module);
 
     const verifycache_tests = b.addTest(.{
         .root_module = verifycache_module,
@@ -110,6 +126,7 @@ pub fn build(b: *std.Build) void {
     verifycache_tests.root_module.linkSystemLibrary("advapi32", .{});
     verifycache_tests.root_module.linkSystemLibrary("crypt32", .{});
     verifycache_tests.root_module.linkSystemLibrary("wintrust", .{});
+    verifycache_tests.root_module.linkSystemLibrary("version", .{});
     const run_verifycache_tests = b.addRunArtifact(verifycache_tests);
     const test_step = b.step("test", "Run shim unit tests");
     test_step.dependOn(&run_verifycache_tests.step);
@@ -126,6 +143,20 @@ pub fn build(b: *std.Build) void {
     });
     const run_resolver_tests = b.addRunArtifact(resolver_tests);
     test_step.dependOn(&run_resolver_tests.step);
+
+    const pe_version_tests = b.addTest(.{
+        .root_module = pe_version_module,
+    });
+    pe_version_tests.root_module.linkSystemLibrary("version", .{});
+    const run_pe_version_tests = b.addRunArtifact(pe_version_tests);
+    test_step.dependOn(&run_pe_version_tests.step);
+
+    const version_firewall_tests = b.addTest(.{
+        .root_module = version_firewall_module,
+    });
+    version_firewall_tests.root_module.linkSystemLibrary("advapi32", .{});
+    const run_version_firewall_tests = b.addRunArtifact(version_firewall_tests);
+    test_step.dependOn(&run_version_firewall_tests.step);
 
     const permission_grants_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -205,11 +236,14 @@ pub fn build(b: *std.Build) void {
 
     if (std.mem.eql(u8, app, "node") or std.mem.eql(u8, app, "proxy")) {
         exe.root_module.addImport("verifycache", verifycache_module);
+        exe.root_module.addImport("version_firewall", version_firewall_module);
+        exe.root_module.addImport("pe_version", pe_version_module);
         exe.root_module.linkSystemLibrary("bcrypt", .{});
         exe.root_module.linkSystemLibrary("kernel32", .{});
         exe.root_module.linkSystemLibrary("advapi32", .{});
         exe.root_module.linkSystemLibrary("crypt32", .{});
         exe.root_module.linkSystemLibrary("wintrust", .{});
+        exe.root_module.linkSystemLibrary("version", .{});
     }
 
     if (std.mem.eql(u8, app, "proxy")) {

@@ -101,3 +101,29 @@ pub fn nodeVerifyFailed(node_bin: []const u8, node_version: []const u8, reason: 
     , .{ node_bin, if (reason.len == 0) "Trust verification failed." else reason, node_version });
     std.process.exit(1);
 }
+
+pub fn versionFirewallBlocked(version: []const u8, source: []const u8) noreturn {
+    std.debug.print(
+        \\NVM blocked Node.js v{s} because version firewall policy forbids it.
+        \\
+        \\Source: {s}
+        \\Action: Install or use a version allowed by VersionAllowList / VersionBlockList.
+        \\Event code: NVM4411
+        \\
+    , .{ version, source });
+    std.process.exit(1);
+}
+
+pub fn nodeVersionMismatch(node_bin: []const u8, expected: []const u8, actual: []const u8) noreturn {
+    std.debug.print(
+        \\NVM blocked Node.js execution because the binary version does not match the install folder.
+        \\
+        \\File: {s}
+        \\Expected: v{s}
+        \\Binary FileVersion: {s}
+        \\Action: Reinstall this version with `nvm install {s} --force`.
+        \\Event code: NVM4314
+        \\
+    , .{ node_bin, expected, actual, expected });
+    std.process.exit(1);
+}

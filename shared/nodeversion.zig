@@ -57,9 +57,19 @@ pub const ShimConfig = struct {
     disable_eval_and_string_execution: bool,
     package_manager_mismatch_action: PackageManagerMismatchAction,
     npm_module_minimum_age: ?u64,
+    npm_module_minimum_age_machine_policy: bool,
     npm_registry_fallback: ?[]u8,
     block_package_manager_lifecycle_scripts: bool,
 };
+
+/// Certified Builds apply this when `NpmModuleMinimumAge` is unset. Community stays off.
+pub const certified_npm_module_minimum_age_minutes: u64 = 2880;
+
+pub fn effectiveNpmModuleMinimumAge(registered: ?u64, certified: bool) ?u64 {
+    if (registered) |age| return age;
+    if (certified) return certified_npm_module_minimum_age_minutes;
+    return null;
+}
 
 pub const PackageManagerConstraint = struct {
     name: []u8,
@@ -177,7 +187,8 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
         .freeze_v8_global_objects = freeze_v8_global_objects,
         .disable_eval_and_string_execution = disable_eval_and_string_execution,
         .package_manager_mismatch_action = package_manager_mismatch_action,
-        .npm_module_minimum_age = npm_module_minimum_age,
+        .npm_module_minimum_age = npm_module_minimum_age.minutes,
+        .npm_module_minimum_age_machine_policy = npm_module_minimum_age.machine_policy,
         .npm_registry_fallback = npm_registry_fallback,
         .block_package_manager_lifecycle_scripts = block_package_manager_lifecycle_scripts,
     };
@@ -439,16 +450,31 @@ fn queryMultiPolicyThenPref(allocator: std.mem.Allocator, pref_hives: []const wi
     return null;
 }
 
-fn loadMinimumAgeMinutes(allocator: std.mem.Allocator, pref_hives: []const windows.HKEY) !?u64 {
+const LoadedMinimumAge = struct {
+    minutes: ?u64,
+    machine_policy: bool,
+};
+
+fn sourceIsMachinePolicy(src: RegistrySource) bool {
+    return hiveIsLocalMachine(src.hive) and std.mem.eql(u8, src.path, policy_path);
+}
+
+fn loadMinimumAgeMinutes(allocator: std.mem.Allocator, pref_hives: []const windows.HKEY) !LoadedMinimumAge {
     var buf: [8]RegistrySource = undefined;
     for (collectPolicyThenPrefSources(pref_hives, &buf)) |src| {
-        if (try registry.queryQwordOptional(src.hive, src.path, reg_value_npm_module_minimum_age)) |value| return value;
-        if (try registry.queryDwordOptional(src.hive, src.path, reg_value_npm_module_minimum_age)) |value| return @as(u64, value);
+        if (try registry.queryQwordOptional(src.hive, src.path, reg_value_npm_module_minimum_age)) |value| {
+            return .{ .minutes = value, .machine_policy = sourceIsMachinePolicy(src) };
+        }
+        if (try registry.queryDwordOptional(src.hive, src.path, reg_value_npm_module_minimum_age)) |value| {
+            return .{ .minutes = @as(u64, value), .machine_policy = sourceIsMachinePolicy(src) };
+        }
         const raw = registry.queryString(allocator, src.hive, src.path, reg_value_npm_module_minimum_age) catch continue;
         defer allocator.free(raw);
-        if (parseMinimumAgeMinutes(raw)) |value| return value;
+        if (parseMinimumAgeMinutes(raw)) |value| {
+            return .{ .minutes = value, .machine_policy = sourceIsMachinePolicy(src) };
+        }
     }
-    return null;
+    return .{ .minutes = null, .machine_policy = false };
 }
 
 fn loadPolicyOrPrefBool(config_hives: []const windows.HKEY, value_name: []const u8) !bool {
@@ -1263,6 +1289,13 @@ test "parseMinimumAgeMinutes saturates overflow and rejects invalid" {
     try std.testing.expect(parseMinimumAgeMinutes("   ") == null);
 }
 
+test "effectiveNpmModuleMinimumAge uses 2-day Certified default when unset" {
+    try std.testing.expectEqual(@as(?u64, null), effectiveNpmModuleMinimumAge(null, false));
+    try std.testing.expectEqual(@as(?u64, certified_npm_module_minimum_age_minutes), effectiveNpmModuleMinimumAge(null, true));
+    try std.testing.expectEqual(@as(?u64, 0), effectiveNpmModuleMinimumAge(0, true));
+    try std.testing.expectEqual(@as(?u64, 1440), effectiveNpmModuleMinimumAge(1440, true));
+}
+
 test "collectPolicyThenPrefSources certified: HKLM policy, HKLM pref, HKCU policy, HKCU pref" {
     const hives = [_]windows.HKEY{ windows.HKEY_LOCAL_MACHINE, windows.HKEY_CURRENT_USER };
     var buf: [8]RegistrySource = undefined;
@@ -1344,6 +1377,7 @@ fn testShimConfig(auto_install: bool) ShimConfig {
         .disable_eval_and_string_execution = false,
         .package_manager_mismatch_action = .ignore,
         .npm_module_minimum_age = null,
+        .npm_module_minimum_age_machine_policy = false,
         .npm_registry_fallback = null,
         .block_package_manager_lifecycle_scripts = false,
     };

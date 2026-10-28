@@ -8,6 +8,7 @@ const config = @import("config");
 const errors = @import("errors");
 const shimintegrity = @import("shimintegrity");
 const verifycache = @import("verifycache");
+const version_firewall = @import("version_firewall");
 
 const shim_version = build_options.version;
 
@@ -74,6 +75,11 @@ pub fn main() !void {
         error.OutOfMemory => return err,
     };
 
+    switch (try version_firewall.evaluate(allocator, resolved.resolved_version.?, build_options.certified)) {
+        .allow => {},
+        .deny => |denied| errors.versionFirewallBlocked(denied.version, denied.source),
+    }
+
     if (parsed_args.nvm_use_debug) {
         std.debug.print(
             "nvm version resolution: source={s} requested={s} effective={s} resolved={s} node={s}\n",
@@ -102,7 +108,7 @@ pub fn main() !void {
         writeNodeExecuted(allocator, audit_ctx, requested_command, resolved.node_bin.?, resolved.resolved_version.?, arguments, working_directory, permission_launch);
     }
 
-    const verify_outcome = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, resolved.node_bin.?);
+    const verify_outcome = verifycache.ensureResolvedNodeTrusted(allocator, cfg.root, resolved.node_bin.?, resolved.resolved_version.?);
     switch (verify_outcome.result) {
         .trusted_cache => {},
         .verified_full => {
@@ -166,6 +172,41 @@ pub fn main() !void {
                     4304,
                 );
             }
+        },
+        .version_mismatch => {
+            const actual = if (verify_outcome.reason.len == 0) "missing" else verify_outcome.reason;
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "NVM4314 Node.js execution blocked because FileVersion {s} does not match folder {s}: {s}",
+                .{ actual, resolved.resolved_version.?, resolved.node_bin.? },
+            );
+            defer allocator.free(message);
+            eventlog.writeLicensedSecurityError(
+                allocator,
+                cfg.structured_logging,
+                "node-shim",
+                "node.security.version_mismatch",
+                .{
+                    .action = "execution_blocked",
+                    .cache_status = @tagName(verify_outcome.cache_status),
+                    .detail = actual,
+                    .failure_kind = "file_version_mismatch",
+                    .node_path = resolved.node_bin.?,
+                    .node_version = resolved.resolved_version.?,
+                    .source = "node-shim",
+                    .verification_result = "version_mismatch",
+                    .user = audit_ctx.user,
+                    .sid = audit_ctx.sid,
+                    .hostname = audit_ctx.hostname,
+                    .parent_process = audit_ctx.parent_process,
+                    .parent_pid = audit_ctx.parent_pid,
+                    .project_name = audit_ctx.project_name,
+                    .project_path = audit_ctx.project_path,
+                },
+                message,
+                4314,
+            );
+            errors.nodeVersionMismatch(resolved.node_bin.?, resolved.resolved_version.?, actual);
         },
         .failed => {
             const message = try std.fmt.allocPrint(
