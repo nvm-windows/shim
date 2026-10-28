@@ -52,6 +52,8 @@ pub const ShimConfig = struct {
     log_executions: bool,
     structured_logging: bool,
     enforce_permission_model: bool,
+    /// True when the winning `EnforcePermissionModel` value is HKLM Policies.
+    enforce_permission_model_machine_policy: bool,
     permission_grant_audit: bool,
     freeze_v8_global_objects: bool,
     disable_eval_and_string_execution: bool,
@@ -159,7 +161,7 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
         try allocator.alloc([]const u8, 0);
     const log_executions = (try queryDwordPolicyThenPref(config_hives, reg_value_log_executions)) orelse 0;
     const structured_logging = allowsStructuredLogging(allocator, config_hives);
-    const enforce_permission_model = try loadPolicyOrPrefBool(config_hives, reg_value_enforce_permission_model);
+    const enforce_permission = try loadPolicyOrPrefBoolSource(config_hives, reg_value_enforce_permission_model);
     const permission_grant_audit = try loadPolicyOrPrefBool(config_hives, reg_value_permission_grant_audit);
     const freeze_v8_global_objects = try loadPolicyOrPrefBool(config_hives, reg_value_freeze_v8_global_objects);
     const disable_eval_and_string_execution = try loadPolicyOrPrefBool(config_hives, reg_value_disable_eval_and_string_execution);
@@ -182,7 +184,8 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
         .aliases = aliases,
         .log_executions = log_executions != 0,
         .structured_logging = structured_logging,
-        .enforce_permission_model = enforce_permission_model,
+        .enforce_permission_model = enforce_permission.value,
+        .enforce_permission_model_machine_policy = enforce_permission.machine_policy,
         .permission_grant_audit = permission_grant_audit,
         .freeze_v8_global_objects = freeze_v8_global_objects,
         .disable_eval_and_string_execution = disable_eval_and_string_execution,
@@ -477,11 +480,23 @@ fn loadMinimumAgeMinutes(allocator: std.mem.Allocator, pref_hives: []const windo
     return .{ .minutes = null, .machine_policy = false };
 }
 
-fn loadPolicyOrPrefBool(config_hives: []const windows.HKEY, value_name: []const u8) !bool {
-    if (try queryDwordPolicyThenPref(config_hives, value_name)) |value| {
-        return value != 0;
+const LoadedBool = struct {
+    value: bool,
+    machine_policy: bool,
+};
+
+fn loadPolicyOrPrefBoolSource(config_hives: []const windows.HKEY, value_name: []const u8) !LoadedBool {
+    var buf: [8]RegistrySource = undefined;
+    for (collectPolicyThenPrefSources(config_hives, &buf)) |src| {
+        if (try registry.queryDwordOptional(src.hive, src.path, value_name)) |value| {
+            return .{ .value = value != 0, .machine_policy = sourceIsMachinePolicy(src) };
+        }
     }
-    return false;
+    return .{ .value = false, .machine_policy = false };
+}
+
+fn loadPolicyOrPrefBool(config_hives: []const windows.HKEY, value_name: []const u8) !bool {
+    return (try loadPolicyOrPrefBoolSource(config_hives, value_name)).value;
 }
 
 pub fn loadPolicyOrPrefMulti(allocator: std.mem.Allocator, value_name: []const u8) ![]const []const u8 {
@@ -1385,6 +1400,7 @@ fn testShimConfig(auto_install: bool) ShimConfig {
         .log_executions = false,
         .structured_logging = false,
         .enforce_permission_model = false,
+        .enforce_permission_model_machine_policy = false,
         .permission_grant_audit = false,
         .freeze_v8_global_objects = false,
         .disable_eval_and_string_execution = false,
