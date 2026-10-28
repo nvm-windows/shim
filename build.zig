@@ -135,6 +135,7 @@ pub fn build(b: *std.Build) void {
         .root_module = nodeversion_module,
     });
     nodeversion_tests.root_module.linkSystemLibrary("advapi32", .{});
+    nodeversion_tests.root_module.linkSystemLibrary("kernel32", .{});
     const run_nodeversion_tests = b.addRunArtifact(nodeversion_tests);
     test_step.dependOn(&run_nodeversion_tests.step);
 

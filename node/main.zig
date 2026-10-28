@@ -75,11 +75,6 @@ pub fn main() !void {
         error.OutOfMemory => return err,
     };
 
-    switch (try version_firewall.evaluate(allocator, resolved.resolved_version.?, build_options.certified)) {
-        .allow => {},
-        .deny => |denied| errors.versionFirewallBlocked(denied.version, denied.source),
-    }
-
     if (parsed_args.nvm_use_debug) {
         std.debug.print(
             "nvm version resolution: source={s} requested={s} effective={s} resolved={s} node={s}\n",
@@ -89,6 +84,41 @@ pub fn main() !void {
 
     var audit_ctx = eventlog.captureAuditContext(allocator);
     defer audit_ctx.deinit(allocator);
+
+    switch (try version_firewall.evaluate(allocator, resolved.resolved_version.?, build_options.certified)) {
+        .allow => {},
+        .deny => |denied| {
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "NVM4411 Node.js v{s} blocked by version firewall ({s})",
+                .{ denied.version, denied.source },
+            );
+            defer allocator.free(message);
+            eventlog.writeLicensedSecurityError(
+                allocator,
+                cfg.structured_logging,
+                "node-shim",
+                "node.security.version_firewall_blocked",
+                .{
+                    .action = "execution_blocked",
+                    .detail = denied.source,
+                    .failure_kind = "version_firewall",
+                    .node_version = denied.version,
+                    .source = "node-shim",
+                    .user = audit_ctx.user,
+                    .sid = audit_ctx.sid,
+                    .hostname = audit_ctx.hostname,
+                    .parent_process = audit_ctx.parent_process,
+                    .parent_pid = audit_ctx.parent_pid,
+                    .project_name = audit_ctx.project_name,
+                    .project_path = audit_ctx.project_path,
+                },
+                message,
+                4411,
+            );
+            errors.versionFirewallBlocked(denied.version, denied.source);
+        },
+    }
 
     const launch_forwarded: []const []const u8 = if (parsed_args.forwarded.len == 0) &.{} else parsed_args.forwarded;
     var permission_launch = try preparePermissionLaunch(allocator, cfg, resolved.resolved_version.?, launch_forwarded);
