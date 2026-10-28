@@ -351,12 +351,15 @@ pub fn main() !void {
         .allocator = allocator,
         .node_install_dir = node_install_dir_abs,
         .node_bin = resolved.node_bin.?,
+        .node_version = resolved.resolved_version.?,
         .command_name = command_name,
         .command_path = command_path,
         .npm_module_minimum_age = npm_module_minimum_age,
         .npm_module_minimum_age_forced = npm_module_minimum_age_forced,
         .npm_registry_fallback = cfg.npm_registry_fallback,
         .block_lifecycle_scripts = cfg.block_package_manager_lifecycle_scripts,
+        .structured_logging = cfg.structured_logging,
+        .audit_ctx = audit_ctx,
     };
     try malware_scan.enforce(
         allocator,
@@ -406,12 +409,15 @@ pub fn main() !void {
         allocator,
         node_install_dir_abs,
         resolved.node_bin.?,
+        resolved.resolved_version.?,
         command_name,
         command_path,
         npm_module_minimum_age,
         npm_module_minimum_age_forced,
         cfg.npm_registry_fallback,
         cfg.block_package_manager_lifecycle_scripts,
+        cfg.structured_logging,
+        audit_ctx,
         forwarded,
     ) catch |err| blk: {
         std.debug.print("proxy failed to run {s}: {s}\n", .{ command_name, @errorName(err) });
@@ -1441,12 +1447,15 @@ const PmCtx = struct {
     allocator: std.mem.Allocator,
     node_install_dir: []const u8,
     node_bin: []const u8,
+    node_version: []const u8,
     command_name: []const u8,
     command_path: []const u8,
     npm_module_minimum_age: ?u64,
     npm_module_minimum_age_forced: bool,
     npm_registry_fallback: ?[]const u8,
     block_lifecycle_scripts: bool,
+    structured_logging: bool,
+    audit_ctx: eventlog.AuditContext,
 };
 
 fn runPm(ctx: *anyopaque, args: []const []const u8) u8 {
@@ -1455,12 +1464,15 @@ fn runPm(ctx: *anyopaque, args: []const []const u8) u8 {
         pm.allocator,
         pm.node_install_dir,
         pm.node_bin,
+        pm.node_version,
         pm.command_name,
         pm.command_path,
         pm.npm_module_minimum_age,
         pm.npm_module_minimum_age_forced,
         pm.npm_registry_fallback,
         pm.block_lifecycle_scripts,
+        pm.structured_logging,
+        pm.audit_ctx,
         args,
     ) catch 1;
 }
@@ -1482,12 +1494,15 @@ fn runDelegatedCommand(
     allocator: std.mem.Allocator,
     node_install_dir: []const u8,
     node_bin: []const u8,
+    node_version: []const u8,
     command_name: []const u8,
     command_path: []const u8,
     npm_module_minimum_age: ?u64,
     npm_module_minimum_age_forced: bool,
     npm_registry_fallback: ?[]const u8,
     block_lifecycle_scripts: bool,
+    structured_logging: bool,
+    audit_ctx: eventlog.AuditContext,
     forwarded: []const []const u8,
 ) !u8 {
     var env_map = try std.process.getEnvMap(allocator);
@@ -1495,6 +1510,7 @@ fn runDelegatedCommand(
 
     const locked = try prepareLifecycleScriptLock(allocator, &env_map, command_name, command_path, block_lifecycle_scripts, forwarded);
     defer if (locked.owns_args) allocator.free(locked.args);
+    logLifecycleScriptsBlocked(allocator, structured_logging, command_name, node_version, locked.action, audit_ctx);
 
     const forwarded_args = try filterForwardedArgsForAgePolicy(allocator, command_name, npm_module_minimum_age, npm_module_minimum_age_forced, locked.args);
     defer allocator.free(forwarded_args);
@@ -1621,7 +1637,37 @@ const LifecycleScriptAction = enum {
 const PreparedLifecycleLock = struct {
     args: []const []const u8,
     owns_args: bool,
+    action: LifecycleScriptAction,
 };
+
+const code_lifecycle_scripts_blocked: u32 = 4412;
+
+fn shouldLogLifecycleScriptsBlocked(certified: bool, structured_logging: bool, action: LifecycleScriptAction) bool {
+    return certified and structured_logging and action != .unchanged;
+}
+
+fn logLifecycleScriptsBlocked(
+    allocator: std.mem.Allocator,
+    structured_logging: bool,
+    command_name: []const u8,
+    node_version: []const u8,
+    action: LifecycleScriptAction,
+    audit_ctx: eventlog.AuditContext,
+) void {
+    if (!shouldLogLifecycleScriptsBlocked(build_options.certified, structured_logging, action)) return;
+    eventlog.writeStructuredInfoCode(allocator, "proxy", "package_manager.lifecycle_scripts_blocked", .{
+        .command = command_name,
+        .action = @tagName(action),
+        .node_version = node_version,
+        .user = audit_ctx.user,
+        .sid = audit_ctx.sid,
+        .hostname = audit_ctx.hostname,
+        .parent_process = audit_ctx.parent_process,
+        .parent_pid = audit_ctx.parent_pid,
+        .project_name = audit_ctx.project_name,
+        .project_path = audit_ctx.project_path,
+    }, code_lifecycle_scripts_blocked);
+}
 
 fn prepareLifecycleScriptLock(
     allocator: std.mem.Allocator,
@@ -1631,21 +1677,22 @@ fn prepareLifecycleScriptLock(
     block_lifecycle_scripts: bool,
     forwarded: []const []const u8,
 ) !PreparedLifecycleLock {
-    if (!block_lifecycle_scripts) return .{ .args = forwarded, .owns_args = false };
+    if (!block_lifecycle_scripts) return .{ .args = forwarded, .owns_args = false, .action = .unchanged };
 
     const yarn_major = if (commandWantsYarnLock(command_name, forwarded))
         detectYarnMajor(allocator, command_name, command_path)
     else
         null;
     switch (lifecycleScriptAction(command_name, forwarded, yarn_major)) {
-        .unchanged => return .{ .args = forwarded, .owns_args = false },
+        .unchanged => return .{ .args = forwarded, .owns_args = false, .action = .unchanged },
         .ignore_scripts_flag => return .{
             .args = try rewriteIgnoreScriptsArgs(allocator, forwarded),
             .owns_args = true,
+            .action = .ignore_scripts_flag,
         },
         .yarn_berry_env => {
             try env_map.put("YARN_ENABLE_SCRIPTS", "false");
-            return .{ .args = forwarded, .owns_args = false };
+            return .{ .args = forwarded, .owns_args = false, .action = .yarn_berry_env };
         },
     }
 }
@@ -3284,6 +3331,14 @@ test "rewriteIgnoreScriptsArgs removes flags that turn scripts back on" {
     });
     defer allocator.free(args);
     try expectArgStrings(args, &.{ "install", "left-pad", "--ignore-scripts" });
+}
+
+test "shouldLogLifecycleScriptsBlocked is Certified Advanced Logging only" {
+    try std.testing.expect(!shouldLogLifecycleScriptsBlocked(false, true, .ignore_scripts_flag));
+    try std.testing.expect(!shouldLogLifecycleScriptsBlocked(true, false, .ignore_scripts_flag));
+    try std.testing.expect(!shouldLogLifecycleScriptsBlocked(true, true, .unchanged));
+    try std.testing.expect(shouldLogLifecycleScriptsBlocked(true, true, .ignore_scripts_flag));
+    try std.testing.expect(shouldLogLifecycleScriptsBlocked(true, true, .yarn_berry_env));
 }
 
 test "lifecycleScriptAction selects the package manager lock" {
