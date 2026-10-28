@@ -127,50 +127,36 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
 
     const root = try loadInstallRoot(allocator);
 
-    const auto_use = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_auto_use)) orelse 1;
+    const auto_use = (try queryDwordPolicyThenPref(config_hives, reg_value_auto_use)) orelse 1;
     // Match Go settings default (auto_install=false). Absent registry → off (DI-03).
-    const auto_install = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_auto_install)) orelse 0;
-    const auto_install_prompt = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_auto_install_prompt)) orelse 1;
+    const auto_install = (try queryDwordPolicyThenPref(config_hives, reg_value_auto_install)) orelse 0;
+    const auto_install_prompt = (try queryDwordPolicyThenPref(config_hives, reg_value_auto_install_prompt)) orelse 1;
 
     const auto_detect = auto_detect: {
-        if (try registry.queryMultiStringOptionalWithFallback(allocator, config_hives, reg_path, reg_value_auto_detect)) |configured| {
+        if (try queryMultiPolicyThenPref(allocator, config_hives, reg_value_auto_detect)) |configured| {
             if (configured.len > 0) break :auto_detect configured;
-            for (configured) |value| allocator.free(value);
-            allocator.free(configured);
+            freeStringList(allocator, configured);
         }
 
-        const auto_detect_raw = registry.queryStringWithFallback(allocator, config_hives, reg_path, reg_value_auto_detect) catch
-            try allocator.dupe(u8, default_auto_detect);
-        defer allocator.free(auto_detect_raw);
-        break :auto_detect try parseCsvList(allocator, auto_detect_raw);
+        if (try queryStringPolicyThenPref(allocator, config_hives, reg_value_auto_detect)) |auto_detect_raw| {
+            defer allocator.free(auto_detect_raw);
+            break :auto_detect try parseCsvList(allocator, auto_detect_raw);
+        }
+
+        break :auto_detect try parseCsvList(allocator, default_auto_detect);
     };
-    const aliases = (try registry.queryMultiStringOptionalWithFallback(allocator, config_hives, reg_path, reg_value_aliases)) orelse
+    const aliases = (try queryMultiPolicyThenPref(allocator, config_hives, reg_value_aliases)) orelse
         try allocator.alloc([]const u8, 0);
-    const log_executions = (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_log_executions)) orelse 0;
+    const log_executions = (try queryDwordPolicyThenPref(config_hives, reg_value_log_executions)) orelse 0;
     const structured_logging = allowsStructuredLogging(allocator, config_hives);
     const enforce_permission_model = try loadPolicyOrPrefBool(config_hives, reg_value_enforce_permission_model);
     const permission_grant_audit = try loadPolicyOrPrefBool(config_hives, reg_value_permission_grant_audit);
     const freeze_v8_global_objects = try loadPolicyOrPrefBool(config_hives, reg_value_freeze_v8_global_objects);
     const disable_eval_and_string_execution = try loadPolicyOrPrefBool(config_hives, reg_value_disable_eval_and_string_execution);
-    const npm_registry_fallback = try loadFirstConfiguredRegistryValue(allocator, config_hives, reg_path, reg_value_npm_mirror);
-    const npm_module_minimum_age = age: {
-        if (try registry.queryQwordOptionalWithFallback(config_hives, reg_path, reg_value_npm_module_minimum_age)) |value| {
-            break :age value;
-        }
+    const npm_registry_fallback = try loadFirstConfiguredRegistryValue(allocator, config_hives, reg_value_npm_mirror);
+    const npm_module_minimum_age = try loadMinimumAgeMinutes(allocator, config_hives);
 
-        if (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, reg_value_npm_module_minimum_age)) |value| {
-            break :age @as(u64, value);
-        }
-
-        const raw_age = registry.queryStringWithFallback(allocator, config_hives, reg_path, reg_value_npm_module_minimum_age) catch {
-            break :age null;
-        };
-        defer allocator.free(raw_age);
-
-        break :age parseMinimumAgeMinutes(raw_age);
-    };
-
-    const raw_package_manager_mismatch_action = registry.queryStringWithFallback(allocator, config_hives, reg_path, reg_value_package_manager_mismatch_action) catch
+    const raw_package_manager_mismatch_action = (try queryStringPolicyThenPref(allocator, config_hives, reg_value_package_manager_mismatch_action)) orelse
         try allocator.dupe(u8, "error");
     defer allocator.free(raw_package_manager_mismatch_action);
     const package_manager_mismatch_action = parsePackageManagerMismatchAction(raw_package_manager_mismatch_action);
@@ -401,25 +387,80 @@ fn jsonInteger(value: std.json.Value) ?i64 {
     };
 }
 
-fn loadPolicyOrPrefBool(config_hives: []const windows.HKEY, value_name: []const u8) !bool {
-    // HKLM policy wins (ADMX); then machine/user preferences (nvm config).
-    if (try registry.queryDwordOptionalWithFallback(&policy_hives, policy_path, value_name)) |value| {
-        return value != 0;
+const RegistrySource = struct {
+    hive: windows.HKEY,
+    path: []const u8,
+};
+
+fn hiveIsLocalMachine(hive: windows.HKEY) bool {
+    return hive == windows.HKEY_LOCAL_MACHINE;
+}
+
+/// Policies beat Preferences in the same hive. HKLM beats HKCU.
+/// Order: HKLM Policies → HKLM Preferences → HKCU Policies → HKCU Preferences.
+/// Community preference hives are HKCU only, so HKLM Preferences is skipped.
+fn collectPolicyThenPrefSources(pref_hives: []const windows.HKEY, out: *[8]RegistrySource) []const RegistrySource {
+    var n: usize = 0;
+    out[n] = .{ .hive = windows.HKEY_LOCAL_MACHINE, .path = policy_path };
+    n += 1;
+    for (pref_hives) |hive| {
+        if (!hiveIsLocalMachine(hive)) {
+            out[n] = .{ .hive = hive, .path = policy_path };
+            n += 1;
+        }
+        out[n] = .{ .hive = hive, .path = reg_path };
+        n += 1;
     }
-    if (try registry.queryDwordOptionalWithFallback(config_hives, reg_path, value_name)) |value| {
+    return out[0..n];
+}
+
+fn queryDwordPolicyThenPref(pref_hives: []const windows.HKEY, value_name: []const u8) !?u32 {
+    var buf: [8]RegistrySource = undefined;
+    for (collectPolicyThenPrefSources(pref_hives, &buf)) |src| {
+        if (try registry.queryDwordOptional(src.hive, src.path, value_name)) |value| return value;
+    }
+    return null;
+}
+
+fn queryStringPolicyThenPref(allocator: std.mem.Allocator, pref_hives: []const windows.HKEY, value_name: []const u8) !?[]u8 {
+    var buf: [8]RegistrySource = undefined;
+    for (collectPolicyThenPrefSources(pref_hives, &buf)) |src| {
+        const value = registry.queryString(allocator, src.hive, src.path, value_name) catch continue;
+        return value;
+    }
+    return null;
+}
+
+fn queryMultiPolicyThenPref(allocator: std.mem.Allocator, pref_hives: []const windows.HKEY, value_name: []const u8) !?[]const []const u8 {
+    var buf: [8]RegistrySource = undefined;
+    for (collectPolicyThenPrefSources(pref_hives, &buf)) |src| {
+        if (try registry.queryMultiStringOptional(allocator, src.hive, src.path, value_name)) |value| return value;
+    }
+    return null;
+}
+
+fn loadMinimumAgeMinutes(allocator: std.mem.Allocator, pref_hives: []const windows.HKEY) !?u64 {
+    var buf: [8]RegistrySource = undefined;
+    for (collectPolicyThenPrefSources(pref_hives, &buf)) |src| {
+        if (try registry.queryQwordOptional(src.hive, src.path, reg_value_npm_module_minimum_age)) |value| return value;
+        if (try registry.queryDwordOptional(src.hive, src.path, reg_value_npm_module_minimum_age)) |value| return @as(u64, value);
+        const raw = registry.queryString(allocator, src.hive, src.path, reg_value_npm_module_minimum_age) catch continue;
+        defer allocator.free(raw);
+        if (parseMinimumAgeMinutes(raw)) |value| return value;
+    }
+    return null;
+}
+
+fn loadPolicyOrPrefBool(config_hives: []const windows.HKEY, value_name: []const u8) !bool {
+    if (try queryDwordPolicyThenPref(config_hives, value_name)) |value| {
         return value != 0;
     }
     return false;
 }
 
 pub fn loadPolicyOrPrefMulti(allocator: std.mem.Allocator, value_name: []const u8) ![]const []const u8 {
-    if (try registry.queryMultiStringOptionalWithFallback(allocator, &policy_hives, policy_path, value_name)) |value| {
-        return value;
-    }
-    if (try registry.queryMultiStringOptionalWithFallback(allocator, registry.preferenceHives(), reg_path, value_name)) |value| {
-        return value;
-    }
-    return allocator.alloc([]const u8, 0);
+    return (try queryMultiPolicyThenPref(allocator, registry.preferenceHives(), value_name)) orelse
+        allocator.alloc([]const u8, 0);
 }
 
 pub fn freeMulti(allocator: std.mem.Allocator, values: []const []const u8) void {
@@ -1125,25 +1166,28 @@ fn parseCsvList(allocator: std.mem.Allocator, raw: []const u8) ![]const []const 
     return out.toOwnedSlice(allocator);
 }
 
-fn loadFirstConfiguredRegistryValue(allocator: std.mem.Allocator, hives: anytype, sub_key: []const u8, value_name: []const u8) !?[]u8 {
-    if (try registry.queryMultiStringOptionalWithFallback(allocator, hives, sub_key, value_name)) |configured| {
-        defer freeStringList(allocator, configured);
+fn loadFirstConfiguredRegistryValue(allocator: std.mem.Allocator, pref_hives: []const windows.HKEY, value_name: []const u8) !?[]u8 {
+    var buf: [8]RegistrySource = undefined;
+    for (collectPolicyThenPrefSources(pref_hives, &buf)) |src| {
+        if (try registry.queryMultiStringOptional(allocator, src.hive, src.path, value_name)) |configured| {
+            defer freeStringList(allocator, configured);
 
-        for (configured) |item| {
-            const trimmed = std.mem.trim(u8, item, " \t\r\n");
+            for (configured) |item| {
+                const trimmed = std.mem.trim(u8, item, " \t\r\n");
+                if (trimmed.len == 0) continue;
+                return try allocator.dupe(u8, trimmed);
+            }
+        }
+
+        const raw = registry.queryString(allocator, src.hive, src.path, value_name) catch continue;
+        defer allocator.free(raw);
+
+        var it = std.mem.tokenizeScalar(u8, raw, ',');
+        while (it.next()) |part| {
+            const trimmed = std.mem.trim(u8, part, " \t\r\n");
             if (trimmed.len == 0) continue;
             return try allocator.dupe(u8, trimmed);
         }
-    }
-
-    const raw = registry.queryStringWithFallback(allocator, hives, sub_key, value_name) catch return null;
-    defer allocator.free(raw);
-
-    var it = std.mem.tokenizeScalar(u8, raw, ',');
-    while (it.next()) |part| {
-        const trimmed = std.mem.trim(u8, part, " \t\r\n");
-        if (trimmed.len == 0) continue;
-        return try allocator.dupe(u8, trimmed);
     }
 
     return null;
@@ -1217,6 +1261,34 @@ test "parseMinimumAgeMinutes saturates overflow and rejects invalid" {
     try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), parseMinimumAgeMinutes("10000000000000000000000000"));
     try std.testing.expect(parseMinimumAgeMinutes("not-a-number") == null);
     try std.testing.expect(parseMinimumAgeMinutes("   ") == null);
+}
+
+test "collectPolicyThenPrefSources certified: HKLM policy, HKLM pref, HKCU policy, HKCU pref" {
+    const hives = [_]windows.HKEY{ windows.HKEY_LOCAL_MACHINE, windows.HKEY_CURRENT_USER };
+    var buf: [8]RegistrySource = undefined;
+    const sources = collectPolicyThenPrefSources(&hives, &buf);
+    try std.testing.expectEqual(@as(usize, 4), sources.len);
+    try std.testing.expect(hiveIsLocalMachine(sources[0].hive));
+    try std.testing.expectEqualStrings(policy_path, sources[0].path);
+    try std.testing.expect(hiveIsLocalMachine(sources[1].hive));
+    try std.testing.expectEqualStrings(reg_path, sources[1].path);
+    try std.testing.expect(!hiveIsLocalMachine(sources[2].hive));
+    try std.testing.expectEqualStrings(policy_path, sources[2].path);
+    try std.testing.expect(!hiveIsLocalMachine(sources[3].hive));
+    try std.testing.expectEqualStrings(reg_path, sources[3].path);
+}
+
+test "collectPolicyThenPrefSources community: HKLM policy, HKCU policy, HKCU pref" {
+    const hives = [_]windows.HKEY{windows.HKEY_CURRENT_USER};
+    var buf: [8]RegistrySource = undefined;
+    const sources = collectPolicyThenPrefSources(&hives, &buf);
+    try std.testing.expectEqual(@as(usize, 3), sources.len);
+    try std.testing.expect(hiveIsLocalMachine(sources[0].hive));
+    try std.testing.expectEqualStrings(policy_path, sources[0].path);
+    try std.testing.expect(!hiveIsLocalMachine(sources[1].hive));
+    try std.testing.expectEqualStrings(policy_path, sources[1].path);
+    try std.testing.expect(!hiveIsLocalMachine(sources[2].hive));
+    try std.testing.expectEqualStrings(reg_path, sources[2].path);
 }
 
 test "tokenAllowsStructuredLogging accepts eligible license in grace window" {
