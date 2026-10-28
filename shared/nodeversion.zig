@@ -523,7 +523,7 @@ pub fn activeVersionInstallDir(allocator: std.mem.Allocator, install_root: []con
 
 pub fn loadInstallRoot(allocator: std.mem.Allocator) ![]u8 {
     const config_hives = registry.preferenceHives();
-    const raw_root = registry.queryStringWithFallback(allocator, config_hives, reg_path, reg_value_root) catch
+    const raw_root = (try queryStringPolicyThenPref(allocator, config_hives, reg_value_root)) orelse
         try allocator.dupe(u8, default_root);
     defer allocator.free(raw_root);
 
@@ -931,7 +931,20 @@ fn autoInstallMissing(
     resolved.* = next;
 }
 
+const std_input_handle: u32 = @bitCast(@as(i32, -10));
+extern "kernel32" fn GetStdHandle(nStdHandle: u32) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GetConsoleMode(hConsoleHandle: ?*anyopaque, lpMode: *u32) callconv(.winapi) i32;
+
+fn stdinIsConsole() bool {
+    const handle = GetStdHandle(std_input_handle) orelse return false;
+    if (@intFromPtr(handle) == std.math.maxInt(usize)) return false;
+    var mode: u32 = 0;
+    return GetConsoleMode(handle, &mode) != 0;
+}
+
 fn confirmAutoInstall(allocator: std.mem.Allocator, version: []const u8) !bool {
+    if (!stdinIsConsole()) return error.NotAConsole;
+
     const prompt = try std.fmt.allocPrint(allocator, "Node.js v{s} is not installed. Install now? [y/N]: ", .{version});
     defer allocator.free(prompt);
 
