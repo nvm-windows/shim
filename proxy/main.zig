@@ -1510,7 +1510,7 @@ fn runDelegatedCommand(
 
     const locked = try prepareLifecycleScriptLock(allocator, &env_map, command_name, command_path, block_lifecycle_scripts, forwarded);
     defer if (locked.owns_args) allocator.free(locked.args);
-    logLifecycleScriptsBlocked(allocator, structured_logging, command_name, node_version, locked.action, audit_ctx);
+    logLifecycleScriptsBlocked(allocator, structured_logging, command_name, forwarded, node_version, locked.action, audit_ctx);
 
     const forwarded_args = try filterForwardedArgsForAgePolicy(allocator, command_name, npm_module_minimum_age, npm_module_minimum_age_forced, locked.args);
     defer allocator.free(forwarded_args);
@@ -1642,21 +1642,103 @@ const PreparedLifecycleLock = struct {
 
 const code_lifecycle_scripts_blocked: u32 = 4412;
 
-fn shouldLogLifecycleScriptsBlocked(certified: bool, structured_logging: bool, action: LifecycleScriptAction) bool {
-    return certified and structured_logging and action != .unchanged;
+fn isInstallClassVerb(arg: []const u8) bool {
+    const verbs = [_][]const u8{
+        "install", "i", "ci", "add",
+        "update", "upgrade", "up",
+        "uninstall", "un", "remove", "r", "rm",
+        "rebuild", "rb", "link", "pack", "publish", "dedupe",
+        "fetch", "import", "dlx", "create",
+    };
+    for (verbs) |verb| {
+        if (std.ascii.eqlIgnoreCase(arg, verb)) return true;
+    }
+    return false;
+}
+
+fn firstInstallClassPositional(forwarded: []const []const u8, start: usize) ?[]const u8 {
+    const sep = passthroughSeparatorIndex(forwarded);
+    var index = start;
+    while (index < sep) : (index += 1) {
+        const arg = forwarded[index];
+        if (arg.len == 0) continue;
+        if (arg[0] == '-') continue;
+        if (isInstallClassVerb(arg)) return arg;
+    }
+    return null;
+}
+
+fn hasPositional(forwarded: []const []const u8, start: usize) bool {
+    const sep = passthroughSeparatorIndex(forwarded);
+    var index = start;
+    while (index < sep) : (index += 1) {
+        const arg = forwarded[index];
+        if (arg.len == 0) continue;
+        if (arg[0] == '-') continue;
+        return true;
+    }
+    return false;
+}
+
+/// Verb that would run dependency lifecycle scripts, or null (no NVM4412).
+/// Yarn with no subcommand counts as `install`. npx with a package name counts as install-class.
+fn installClassVerb(command_name: []const u8, forwarded: []const []const u8) ?[]const u8 {
+    var pm = command_name;
+    var args_start: usize = 0;
+    if (std.ascii.eqlIgnoreCase(command_name, "corepack")) {
+        const sep = passthroughSeparatorIndex(forwarded);
+        var index: usize = 0;
+        var found = false;
+        while (index < sep) : (index += 1) {
+            const arg = forwarded[index];
+            if (arg.len == 0 or arg[0] == '-') continue;
+            pm = arg;
+            args_start = index + 1;
+            found = true;
+            break;
+        }
+        if (!found) return null;
+    }
+
+    if (std.ascii.eqlIgnoreCase(pm, "npx")) {
+        return if (hasPositional(forwarded, args_start)) "npx" else null;
+    }
+    if (std.ascii.eqlIgnoreCase(pm, "yarn") or std.ascii.eqlIgnoreCase(pm, "yarnpkg")) {
+        if (firstInstallClassPositional(forwarded, args_start)) |verb| return verb;
+        return if (hasPositional(forwarded, args_start)) null else "install";
+    }
+    if (std.ascii.eqlIgnoreCase(pm, "npm") or
+        std.ascii.eqlIgnoreCase(pm, "pnpm") or
+        std.ascii.eqlIgnoreCase(pm, "vlt"))
+    {
+        return firstInstallClassPositional(forwarded, args_start);
+    }
+    return null;
+}
+
+fn shouldLogLifecycleScriptsBlocked(
+    certified: bool,
+    structured_logging: bool,
+    action: LifecycleScriptAction,
+    command_name: []const u8,
+    forwarded: []const []const u8,
+) bool {
+    return certified and structured_logging and action != .unchanged and installClassVerb(command_name, forwarded) != null;
 }
 
 fn logLifecycleScriptsBlocked(
     allocator: std.mem.Allocator,
     structured_logging: bool,
     command_name: []const u8,
+    forwarded: []const []const u8,
     node_version: []const u8,
     action: LifecycleScriptAction,
     audit_ctx: eventlog.AuditContext,
 ) void {
-    if (!shouldLogLifecycleScriptsBlocked(build_options.certified, structured_logging, action)) return;
+    if (!shouldLogLifecycleScriptsBlocked(build_options.certified, structured_logging, action, command_name, forwarded)) return;
     eventlog.writeStructuredInfoCode(allocator, "proxy", "package_manager.lifecycle_scripts_blocked", .{
         .command = command_name,
+        .verb = installClassVerb(command_name, forwarded) orelse "",
         .action = @tagName(action),
         .node_version = node_version,
         .user = audit_ctx.user,
@@ -3334,11 +3416,26 @@ test "rewriteIgnoreScriptsArgs removes flags that turn scripts back on" {
 }
 
 test "shouldLogLifecycleScriptsBlocked is Certified Advanced Logging only" {
-    try std.testing.expect(!shouldLogLifecycleScriptsBlocked(false, true, .ignore_scripts_flag));
-    try std.testing.expect(!shouldLogLifecycleScriptsBlocked(true, false, .ignore_scripts_flag));
-    try std.testing.expect(!shouldLogLifecycleScriptsBlocked(true, true, .unchanged));
-    try std.testing.expect(shouldLogLifecycleScriptsBlocked(true, true, .ignore_scripts_flag));
-    try std.testing.expect(shouldLogLifecycleScriptsBlocked(true, true, .yarn_berry_env));
+    try std.testing.expect(!shouldLogLifecycleScriptsBlocked(false, true, .ignore_scripts_flag, "npm", &.{"install"}));
+    try std.testing.expect(!shouldLogLifecycleScriptsBlocked(true, false, .ignore_scripts_flag, "npm", &.{"install"}));
+    try std.testing.expect(!shouldLogLifecycleScriptsBlocked(true, true, .unchanged, "npm", &.{"install"}));
+    try std.testing.expect(shouldLogLifecycleScriptsBlocked(true, true, .ignore_scripts_flag, "npm", &.{"install"}));
+    try std.testing.expect(shouldLogLifecycleScriptsBlocked(true, true, .yarn_berry_env, "yarn", &.{"install"}));
+}
+
+test "installClassVerb keeps install-class commands and drops run/version" {
+    try std.testing.expectEqualStrings("install", installClassVerb("npm", &.{ "install", "left-pad" }).?);
+    try std.testing.expectEqualStrings("ci", installClassVerb("npm", &.{ "--prefix", "C:\\app", "ci" }).?);
+    try std.testing.expect(installClassVerb("npm", &.{ "--version" }) == null);
+    try std.testing.expect(installClassVerb("npm", &.{ "run", "build" }) == null);
+    try std.testing.expectEqualStrings("add", installClassVerb("pnpm", &.{ "add", "left-pad" }).?);
+    try std.testing.expectEqualStrings("install", installClassVerb("yarn", &.{}).?);
+    try std.testing.expect(installClassVerb("yarn", &.{"test"}) == null);
+    try std.testing.expectEqualStrings("npx", installClassVerb("npx", &.{"cowsay"}).?);
+    try std.testing.expect(installClassVerb("npx", &.{ "--version" }) == null);
+    try std.testing.expectEqualStrings("install", installClassVerb("corepack", &.{ "pnpm", "install" }).?);
+    try std.testing.expect(!shouldLogLifecycleScriptsBlocked(true, true, .ignore_scripts_flag, "npm", &.{ "--version" }));
+    try std.testing.expect(!shouldLogLifecycleScriptsBlocked(true, true, .ignore_scripts_flag, "npm", &.{ "run", "test" }));
 }
 
 test "lifecycleScriptAction selects the package manager lock" {
