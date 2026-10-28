@@ -17,6 +17,41 @@ pub fn isAllowFlag(arg: []const u8) bool {
     return std.mem.startsWith(u8, arg, "--allow-");
 }
 
+/// Node.js 25.8+ report-only permission model. NVM never injects this flag.
+pub fn isPermissionAuditFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--permission-audit") or
+        std.mem.startsWith(u8, arg, "--permission-audit=");
+}
+
+pub const Stripped = struct {
+    args: []const []const u8,
+    owns: bool,
+
+    pub fn deinit(self: Stripped, allocator: std.mem.Allocator) void {
+        if (self.owns) allocator.free(self.args);
+    }
+};
+
+/// Drop caller `--permission-audit` when HKLM Policies forces EnforcePermissionModel.
+pub fn stripPermissionAuditFlags(allocator: std.mem.Allocator, forwarded: []const []const u8) !Stripped {
+    var found = false;
+    for (forwarded) |arg| {
+        if (isPermissionAuditFlag(arg)) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) return .{ .args = forwarded, .owns = false };
+
+    var kept = std.ArrayListUnmanaged([]const u8){};
+    errdefer kept.deinit(allocator);
+    for (forwarded) |arg| {
+        if (isPermissionAuditFlag(arg)) continue;
+        try kept.append(allocator, arg);
+    }
+    return .{ .args = try kept.toOwnedSlice(allocator), .owns = true };
+}
+
 pub fn isCallerGrant(arg: []const u8) bool {
     return isAllowFlag(arg) or
         std.mem.eql(u8, arg, "--permission") or
@@ -78,6 +113,7 @@ pub fn apply(allocator: std.mem.Allocator, forwarded: []const []const u8, allow:
     for (defaults) |raw| {
         const item = std.mem.trim(u8, raw, " \t\r\n");
         if (item.len == 0) continue;
+        if (isPermissionAuditFlag(item)) continue;
         if (hasExact(kept_slice, item) or hasExact(added.items, item)) continue;
         try added.append(allocator, item);
     }
@@ -147,4 +183,33 @@ test "joinCallerGrants is empty when the caller passed no grants" {
     const text = try joinCallerGrants(std.testing.allocator, &.{"app.js"});
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("", text);
+}
+
+test "stripPermissionAuditFlags drops audit tokens and keeps the rest" {
+    const stripped = try stripPermissionAuditFlags(
+        std.testing.allocator,
+        &.{ "--permission-audit", "app.js", "--permission-audit=fs", "--allow-fs-read=*" },
+    );
+    defer stripped.deinit(std.testing.allocator);
+    try std.testing.expect(stripped.owns);
+    try std.testing.expectEqual(@as(usize, 2), stripped.args.len);
+    try std.testing.expectEqualStrings("app.js", stripped.args[0]);
+    try std.testing.expectEqualStrings("--allow-fs-read=*", stripped.args[1]);
+}
+
+test "stripPermissionAuditFlags is a no-op when audit is absent" {
+    const original = [_][]const u8{ "--permission", "app.js" };
+    const stripped = try stripPermissionAuditFlags(std.testing.allocator, &original);
+    defer stripped.deinit(std.testing.allocator);
+    try std.testing.expect(!stripped.owns);
+    try std.testing.expectEqual(@as(usize, 2), stripped.args.len);
+    try std.testing.expectEqualStrings("--permission", stripped.args[0]);
+}
+
+test "default grants skip --permission-audit" {
+    const defaults = [_][]const u8{ "--allow-fs-read=*", "--permission-audit" };
+    const filtered = try apply(std.testing.allocator, &.{"app.js"}, &.{}, &defaults);
+    defer filtered.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), filtered.defaults.len);
+    try std.testing.expectEqualStrings("--allow-fs-read=*", filtered.defaults[0]);
 }

@@ -385,6 +385,8 @@ fn alreadyHasPermissionFlag(forwarded: []const []const u8) bool {
 
 /// Returns the Node permission-model enable flag for this runtime version, or null.
 /// Node < 20: unsupported. 20–22: experimental. 23+: stable `--permission`.
+/// Never returns `--permission-audit`. Caller `--permission-audit` skips inject unless
+/// HKLM Policies forced enforce (caller must strip that flag first).
 fn permissionFlag(version: []const u8, enforce: bool, forwarded: []const []const u8) ?[]const u8 {
     if (!enforce) return null;
     if (alreadyHasPermissionFlag(forwarded)) return null;
@@ -393,6 +395,14 @@ fn permissionFlag(version: []const u8, enforce: bool, forwarded: []const []const
     if (major < 20) return null;
     if (major >= 23) return "--permission";
     return "--experimental-permission";
+}
+
+fn enforceForced(cfg: nodeversion.ShimConfig) bool {
+    return cfg.enforce_permission_model and cfg.enforce_permission_model_machine_policy;
+}
+
+fn shouldFilterPermissionGrants(forced: bool, injected: bool, forwarded: []const []const u8) bool {
+    return injected or (forced and alreadyHasPermissionFlag(forwarded));
 }
 
 fn collectSecurityFlags(
@@ -462,13 +472,20 @@ fn preparePermissionLaunch(
 ) !PermissionLaunch {
     const supplied = try permission_grants.joinCallerGrants(allocator, forwarded);
     errdefer allocator.free(supplied);
-    const injected = permissionFlag(version, cfg.enforce_permission_model, forwarded);
+    const forced = enforceForced(cfg);
+    var stripped = if (forced)
+        try permission_grants.stripPermissionAuditFlags(allocator, forwarded)
+    else
+        permission_grants.Stripped{ .args = forwarded, .owns = false };
+    errdefer stripped.deinit(allocator);
+    const working = stripped.args;
+    const injected = permissionFlag(version, cfg.enforce_permission_model, working);
     var default_values: []const []const u8 = &.{};
     var allow_values: []const []const u8 = &.{};
     var loaded_defaults = false;
     var loaded_allow = false;
     var filtered = permission_grants.Filtered{
-        .forwarded = forwarded,
+        .forwarded = working,
         .owns_forwarded = false,
         .dropped = &.{},
         .defaults = &.{},
@@ -477,13 +494,26 @@ fn preparePermissionLaunch(
     errdefer if (loaded_defaults) nodeversion.freeMulti(allocator, default_values);
     errdefer if (loaded_allow) nodeversion.freeMulti(allocator, allow_values);
     errdefer if (applied_filter) filtered.deinit(allocator);
-    if (injected != null) {
+    if (shouldFilterPermissionGrants(forced, injected != null, working)) {
         default_values = try nodeversion.loadPolicyOrPrefMulti(allocator, config.reg_value_default_permission_grants);
         loaded_defaults = true;
         allow_values = try nodeversion.loadPolicyOrPrefMulti(allocator, config.reg_value_allowed_permission_grants);
         loaded_allow = true;
-        filtered = try permission_grants.apply(allocator, forwarded, allow_values, default_values);
+        filtered = try permission_grants.apply(allocator, working, allow_values, default_values);
         applied_filter = true;
+        if (filtered.owns_forwarded) {
+            stripped.deinit(allocator);
+            stripped.owns = false;
+        } else if (stripped.owns) {
+            filtered.forwarded = working;
+            filtered.owns_forwarded = true;
+            stripped.owns = false;
+        }
+    } else if (stripped.owns) {
+        filtered.forwarded = working;
+        filtered.owns_forwarded = true;
+        applied_filter = true;
+        stripped.owns = false;
     }
     const applied = try std.mem.join(allocator, " ", filtered.defaults);
     errdefer allocator.free(applied);
@@ -708,4 +738,28 @@ test "parseArgs detects nvm shim version flag" {
     try std.testing.expectEqual(@as(usize, 2), parsed.forwarded.len);
     try std.testing.expectEqualStrings("-e", parsed.forwarded[0]);
     try std.testing.expectEqualStrings("console.log('x')", parsed.forwarded[1]);
+}
+
+test "permissionFlag never emits --permission-audit" {
+    try std.testing.expectEqualStrings("--permission", permissionFlag("24.0.0", true, &.{"app.js"}).?);
+    try std.testing.expectEqualStrings("--experimental-permission", permissionFlag("20.19.0", true, &.{"app.js"}).?);
+    try std.testing.expect(permissionFlag("18.20.0", true, &.{"app.js"}) == null);
+}
+
+test "permissionFlag skips inject when caller passed --permission-audit (debug exception)" {
+    try std.testing.expect(permissionFlag("24.0.0", true, &.{ "--permission-audit", "app.js" }) == null);
+    try std.testing.expect(permissionFlag("24.0.0", true, &.{ "--permission", "app.js" }) == null);
+}
+
+test "HKLM forced strip then permissionFlag injects --permission" {
+    const allocator = std.testing.allocator;
+    const stripped = try permission_grants.stripPermissionAuditFlags(allocator, &.{ "--permission-audit", "app.js" });
+    defer stripped.deinit(allocator);
+    try std.testing.expectEqualStrings("--permission", permissionFlag("24.0.0", true, stripped.args).?);
+}
+
+test "shouldFilterPermissionGrants when HKLM forced and caller already passed --permission" {
+    try std.testing.expect(shouldFilterPermissionGrants(true, false, &.{ "--permission", "app.js" }));
+    try std.testing.expect(!shouldFilterPermissionGrants(false, false, &.{ "--permission-audit", "app.js" }));
+    try std.testing.expect(shouldFilterPermissionGrants(false, true, &.{"app.js"}));
 }
