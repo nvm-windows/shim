@@ -159,12 +159,13 @@ pub fn build(b: *std.Build) void {
     const run_version_firewall_tests = b.addRunArtifact(version_firewall_tests);
     test_step.dependOn(&run_version_firewall_tests.step);
 
+    const permission_grants_module = b.createModule(.{
+        .root_source_file = b.path("shared/permission_grants.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const permission_grants_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("shared/permission_grants.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = permission_grants_module,
     });
     const run_permission_grants_tests = b.addRunArtifact(permission_grants_tests);
     test_step.dependOn(&run_permission_grants_tests.step);
@@ -174,11 +175,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    script_node_options_module.addImport("permission_grants", b.createModule(.{
-        .root_source_file = b.path("shared/permission_grants.zig"),
-        .target = target,
-        .optimize = optimize,
-    }));
+    script_node_options_module.addImport("permission_grants", permission_grants_module);
     const script_node_options_tests = b.addTest(.{
         .root_module = script_node_options_module,
     });
@@ -244,11 +241,7 @@ pub fn build(b: *std.Build) void {
     }
 
     if (std.mem.eql(u8, app, "node")) {
-        exe.root_module.addImport("permission_grants", b.createModule(.{
-            .root_source_file = b.path("shared/permission_grants.zig"),
-            .target = target,
-            .optimize = optimize,
-        }));
+        exe.root_module.addImport("permission_grants", permission_grants_module);
     }
 
     if (std.mem.eql(u8, app, "node") or std.mem.eql(u8, app, "proxy")) {
@@ -264,6 +257,7 @@ pub fn build(b: *std.Build) void {
     }
 
     if (std.mem.eql(u8, app, "proxy")) {
+        exe.root_module.addImport("permission_grants", permission_grants_module);
         exe.root_module.addImport("script_node_options", script_node_options_module);
         exe.root_module.addImport("install_safety", install_safety_module);
         exe.root_module.addImport("wintrust", wintrust_module);

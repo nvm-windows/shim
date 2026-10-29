@@ -596,6 +596,9 @@ fn runNode(
     defer allocator.free(child_path);
 
     try env_map.put("PATH", child_path);
+    if (enforceForced(cfg)) {
+        try permission_grants.stripPermissionAuditFromEnvMap(allocator, &env_map);
+    }
 
     if (cfg.permission_grant_audit or cfg.enforce_permission_model) {
         logPermissionGrants(allocator, cfg, launch) catch {};
