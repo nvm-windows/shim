@@ -169,6 +169,22 @@ pub fn build(b: *std.Build) void {
     const run_permission_grants_tests = b.addRunArtifact(permission_grants_tests);
     test_step.dependOn(&run_permission_grants_tests.step);
 
+    const script_node_options_module = b.createModule(.{
+        .root_source_file = b.path("shared/script_node_options.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    script_node_options_module.addImport("permission_grants", b.createModule(.{
+        .root_source_file = b.path("shared/permission_grants.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    const script_node_options_tests = b.addTest(.{
+        .root_module = script_node_options_module,
+    });
+    const run_script_node_options_tests = b.addRunArtifact(script_node_options_tests);
+    test_step.dependOn(&run_script_node_options_tests.step);
+
     const install_safety_module = b.createModule(.{
         .root_source_file = b.path(install_safety_path),
         .target = target,
@@ -248,6 +264,7 @@ pub fn build(b: *std.Build) void {
     }
 
     if (std.mem.eql(u8, app, "proxy")) {
+        exe.root_module.addImport("script_node_options", script_node_options_module);
         exe.root_module.addImport("install_safety", install_safety_module);
         exe.root_module.addImport("wintrust", wintrust_module);
         const module_firewall_module = b.createModule(.{
