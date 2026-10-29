@@ -12,6 +12,7 @@ const module_firewall = @import("module_firewall");
 const config = @import("config");
 const registry = @import("registry");
 const cmd_spawn = @import("cmd_spawn");
+const script_node_options = @import("script_node_options");
 const malware_scan = @import("malware_scan.zig");
 const bun_lane = @import("bun_lane.zig");
 
@@ -359,6 +360,7 @@ pub fn main() !void {
         .npm_registry_fallback = cfg.npm_registry_fallback,
         .block_lifecycle_scripts = cfg.block_package_manager_lifecycle_scripts,
         .structured_logging = cfg.structured_logging,
+        .script_policy = scriptPolicy(cfg),
         .audit_ctx = audit_ctx,
     };
     try malware_scan.enforce(
@@ -417,6 +419,7 @@ pub fn main() !void {
         cfg.npm_registry_fallback,
         cfg.block_package_manager_lifecycle_scripts,
         cfg.structured_logging,
+        scriptPolicy(cfg),
         audit_ctx,
         forwarded,
     ) catch |err| blk: {
@@ -1455,8 +1458,43 @@ const PmCtx = struct {
     npm_registry_fallback: ?[]const u8,
     block_lifecycle_scripts: bool,
     structured_logging: bool,
+    script_policy: script_node_options.Policy,
     audit_ctx: eventlog.AuditContext,
 };
+
+fn scriptPolicy(cfg: nodeversion.ShimConfig) script_node_options.Policy {
+    return .{
+        .enforce_permission_model = cfg.enforce_permission_model,
+        .enforce_permission_model_machine_policy = cfg.enforce_permission_model_machine_policy,
+        .freeze_v8_global_objects = cfg.freeze_v8_global_objects,
+        .disable_eval_and_string_execution = cfg.disable_eval_and_string_execution,
+    };
+}
+
+fn applyScriptNodeOptions(
+    allocator: std.mem.Allocator,
+    env_map: *std.process.EnvMap,
+    command_name: []const u8,
+    node_version: []const u8,
+    policy: script_node_options.Policy,
+) !void {
+    if (!policy.enforce_permission_model and
+        !policy.freeze_v8_global_objects and
+        !policy.disable_eval_and_string_execution)
+    {
+        return;
+    }
+    if (!script_node_options.appliesToCommand(command_name)) return;
+
+    var grants: []const []const u8 = &.{};
+    var owns_grants = false;
+    defer if (owns_grants) nodeversion.freeMulti(allocator, grants);
+    if (policy.enforce_permission_model) {
+        grants = try nodeversion.loadPolicyOrPrefMulti(allocator, config.reg_value_default_permission_grants);
+        owns_grants = true;
+    }
+    try script_node_options.applyToEnv(allocator, env_map, command_name, node_version, policy, grants);
+}
 
 fn runPm(ctx: *anyopaque, args: []const []const u8) u8 {
     const pm: *PmCtx = @ptrCast(@alignCast(ctx));
@@ -1472,6 +1510,7 @@ fn runPm(ctx: *anyopaque, args: []const []const u8) u8 {
         pm.npm_registry_fallback,
         pm.block_lifecycle_scripts,
         pm.structured_logging,
+        pm.script_policy,
         pm.audit_ctx,
         args,
     ) catch 1;
@@ -1502,6 +1541,7 @@ fn runDelegatedCommand(
     npm_registry_fallback: ?[]const u8,
     block_lifecycle_scripts: bool,
     structured_logging: bool,
+    script_policy: script_node_options.Policy,
     audit_ctx: eventlog.AuditContext,
     forwarded: []const []const u8,
 ) !u8 {
@@ -1521,6 +1561,7 @@ fn runDelegatedCommand(
     try env_map.put("PATH", child_path);
     try applyPackageManagerMinimumAgeGate(allocator, &env_map, command_name, npm_module_minimum_age);
     try applyPackageManagerRegistryFallback(allocator, &env_map, command_name, forwarded_args, npm_registry_fallback);
+    try applyScriptNodeOptions(allocator, &env_map, command_name, node_version, script_policy);
 
     // Fast path: skip cmd.exe + *.cmd wrapper (often doubles Node startup).
     // Entrypoint must already be script-cache trusted in enforceDelegatedCommandTrust.
