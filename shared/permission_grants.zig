@@ -32,6 +32,81 @@ pub const Stripped = struct {
     }
 };
 
+fn isAsciiWhitespace(ch: u8) bool {
+    return ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n';
+}
+
+fn tokenizeOptions(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
+    var out = std.ArrayListUnmanaged([]const u8){};
+    errdefer out.deinit(allocator);
+    var index: usize = 0;
+    while (index < raw.len) {
+        while (index < raw.len and isAsciiWhitespace(raw[index])) index += 1;
+        if (index >= raw.len) break;
+        const start = index;
+        while (index < raw.len and !isAsciiWhitespace(raw[index])) index += 1;
+        try out.append(allocator, raw[start..index]);
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Returns null when `raw` has no `--permission-audit` tokens.
+/// Empty string means every token was audit (caller should unset the env var).
+pub fn stripPermissionAuditFromOptions(allocator: std.mem.Allocator, raw: []const u8) !?[]u8 {
+    const tokens = try tokenizeOptions(allocator, raw);
+    defer allocator.free(tokens);
+
+    var found = false;
+    var kept = std.ArrayListUnmanaged([]const u8){};
+    defer kept.deinit(allocator);
+    for (tokens) |token| {
+        if (isPermissionAuditFlag(token)) {
+            found = true;
+            continue;
+        }
+        try kept.append(allocator, token);
+    }
+    if (!found) return null;
+    if (kept.items.len == 0) return try allocator.dupe(u8, "");
+
+    var total: usize = 0;
+    for (kept.items, 0..) |token, i| {
+        total += token.len;
+        if (i != 0) total += 1;
+    }
+    var out = try allocator.alloc(u8, total);
+    var offset: usize = 0;
+    for (kept.items, 0..) |token, i| {
+        if (i != 0) {
+            out[offset] = ' ';
+            offset += 1;
+        }
+        @memcpy(out[offset..][0..token.len], token);
+        offset += token.len;
+    }
+    return out;
+}
+
+fn stripEnvOptionsKey(allocator: std.mem.Allocator, env: *std.process.EnvMap, key: []const u8) !void {
+    const raw = env.get(key) orelse return;
+    const copy = try allocator.dupe(u8, raw);
+    defer allocator.free(copy);
+    const stripped = (try stripPermissionAuditFromOptions(allocator, copy)) orelse return;
+    defer allocator.free(stripped);
+    if (stripped.len == 0) {
+        env.remove(key);
+        return;
+    }
+    try env.put(key, stripped);
+}
+
+/// HKLM Policies `EnforcePermissionModel`: drop `--permission-audit` from
+/// `NODE_OPTIONS` and `npm_config_node_options` so users cannot opt out of enforce.
+pub fn stripPermissionAuditFromEnvMap(allocator: std.mem.Allocator, env: *std.process.EnvMap) !void {
+    try stripEnvOptionsKey(allocator, env, "NODE_OPTIONS");
+    try stripEnvOptionsKey(allocator, env, "npm_config_node_options");
+}
+
 /// Drop caller `--permission-audit` when HKLM Policies forces EnforcePermissionModel.
 pub fn stripPermissionAuditFlags(allocator: std.mem.Allocator, forwarded: []const []const u8) !Stripped {
     var found = false;
@@ -204,6 +279,41 @@ test "stripPermissionAuditFlags is a no-op when audit is absent" {
     try std.testing.expect(!stripped.owns);
     try std.testing.expectEqual(@as(usize, 2), stripped.args.len);
     try std.testing.expectEqualStrings("--permission", stripped.args[0]);
+}
+
+test "stripPermissionAuditFromOptions drops audit tokens" {
+    const allocator = std.testing.allocator;
+    const only = (try stripPermissionAuditFromOptions(allocator, "--permission-audit")).?;
+    defer allocator.free(only);
+    try std.testing.expectEqualStrings("", only);
+
+    const mixed = (try stripPermissionAuditFromOptions(allocator, "--inspect --permission-audit --trace-warnings")).?;
+    defer allocator.free(mixed);
+    try std.testing.expectEqualStrings("--inspect --trace-warnings", mixed);
+
+    const equals = (try stripPermissionAuditFromOptions(allocator, "--permission-audit=fs --inspect")).?;
+    defer allocator.free(equals);
+    try std.testing.expectEqualStrings("--inspect", equals);
+
+    try std.testing.expect(try stripPermissionAuditFromOptions(allocator, "--inspect") == null);
+}
+
+test "stripPermissionAuditFromEnvMap unsets audit-only NODE_OPTIONS" {
+    var env = std.process.EnvMap.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("NODE_OPTIONS", "--permission-audit");
+    try env.put("npm_config_node_options", "--inspect --permission-audit");
+    try stripPermissionAuditFromEnvMap(std.testing.allocator, &env);
+    try std.testing.expect(env.get("NODE_OPTIONS") == null);
+    try std.testing.expectEqualStrings("--inspect", env.get("npm_config_node_options").?);
+}
+
+test "stripPermissionAuditFromEnvMap no-op without audit" {
+    var env = std.process.EnvMap.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("NODE_OPTIONS", "--inspect");
+    try stripPermissionAuditFromEnvMap(std.testing.allocator, &env);
+    try std.testing.expectEqualStrings("--inspect", env.get("NODE_OPTIONS").?);
 }
 
 test "default grants skip --permission-audit" {

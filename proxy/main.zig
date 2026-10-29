@@ -13,6 +13,7 @@ const config = @import("config");
 const registry = @import("registry");
 const cmd_spawn = @import("cmd_spawn");
 const script_node_options = @import("script_node_options");
+const permission_grants = @import("permission_grants");
 const malware_scan = @import("malware_scan.zig");
 const bun_lane = @import("bun_lane.zig");
 
@@ -1547,6 +1548,9 @@ fn runDelegatedCommand(
 ) !u8 {
     var env_map = try std.process.getEnvMap(allocator);
     defer env_map.deinit();
+    if (script_policy.enforce_permission_model and script_policy.enforce_permission_model_machine_policy) {
+        try permission_grants.stripPermissionAuditFromEnvMap(allocator, &env_map);
+    }
 
     const locked = try prepareLifecycleScriptLock(allocator, &env_map, command_name, command_path, block_lifecycle_scripts, forwarded);
     defer if (locked.owns_args) allocator.free(locked.args);
