@@ -436,13 +436,13 @@ fn runFullVerify(
 
     if (expected_version) |folder_version| {
         const pe = pe_version.readFileVersion(allocator, node_exe_path) catch {
-            var outcome = VerifyOutcome{};
+            var outcome = VerifyOutcome{ .result = .version_mismatch };
             outcome.setReason("missing", .{});
             outcome.result = .version_mismatch;
             return outcome;
         };
         if (!pe_version.coreVersionsEqual(pe, folder_version)) {
-            var outcome = VerifyOutcome{};
+            var outcome = VerifyOutcome{ .result = .version_mismatch };
             outcome.setReason("{d}.{d}.{d}", .{ pe.major, pe.minor, pe.patch });
             outcome.result = .version_mismatch;
             return outcome;
