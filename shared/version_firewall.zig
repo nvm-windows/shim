@@ -68,27 +68,62 @@ fn appendSplit(allocator: std.mem.Allocator, raw: []const u8, out: *std.ArrayLis
     }
 }
 
-fn loadListRaw(allocator: std.mem.Allocator, pref_hives: []const windows.HKEY, value_name: []const u8) !?[]u8 {
+const ListHit = struct {
+    allow: ?[]const u8 = null,
+    block: ?[]const u8 = null,
+};
+
+/// First source that has either list supplies both. Missing key is empty, not a later hive.
+fn firstPaired(hits: []const ListHit) ListHit {
+    for (hits) |h| {
+        if (h.allow != null or h.block != null) return h;
+    }
+    return .{};
+}
+
+const PairedLists = struct {
+    allow: ?[]u8 = null,
+    block: ?[]u8 = null,
+
+    fn deinit(self: *PairedLists, allocator: std.mem.Allocator) void {
+        if (self.allow) |raw| allocator.free(raw);
+        if (self.block) |raw| allocator.free(raw);
+        self.* = .{};
+    }
+};
+
+fn loadFromSource(allocator: std.mem.Allocator, src: RegistrySource, value_name: []const u8) !?[]u8 {
+    if (try registry.queryMultiStringOptional(allocator, src.hive, src.path, value_name)) |values| {
+        defer {
+            for (values) |v| allocator.free(v);
+            allocator.free(values);
+        }
+        var joined = std.ArrayListUnmanaged(u8){};
+        errdefer joined.deinit(allocator);
+        for (values, 0..) |v, idx| {
+            if (idx > 0) try joined.append(allocator, '\n');
+            try joined.appendSlice(allocator, v);
+        }
+        return try joined.toOwnedSlice(allocator);
+    }
+    return registry.queryString(allocator, src.hive, src.path, value_name) catch |err| switch (err) {
+        error.RegistryKeyNotFound, error.RegistryValueNotFound, error.RegistryValueWrongType => null,
+        else => err,
+    };
+}
+
+fn loadPairedLists(allocator: std.mem.Allocator, pref_hives: []const windows.HKEY) !PairedLists {
     var buf: [8]RegistrySource = undefined;
     for (collectPolicyThenPrefSources(pref_hives, &buf)) |src| {
-        if (try registry.queryMultiStringOptional(allocator, src.hive, src.path, value_name)) |values| {
-            defer {
-                for (values) |v| allocator.free(v);
-                allocator.free(values);
-            }
-            var joined = std.ArrayListUnmanaged(u8){};
-            errdefer joined.deinit(allocator);
-            for (values, 0..) |v, idx| {
-                if (idx > 0) try joined.append(allocator, '\n');
-                try joined.appendSlice(allocator, v);
-            }
-            const owned: ?[]u8 = try joined.toOwnedSlice(allocator);
-            return owned;
+        const allow = try loadFromSource(allocator, src, allow_key);
+        errdefer if (allow) |raw| allocator.free(raw);
+        const block = try loadFromSource(allocator, src, block_key);
+        errdefer if (block) |raw| allocator.free(raw);
+        if (allow != null or block != null) {
+            return .{ .allow = allow, .block = block };
         }
-        const raw = registry.queryString(allocator, src.hive, src.path, value_name) catch continue;
-        return raw;
     }
-    return null;
+    return .{};
 }
 
 fn stripNotPrefix(raw: []const u8) struct { entry: []const u8, negated: bool } {
@@ -135,11 +170,17 @@ pub fn evaluate(
     if (target.len == 0) return .allow;
 
     const pref_hives = registry.preferenceHives();
-    const allow_raw = try loadListRaw(allocator, pref_hives, allow_key);
-    defer if (allow_raw) |raw| allocator.free(raw);
-    const block_raw = try loadListRaw(allocator, pref_hives, block_key);
-    defer if (block_raw) |raw| allocator.free(raw);
+    var lists = try loadPairedLists(allocator, pref_hives);
+    defer lists.deinit(allocator);
+    return evaluateLists(allocator, target, lists.allow, lists.block);
+}
 
+fn evaluateLists(
+    allocator: std.mem.Allocator,
+    target: []const u8,
+    allow_raw: ?[]const u8,
+    block_raw: ?[]const u8,
+) !Decision {
     var allow_neg = std.ArrayListUnmanaged([]const u8){};
     defer allow_neg.deinit(allocator);
     var allow_pos = std.ArrayListUnmanaged([]const u8){};
@@ -230,4 +271,60 @@ test "matchesEntry understands 20.x and exact" {
     try std.testing.expect(!matchesEntry(std.testing.allocator, "18.19.1", "20.x"));
     try std.testing.expect(matchesEntry(std.testing.allocator, "20.17.0", "ALL"));
     try std.testing.expect(!matchesEntry(std.testing.allocator, "20.17.0", "EOL"));
+}
+
+test "firstPaired uses first source with either list" {
+    const picked = firstPaired(&.{
+        .{},
+        .{ .block = "18.x" },
+        .{ .allow = "18.x" },
+    });
+    try std.testing.expect(picked.allow == null);
+    try std.testing.expectEqualStrings("18.x", picked.block.?);
+}
+
+test "firstPaired empty string is a hit" {
+    const picked = firstPaired(&.{
+        .{ .allow = "" },
+        .{ .block = "18.x" },
+    });
+    try std.testing.expect(picked.block == null);
+    try std.testing.expectEqualStrings("", picked.allow.?);
+}
+
+test "evaluateLists HKLM block not punched by later allow" {
+    const picked = firstPaired(&.{
+        .{ .block = "18.x" },
+        .{ .allow = "18.x" },
+    });
+    const d = try evaluateLists(std.testing.allocator, "18.19.1", picked.allow, picked.block);
+    try std.testing.expect(d == .deny);
+    switch (d) {
+        .deny => |r| try std.testing.expectEqualStrings("VersionBlockList", r.source),
+        else => unreachable,
+    }
+}
+
+test "evaluateLists same-source allow wins over block" {
+    const d = try evaluateLists(std.testing.allocator, "18.19.1", "18.x", "18.x");
+    try std.testing.expect(d == .allow);
+}
+
+test "evaluateLists exclusive allow denies other majors" {
+    const d = try evaluateLists(std.testing.allocator, "18.19.1", "20.x", null);
+    try std.testing.expect(d == .deny);
+    switch (d) {
+        .deny => |r| try std.testing.expectEqualStrings("VersionAllowList", r.source),
+        else => unreachable,
+    }
+}
+
+test "evaluateLists EOL magic ignored locally" {
+    const d = try evaluateLists(std.testing.allocator, "18.19.1", "EOL", null);
+    try std.testing.expect(d == .allow);
+}
+
+test "evaluateLists EOL plus allow is not exclusive" {
+    const d = try evaluateLists(std.testing.allocator, "18.19.1", "20.x\nEOL", null);
+    try std.testing.expect(d == .allow);
 }
