@@ -2099,7 +2099,9 @@ fn buildPackageManagerMinimumAgeGate(
     command_name: []const u8,
     minutes: u64,
 ) !?PackageManagerAgeGateEnv {
-    if (std.ascii.eqlIgnoreCase(command_name, "npm")) {
+    if (std.ascii.eqlIgnoreCase(command_name, "npm") or
+        std.ascii.eqlIgnoreCase(command_name, "npx"))
+    {
         const days = (minutes + 1439) / 1440;
         return .{
             .key = "npm_config_min_release_age",
@@ -3411,6 +3413,17 @@ test "buildPackageManagerMinimumAgeGate emits npm, pnpm, and yarn formats" {
     const npm_gate_round = (try buildPackageManagerMinimumAgeGate(allocator, "npm", 10081)).?;
     defer npm_gate_round.deinit(allocator);
     try std.testing.expectEqualStrings("8", npm_gate_round.value);
+}
+
+test "buildPackageManagerMinimumAgeGate treats npx like npm" {
+    const allocator = std.testing.allocator;
+
+    const npx_gate = (try buildPackageManagerMinimumAgeGate(allocator, "npx", 2880)).?;
+    defer npx_gate.deinit(allocator);
+    try std.testing.expectEqualStrings("npm_config_min_release_age", npx_gate.key);
+    try std.testing.expectEqualStrings("2", npx_gate.value);
+
+    try std.testing.expect(try buildPackageManagerMinimumAgeGate(allocator, "bunx", 2880) == null);
 }
 
 test "buildPackageManagerMinimumAgeGate emits pnpm and yarn formats" {
