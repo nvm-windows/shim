@@ -186,12 +186,16 @@ const policy_hives = &[_]windows.HKEY{
     windows.HKEY_LOCAL_MACHINE,
 };
 
+/// Per-user NVM home for .verify / runtime metadata. Always
+/// `%LOCALAPPDATA%\Author Software\nvm` — never parent(InstallRoot), which
+/// spilled `.shim` / `.nodejs` onto volume roots for custom storage like `D:\nvm`.
 pub fn resolveDataRoot(allocator: std.mem.Allocator, install_root: []const u8) ![]u8 {
-    const trimmed = std.mem.trim(u8, install_root, " \t\r\n");
+    _ = install_root;
+    const lad = std.process.getEnvVarOwned(allocator, "LOCALAPPDATA") catch return error.InvalidInstallRoot;
+    defer allocator.free(lad);
+    const trimmed = std.mem.trim(u8, lad, " \t\r\n");
     if (trimmed.len == 0) return error.InvalidInstallRoot;
-    const data_root = std.fs.path.dirname(trimmed) orelse return error.InvalidInstallRoot;
-    if (data_root.len == 0 or std.mem.eql(u8, data_root, ".")) return error.InvalidInstallRoot;
-    return try allocator.dupe(u8, data_root);
+    return try std.fs.path.join(allocator, &.{ trimmed, "Author Software", "nvm" });
 }
 
 pub fn loadAllowedSigners(allocator: std.mem.Allocator) ![]const []const u8 {
@@ -994,11 +998,15 @@ test "VerifyOutcome setReason formats disallowed signer" {
     try std.testing.expect(std.mem.startsWith(u8, outcome.reason, "code signer \"Evil Corp\""));
 }
 
-test "resolveDataRoot derives parent of install root" {
+test "resolveDataRoot uses LOCALAPPDATA Author Software nvm" {
     const allocator = std.testing.allocator;
-    const data_root = try resolveDataRoot(allocator, "C:\\nvm\\installs");
+    const lad = std.process.getEnvVarOwned(allocator, "LOCALAPPDATA") catch return error.SkipZigTest;
+    defer allocator.free(lad);
+    const data_root = try resolveDataRoot(allocator, "D:\\nvm");
     defer allocator.free(data_root);
-    try std.testing.expectEqualStrings("C:\\nvm", data_root);
+    const want = try std.fs.path.join(allocator, &.{ lad, "Author Software", "nvm" });
+    defer allocator.free(want);
+    try std.testing.expectEqualStrings(want, data_root);
 }
 
 test "loadAllowedSigners falls back to defaults" {
