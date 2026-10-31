@@ -4,6 +4,7 @@ const config = @import("config");
 const registry = @import("registry");
 const wintrust = @import("wintrust");
 const pe_version = @import("pe_version");
+const nodeversion = @import("nodeversion");
 
 const bcrypt_ms_primitive_provider = "Microsoft Primitive Provider";
 const bcrypt_ecdsa_p256 = "ECDSA_P256";
@@ -199,9 +200,11 @@ pub fn resolveDataRoot(allocator: std.mem.Allocator, install_root: []const u8) !
 }
 
 pub fn loadAllowedSigners(allocator: std.mem.Allocator) ![]const []const u8 {
-    if (registry.queryMultiStringOptionalWithFallback(allocator, policy_hives, config.policy_registry_root, config.reg_value_allowed_signers) catch null) |signers| {
-        if (signers.len > 0) return signers;
-        freeAllowedSigners(allocator, signers);
+    if (nodeversion.allowsMachinePolicy(allocator)) {
+        if (registry.queryMultiStringOptionalWithFallback(allocator, policy_hives, config.policy_registry_root, config.reg_value_allowed_signers) catch null) |signers| {
+            if (signers.len > 0) return signers;
+            freeAllowedSigners(allocator, signers);
+        }
     }
 
     if (registry.queryMultiStringOptionalWithFallback(allocator, registry.preferenceHives(), config.preference_registry_root, config.reg_value_allowed_signers) catch null) |signers| {
@@ -228,18 +231,22 @@ fn duplicateAllowedSigners(allocator: std.mem.Allocator, signers: []const []cons
 }
 
 fn queryConfigString(allocator: std.mem.Allocator, value_name: []const u8) ?[]u8 {
-    if (registry.queryStringWithFallback(allocator, policy_hives, config.policy_registry_root, value_name)) |value| {
-        return value;
-    } else |_| {}
+    if (nodeversion.allowsMachinePolicy(allocator)) {
+        if (registry.queryStringWithFallback(allocator, policy_hives, config.policy_registry_root, value_name)) |value| {
+            return value;
+        } else |_| {}
+    }
     if (registry.queryStringWithFallback(allocator, registry.preferenceHives(), config.preference_registry_root, value_name)) |value| {
         return value;
     } else |_| {}
     return null;
 }
 
-fn isAirGapped() bool {
-    if (registry.queryDwordOptionalWithFallback(policy_hives, config.policy_registry_root, config.reg_value_air_gapped) catch null) |value| {
-        return value != 0;
+fn isAirGapped(allocator: std.mem.Allocator) bool {
+    if (nodeversion.allowsMachinePolicy(allocator)) {
+        if (registry.queryDwordOptionalWithFallback(policy_hives, config.policy_registry_root, config.reg_value_air_gapped) catch null) |value| {
+            return value != 0;
+        }
     }
     if (registry.queryDwordOptionalWithFallback(registry.preferenceHives(), config.preference_registry_root, config.reg_value_air_gapped) catch null) |value| {
         return value != 0;
@@ -254,16 +261,18 @@ pub fn loadRuntimeRevocationMode(allocator: std.mem.Allocator) wintrust.Revocati
         defer allocator.free(raw);
         mode = wintrust.parseRevocationMode(raw);
     }
-    if (isAirGapped() and mode == .online) {
+    if (isAirGapped(allocator) and mode == .online) {
         mode = .cached;
     }
     return wintrust.clampRuntimeRevocationMode(mode);
 }
 
 pub fn loadAllowedThumbprints(allocator: std.mem.Allocator) ![]const []const u8 {
-    if (registry.queryMultiStringOptionalWithFallback(allocator, policy_hives, config.policy_registry_root, config.reg_value_allowed_thumbprints) catch null) |pins| {
-        if (pins.len > 0) return try normalizeThumbprintList(allocator, pins);
-        freeAllowedSigners(allocator, pins);
+    if (nodeversion.allowsMachinePolicy(allocator)) {
+        if (registry.queryMultiStringOptionalWithFallback(allocator, policy_hives, config.policy_registry_root, config.reg_value_allowed_thumbprints) catch null) |pins| {
+            if (pins.len > 0) return try normalizeThumbprintList(allocator, pins);
+            freeAllowedSigners(allocator, pins);
+        }
     }
     if (registry.queryMultiStringOptionalWithFallback(allocator, registry.preferenceHives(), config.preference_registry_root, config.reg_value_allowed_thumbprints) catch null) |pins| {
         if (pins.len > 0) return try normalizeThumbprintList(allocator, pins);
