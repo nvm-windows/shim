@@ -2060,13 +2060,15 @@ fn isYarnNoTimeGateFlag(arg: []const u8) bool {
 fn isAgeOverrideBareFlag(arg: []const u8) bool {
     return std.ascii.eqlIgnoreCase(arg, "--min-release-age") or
         std.ascii.eqlIgnoreCase(arg, "--minimum-release-age") or
-        std.ascii.eqlIgnoreCase(arg, "--config.min-release-age");
+        std.ascii.eqlIgnoreCase(arg, "--config.min-release-age") or
+        std.ascii.eqlIgnoreCase(arg, "--before");
 }
 
 fn isAgeOverrideEqualsFlag(arg: []const u8) bool {
     return startsWithIgnoreCase(arg, "--min-release-age=") or
         startsWithIgnoreCase(arg, "--minimum-release-age=") or
-        startsWithIgnoreCase(arg, "--config.min-release-age=");
+        startsWithIgnoreCase(arg, "--config.min-release-age=") or
+        startsWithIgnoreCase(arg, "--before=");
 }
 
 fn startsWithIgnoreCase(haystack: []const u8, prefix: []const u8) bool {
@@ -2120,14 +2122,43 @@ fn buildPackageManagerMinimumAgeGate(
         };
     }
 
-    if (std.ascii.eqlIgnoreCase(command_name, "yarn")) {
+    if (std.ascii.eqlIgnoreCase(command_name, "yarn") or
+        std.ascii.eqlIgnoreCase(command_name, "yarnpkg"))
+    {
         return .{
             .key = "YARN_NPM_MINIMAL_AGE_GATE",
             .value = try std.fmt.allocPrint(allocator, "{d}", .{minutes}),
         };
     }
 
+    if (std.ascii.eqlIgnoreCase(command_name, "vlt")) {
+        const now_secs: u64 = @intCast(@max(std.time.timestamp(), 0));
+        const offset_secs = minutes * 60;
+        const cutoff = if (now_secs > offset_secs) now_secs - offset_secs else 0;
+        return .{
+            .key = "VLT_BEFORE",
+            .value = try formatUtcIso8601(allocator, cutoff),
+        };
+    }
+
     return null;
+}
+
+/// UTC wall time as `YYYY-MM-DDTHH:MM:SSZ` for vlt `--before` / `VLT_BEFORE`.
+fn formatUtcIso8601(allocator: std.mem.Allocator, epoch_secs: u64) ![]u8 {
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
+    const epoch_day = epoch_seconds.getEpochDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        year_day.year,
+        month_day.month.numeric(),
+        @as(u8, month_day.day_index) + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+    });
 }
 
 fn applyPackageManagerRegistryFallback(
@@ -3442,6 +3473,43 @@ test "buildPackageManagerMinimumAgeGate emits pnpm and yarn formats" {
     defer yarn_gate.deinit(allocator);
     try std.testing.expectEqualStrings("YARN_NPM_MINIMAL_AGE_GATE", yarn_gate.key);
     try std.testing.expectEqualStrings("1440", yarn_gate.value);
+
+    const yarnpkg_gate = (try buildPackageManagerMinimumAgeGate(allocator, "yarnpkg", 1440)).?;
+    defer yarnpkg_gate.deinit(allocator);
+    try std.testing.expectEqualStrings("YARN_NPM_MINIMAL_AGE_GATE", yarnpkg_gate.key);
+    try std.testing.expectEqualStrings("1440", yarnpkg_gate.value);
+}
+
+test "formatUtcIso8601 formats known epoch seconds" {
+    const allocator = std.testing.allocator;
+
+    const epoch = try formatUtcIso8601(allocator, 0);
+    defer allocator.free(epoch);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", epoch);
+
+    const known = try formatUtcIso8601(allocator, 1622924906);
+    defer allocator.free(known);
+    try std.testing.expectEqualStrings("2021-06-05T20:28:26Z", known);
+}
+
+test "buildPackageManagerMinimumAgeGate emits VLT_BEFORE cutoff for vlt" {
+    const allocator = std.testing.allocator;
+
+    const before = @as(u64, @intCast(@max(std.time.timestamp(), 0)));
+    const gate = (try buildPackageManagerMinimumAgeGate(allocator, "vlt", 1440)).?;
+    defer gate.deinit(allocator);
+    const after = @as(u64, @intCast(@max(std.time.timestamp(), 0)));
+
+    try std.testing.expectEqualStrings("VLT_BEFORE", gate.key);
+    try std.testing.expect(gate.value.len == "1970-01-01T00:00:00Z".len);
+    try std.testing.expect(gate.value[gate.value.len - 1] == 'Z');
+
+    const expected_low = try formatUtcIso8601(allocator, before - 1440 * 60);
+    defer allocator.free(expected_low);
+    const expected_high = try formatUtcIso8601(allocator, after - 1440 * 60);
+    defer allocator.free(expected_high);
+    try std.testing.expect(std.mem.order(u8, expected_low, gate.value) != .gt);
+    try std.testing.expect(std.mem.order(u8, gate.value, expected_high) != .gt);
 }
 
 fn expectArgStrings(args: []const []const u8, expected: []const []const u8) !void {
@@ -3619,6 +3687,34 @@ test "filterForwardedArgsForAgePolicy strips age flags when HKLM policy is force
     defer allocator.free(filtered);
 
     try expectArgStrings(filtered, &.{ "install", "left-pad", "--", "--min-release-age=0" });
+}
+
+test "filterForwardedArgsForAgePolicy strips vlt --before when HKLM policy is forced" {
+    const allocator = std.testing.allocator;
+    const original = [_][]const u8{
+        "install",
+        "left-pad",
+        "--before=2020-01-01T00:00:00Z",
+        "--before",
+        "2020-01-01T00:00:00Z",
+        "--",
+        "--before=2020-01-01T00:00:00Z",
+    };
+
+    const filtered = try filterForwardedArgsForAgePolicy(allocator, "vlt", 2880, true, &original);
+    defer allocator.free(filtered);
+
+    try expectArgStrings(filtered, &.{ "install", "left-pad", "--", "--before=2020-01-01T00:00:00Z" });
+}
+
+test "filterForwardedArgsForAgePolicy keeps vlt --before when not forced" {
+    const allocator = std.testing.allocator;
+    const original = [_][]const u8{ "install", "left-pad", "--before=2020-01-01T00:00:00Z" };
+
+    const filtered = try filterForwardedArgsForAgePolicy(allocator, "vlt", 2880, false, &original);
+    defer allocator.free(filtered);
+
+    try expectArgStrings(filtered, &.{ "install", "left-pad", "--before=2020-01-01T00:00:00Z" });
 }
 
 test "filterForwardedArgsForAgePolicy forced DWORD 0 still strips CLI age flags" {
