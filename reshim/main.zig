@@ -729,7 +729,7 @@ fn appendDefaultPackageManagerShims(
     try appendUniqueCommandName(allocator, dedupe, names, "pnpm");
     try appendUniqueCommandName(allocator, dedupe, names, "yarn");
     try appendUniqueCommandName(allocator, dedupe, names, "yarnpkg");
-    if (shim_bun.enabled(build_options.certified)) {
+    if (shim_bun.enabled(allocator, build_options.certified)) {
         try appendUniqueCommandName(allocator, dedupe, names, "bun");
         try appendUniqueCommandName(allocator, dedupe, names, "bunx");
     }

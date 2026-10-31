@@ -2,6 +2,7 @@ const std = @import("std");
 const windows = std.os.windows;
 const config = @import("config");
 const registry = @import("registry");
+const nodeversion = @import("nodeversion");
 
 pub const Target = struct {
     path: []u8,
@@ -16,11 +17,13 @@ pub fn isBunCommand(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "bun") or std.ascii.eqlIgnoreCase(name, "bunx");
 }
 
-/// HKLM policy, then HKCU policy, then preferences, else `certified_default`.
-pub fn enabled(certified_default: bool) bool {
-    const policy = [_]windows.HKEY{ windows.HKEY_LOCAL_MACHINE, windows.HKEY_CURRENT_USER };
-    if (registry.queryDwordOptionalWithFallback(&policy, config.policy_registry_root, config.reg_value_shim_bun) catch null) |value| {
-        return value != 0;
+/// HKLM Policies (Governance only), then preferences, else `certified_default`.
+pub fn enabled(allocator: std.mem.Allocator, certified_default: bool) bool {
+    if (nodeversion.allowsMachinePolicy(allocator)) {
+        const policy = [_]windows.HKEY{ windows.HKEY_LOCAL_MACHINE, windows.HKEY_CURRENT_USER };
+        if (registry.queryDwordOptionalWithFallback(&policy, config.policy_registry_root, config.reg_value_shim_bun) catch null) |value| {
+            return value != 0;
+        }
     }
     if (registry.queryDwordOptionalWithFallback(registry.preferenceHives(), config.preference_registry_root, config.reg_value_shim_bun) catch null) |value| {
         return value != 0;

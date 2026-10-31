@@ -26,7 +26,7 @@ pub fn runIfBun(
     };
     defer target.deinit(allocator);
 
-    if (shim_bun.enabled(build_options.certified)) {
+    if (shim_bun.enabled(allocator, build_options.certified)) {
         var bare = false;
         try malware_scan.enforce(
             allocator,
