@@ -139,10 +139,10 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
 
     const root = try loadInstallRoot(allocator);
 
-    const auto_use = (try queryDwordPolicyThenPref(config_hives, reg_value_auto_use)) orelse 1;
+    const auto_use = (try queryDwordPolicyThenPref(allocator, config_hives, reg_value_auto_use)) orelse 1;
     // Match Go settings default (auto_install=false). Absent registry → off (DI-03).
-    const auto_install = (try queryDwordPolicyThenPref(config_hives, reg_value_auto_install)) orelse 0;
-    const auto_install_prompt = (try queryDwordPolicyThenPref(config_hives, reg_value_auto_install_prompt)) orelse 1;
+    const auto_install = (try queryDwordPolicyThenPref(allocator, config_hives, reg_value_auto_install)) orelse 0;
+    const auto_install_prompt = (try queryDwordPolicyThenPref(allocator, config_hives, reg_value_auto_install_prompt)) orelse 1;
 
     const auto_detect = auto_detect: {
         if (try queryMultiPolicyThenPref(allocator, config_hives, reg_value_auto_detect)) |configured| {
@@ -159,12 +159,12 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
     };
     const aliases = (try queryMultiPolicyThenPref(allocator, config_hives, reg_value_aliases)) orelse
         try allocator.alloc([]const u8, 0);
-    const log_executions = (try queryDwordPolicyThenPref(config_hives, reg_value_log_executions)) orelse 0;
+    const log_executions = (try queryDwordPolicyThenPref(allocator, config_hives, reg_value_log_executions)) orelse 0;
     const structured_logging = allowsStructuredLogging(allocator, config_hives);
-    const enforce_permission = try loadPolicyOrPrefBoolSource(config_hives, reg_value_enforce_permission_model);
-    const permission_grant_audit = try loadPolicyOrPrefBool(config_hives, reg_value_permission_grant_audit);
-    const freeze_v8_global_objects = try loadPolicyOrPrefBool(config_hives, reg_value_freeze_v8_global_objects);
-    const disable_eval_and_string_execution = try loadPolicyOrPrefBool(config_hives, reg_value_disable_eval_and_string_execution);
+    const enforce_permission = try loadPolicyOrPrefBoolSource(allocator, config_hives, reg_value_enforce_permission_model);
+    const permission_grant_audit = try loadPolicyOrPrefBool(allocator, config_hives, reg_value_permission_grant_audit);
+    const freeze_v8_global_objects = try loadPolicyOrPrefBool(allocator, config_hives, reg_value_freeze_v8_global_objects);
+    const disable_eval_and_string_execution = try loadPolicyOrPrefBool(allocator, config_hives, reg_value_disable_eval_and_string_execution);
     const npm_registry_fallback = try loadFirstConfiguredRegistryValue(allocator, config_hives, reg_value_npm_mirror);
     const npm_module_minimum_age = try loadMinimumAgeMinutes(allocator, config_hives);
 
@@ -172,7 +172,7 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
         try allocator.dupe(u8, "error");
     defer allocator.free(raw_package_manager_mismatch_action);
     const package_manager_mismatch_action = parsePackageManagerMismatchAction(raw_package_manager_mismatch_action);
-    const block_package_manager_lifecycle_scripts = try loadBlockPackageManagerLifecycleScripts();
+    const block_package_manager_lifecycle_scripts = try loadBlockPackageManagerLifecycleScripts(allocator);
 
     return .{
         .root = root,
@@ -197,12 +197,96 @@ pub fn loadConfig(allocator: std.mem.Allocator) !ShimConfig {
     };
 }
 
-fn loadBlockPackageManagerLifecycleScripts() !bool {
-    // HKLM policy only. HKCU preferences must not enable or disable this.
+fn loadBlockPackageManagerLifecycleScripts(allocator: std.mem.Allocator) !bool {
+    // HKLM policy only (Governance). HKCU preferences must not enable or disable this.
+    if (!allowsMachinePolicy(allocator)) return false;
     if (try registry.queryDwordOptionalWithFallback(&policy_hives, policy_path, reg_value_block_package_manager_lifecycle_scripts)) |value| {
         return value != 0;
     }
     return false;
+}
+
+/// AllowsMachinePolicy matches Go license.AllowsMachinePolicy: honor Software\Policies
+/// only with a non-expired governance entitlement (and commercial trust stamp).
+pub fn allowsMachinePolicy(allocator: std.mem.Allocator) bool {
+    const now = std.time.timestamp();
+    const pref_hives = registry.preferenceHives();
+    if (!commercialLicenseTrustOK(allocator, pref_hives, now)) return false;
+    const token = readAccessTokenPolicyOrPref(allocator, pref_hives) orelse return false;
+    defer allocator.free(token);
+    return tokenAllowsGovernance(allocator, token, now);
+}
+
+fn readAccessTokenPolicyOrPref(allocator: std.mem.Allocator, pref_hives: []const windows.HKEY) ?[]u8 {
+    // Licensing secrets may live only under Policies even when other policy values are ignored.
+    if (registry.queryBinaryOptional(allocator, windows.HKEY_LOCAL_MACHINE, policy_path, reg_value_access_token) catch null) |token| {
+        return token;
+    }
+    for (pref_hives) |hive| {
+        const token_optional = registry.queryBinaryOptional(allocator, hive, reg_path, reg_value_access_token) catch continue;
+        if (token_optional) |token| return token;
+    }
+    return null;
+}
+
+fn tokenAllowsGovernance(allocator: std.mem.Allocator, raw_token: []const u8, now: i64) bool {
+    var segments = std.mem.splitScalar(u8, std.mem.trim(u8, raw_token, " \t\r\n\x00"), '.');
+    _ = segments.next() orelse return false;
+    const encoded_payload = segments.next() orelse return false;
+    _ = segments.next() orelse return false;
+    if (segments.next() != null) return false;
+
+    const payload_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(encoded_payload) catch return false;
+    const payload = allocator.alloc(u8, payload_len) catch return false;
+    defer allocator.free(payload);
+    std.base64.url_safe_no_pad.Decoder.decode(payload, encoded_payload) catch return false;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch return false;
+    defer parsed.deinit();
+    const claims = switch (parsed.value) {
+        .object => |object| object,
+        else => return false,
+    };
+
+    if (claims.get("tmp")) |temporary| {
+        if (temporary != .bool or temporary.bool) return false;
+    }
+    if (!claimsAllowGovernance(claims)) return false;
+
+    if (claims.get("nbf")) |not_before| {
+        const timestamp = jsonInteger(not_before) orelse return false;
+        if (timestamp > now) return false;
+    }
+    const expires = jsonInteger(claims.get("exp") orelse return false) orelse return false;
+    const grace_seconds: i64 = 7 * 24 * 60 * 60;
+    return now <= expires +| grace_seconds;
+}
+
+fn claimsAllowGovernance(claims: std.json.ObjectMap) bool {
+    if (claims.get("lic")) |license_value| {
+        if (licenseValueAllowsGovernance(license_value)) return true;
+        if (licenseValueHasEntries(license_value)) return false;
+    }
+    const plan_value = claims.get("plan") orelse return false;
+    return licenseValueAllowsGovernance(plan_value);
+}
+
+fn licenseValueAllowsGovernance(value: std.json.Value) bool {
+    return switch (value) {
+        .string => |s| entitlementAllowsGovernance(s),
+        .array => |items| blk: {
+            for (items.items) |item| {
+                if (item != .string) continue;
+                if (entitlementAllowsGovernance(item.string)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn entitlementAllowsGovernance(raw: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw, " \t\r\n"), "governance");
 }
 
 fn allowsStructuredLogging(allocator: std.mem.Allocator, hives: []const windows.HKEY) bool {
@@ -413,24 +497,32 @@ fn hiveIsLocalMachine(hive: windows.HKEY) bool {
 /// Policies beat Preferences in the same hive. HKLM beats HKCU.
 /// Order: HKLM Policies → HKLM Preferences → HKCU Policies → HKCU Preferences.
 /// Community preference hives are HKCU only, so HKLM Preferences is skipped.
-fn collectPolicyThenPrefSources(pref_hives: []const windows.HKEY, out: *[8]RegistrySource) []const RegistrySource {
+/// Policies roots are omitted unless AllowsMachinePolicy (Governance entitlement).
+fn collectPolicyThenPrefSources(allocator: std.mem.Allocator, pref_hives: []const windows.HKEY, out: *[8]RegistrySource) []const RegistrySource {
     var n: usize = 0;
-    out[n] = .{ .hive = windows.HKEY_LOCAL_MACHINE, .path = policy_path };
-    n += 1;
-    for (pref_hives) |hive| {
-        if (!hiveIsLocalMachine(hive)) {
-            out[n] = .{ .hive = hive, .path = policy_path };
+    if (allowsMachinePolicy(allocator)) {
+        out[n] = .{ .hive = windows.HKEY_LOCAL_MACHINE, .path = policy_path };
+        n += 1;
+        for (pref_hives) |hive| {
+            if (!hiveIsLocalMachine(hive)) {
+                out[n] = .{ .hive = hive, .path = policy_path };
+                n += 1;
+            }
+            out[n] = .{ .hive = hive, .path = reg_path };
             n += 1;
         }
+        return out[0..n];
+    }
+    for (pref_hives) |hive| {
         out[n] = .{ .hive = hive, .path = reg_path };
         n += 1;
     }
     return out[0..n];
 }
 
-fn queryDwordPolicyThenPref(pref_hives: []const windows.HKEY, value_name: []const u8) !?u32 {
+fn queryDwordPolicyThenPref(allocator: std.mem.Allocator, pref_hives: []const windows.HKEY, value_name: []const u8) !?u32 {
     var buf: [8]RegistrySource = undefined;
-    for (collectPolicyThenPrefSources(pref_hives, &buf)) |src| {
+    for (collectPolicyThenPrefSources(allocator, pref_hives, &buf)) |src| {
         if (try registry.queryDwordOptional(src.hive, src.path, value_name)) |value| return value;
     }
     return null;
@@ -438,7 +530,7 @@ fn queryDwordPolicyThenPref(pref_hives: []const windows.HKEY, value_name: []cons
 
 fn queryStringPolicyThenPref(allocator: std.mem.Allocator, pref_hives: []const windows.HKEY, value_name: []const u8) !?[]u8 {
     var buf: [8]RegistrySource = undefined;
-    for (collectPolicyThenPrefSources(pref_hives, &buf)) |src| {
+    for (collectPolicyThenPrefSources(allocator, pref_hives, &buf)) |src| {
         const value = registry.queryString(allocator, src.hive, src.path, value_name) catch continue;
         return value;
     }
@@ -447,7 +539,7 @@ fn queryStringPolicyThenPref(allocator: std.mem.Allocator, pref_hives: []const w
 
 fn queryMultiPolicyThenPref(allocator: std.mem.Allocator, pref_hives: []const windows.HKEY, value_name: []const u8) !?[]const []const u8 {
     var buf: [8]RegistrySource = undefined;
-    for (collectPolicyThenPrefSources(pref_hives, &buf)) |src| {
+    for (collectPolicyThenPrefSources(allocator, pref_hives, &buf)) |src| {
         if (try registry.queryMultiStringOptional(allocator, src.hive, src.path, value_name)) |value| return value;
     }
     return null;
@@ -464,7 +556,7 @@ fn sourceIsMachinePolicy(src: RegistrySource) bool {
 
 fn loadMinimumAgeMinutes(allocator: std.mem.Allocator, pref_hives: []const windows.HKEY) !LoadedMinimumAge {
     var buf: [8]RegistrySource = undefined;
-    for (collectPolicyThenPrefSources(pref_hives, &buf)) |src| {
+    for (collectPolicyThenPrefSources(allocator, pref_hives, &buf)) |src| {
         if (try registry.queryQwordOptional(src.hive, src.path, reg_value_npm_module_minimum_age)) |value| {
             return .{ .minutes = value, .machine_policy = sourceIsMachinePolicy(src) };
         }
@@ -485,9 +577,9 @@ const LoadedBool = struct {
     machine_policy: bool,
 };
 
-fn loadPolicyOrPrefBoolSource(config_hives: []const windows.HKEY, value_name: []const u8) !LoadedBool {
+fn loadPolicyOrPrefBoolSource(allocator: std.mem.Allocator, config_hives: []const windows.HKEY, value_name: []const u8) !LoadedBool {
     var buf: [8]RegistrySource = undefined;
-    for (collectPolicyThenPrefSources(config_hives, &buf)) |src| {
+    for (collectPolicyThenPrefSources(allocator, config_hives, &buf)) |src| {
         if (try registry.queryDwordOptional(src.hive, src.path, value_name)) |value| {
             return .{ .value = value != 0, .machine_policy = sourceIsMachinePolicy(src) };
         }
@@ -495,8 +587,8 @@ fn loadPolicyOrPrefBoolSource(config_hives: []const windows.HKEY, value_name: []
     return .{ .value = false, .machine_policy = false };
 }
 
-fn loadPolicyOrPrefBool(config_hives: []const windows.HKEY, value_name: []const u8) !bool {
-    return (try loadPolicyOrPrefBoolSource(config_hives, value_name)).value;
+fn loadPolicyOrPrefBool(allocator: std.mem.Allocator, config_hives: []const windows.HKEY, value_name: []const u8) !bool {
+    return (try loadPolicyOrPrefBoolSource(allocator, config_hives, value_name)).value;
 }
 
 pub fn loadPolicyOrPrefMulti(allocator: std.mem.Allocator, value_name: []const u8) ![]const []const u8 {
@@ -1222,7 +1314,7 @@ fn parseCsvList(allocator: std.mem.Allocator, raw: []const u8) ![]const []const 
 
 fn loadFirstConfiguredRegistryValue(allocator: std.mem.Allocator, pref_hives: []const windows.HKEY, value_name: []const u8) !?[]u8 {
     var buf: [8]RegistrySource = undefined;
-    for (collectPolicyThenPrefSources(pref_hives, &buf)) |src| {
+    for (collectPolicyThenPrefSources(allocator, pref_hives, &buf)) |src| {
         if (try registry.queryMultiStringOptional(allocator, src.hive, src.path, value_name)) |configured| {
             defer freeStringList(allocator, configured);
 
@@ -1324,32 +1416,25 @@ test "effectiveNpmModuleMinimumAge uses 2-day Certified default when unset" {
     try std.testing.expectEqual(@as(?u64, 1440), effectiveNpmModuleMinimumAge(1440, true));
 }
 
-test "collectPolicyThenPrefSources certified: HKLM policy, HKLM pref, HKCU policy, HKCU pref" {
+test "collectPolicyThenPrefSources without governance: preference hives only" {
+    // No AccessToken in the test environment → AllowsMachinePolicy is false.
     const hives = [_]windows.HKEY{ windows.HKEY_LOCAL_MACHINE, windows.HKEY_CURRENT_USER };
     var buf: [8]RegistrySource = undefined;
-    const sources = collectPolicyThenPrefSources(&hives, &buf);
-    try std.testing.expectEqual(@as(usize, 4), sources.len);
+    const sources = collectPolicyThenPrefSources(std.testing.allocator, &hives, &buf);
+    try std.testing.expectEqual(@as(usize, 2), sources.len);
     try std.testing.expect(hiveIsLocalMachine(sources[0].hive));
-    try std.testing.expectEqualStrings(policy_path, sources[0].path);
-    try std.testing.expect(hiveIsLocalMachine(sources[1].hive));
+    try std.testing.expectEqualStrings(reg_path, sources[0].path);
+    try std.testing.expect(!hiveIsLocalMachine(sources[1].hive));
     try std.testing.expectEqualStrings(reg_path, sources[1].path);
-    try std.testing.expect(!hiveIsLocalMachine(sources[2].hive));
-    try std.testing.expectEqualStrings(policy_path, sources[2].path);
-    try std.testing.expect(!hiveIsLocalMachine(sources[3].hive));
-    try std.testing.expectEqualStrings(reg_path, sources[3].path);
 }
 
-test "collectPolicyThenPrefSources community: HKLM policy, HKCU policy, HKCU pref" {
+test "collectPolicyThenPrefSources community without governance: HKCU pref only" {
     const hives = [_]windows.HKEY{windows.HKEY_CURRENT_USER};
     var buf: [8]RegistrySource = undefined;
-    const sources = collectPolicyThenPrefSources(&hives, &buf);
-    try std.testing.expectEqual(@as(usize, 3), sources.len);
-    try std.testing.expect(hiveIsLocalMachine(sources[0].hive));
-    try std.testing.expectEqualStrings(policy_path, sources[0].path);
-    try std.testing.expect(!hiveIsLocalMachine(sources[1].hive));
-    try std.testing.expectEqualStrings(policy_path, sources[1].path);
-    try std.testing.expect(!hiveIsLocalMachine(sources[2].hive));
-    try std.testing.expectEqualStrings(reg_path, sources[2].path);
+    const sources = collectPolicyThenPrefSources(std.testing.allocator, &hives, &buf);
+    try std.testing.expectEqual(@as(usize, 1), sources.len);
+    try std.testing.expect(!hiveIsLocalMachine(sources[0].hive));
+    try std.testing.expectEqualStrings(reg_path, sources[0].path);
 }
 
 test "tokenAllowsStructuredLogging accepts eligible license in grace window" {
