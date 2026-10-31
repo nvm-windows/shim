@@ -112,6 +112,7 @@ pub fn build(b: *std.Build) void {
     version_firewall_module.addImport("config", config_module);
     version_firewall_module.addImport("registry", registry_module);
     version_firewall_module.addImport("resolver", resolver_module);
+    version_firewall_module.addImport("nodeversion", nodeversion_module);
 
     verifycache_module.addImport("config", config_module);
     verifycache_module.addImport("registry", registry_module);
@@ -268,6 +269,7 @@ pub fn build(b: *std.Build) void {
         });
         module_firewall_module.addImport("config", config_module);
         module_firewall_module.addImport("registry", registry_module);
+        module_firewall_module.addImport("nodeversion", nodeversion_module);
         exe.root_module.addImport("module_firewall", module_firewall_module);
         const malware_module = b.createModule(.{
             .root_source_file = b.path("shared/malware.zig"),

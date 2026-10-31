@@ -3,6 +3,7 @@ const windows = std.os.windows;
 const config = @import("config");
 const registry = @import("registry");
 const resolver = @import("resolver");
+const nodeversion = @import("nodeversion");
 
 const policy_path = config.policy_registry_root;
 const pref_path = config.preference_registry_root;
@@ -158,6 +159,7 @@ fn matchesAny(allocator: std.mem.Allocator, target: []const u8, entries: []const
 }
 
 /// Local version firewall. Community callers pass certified=false (always allow).
+/// Lists live under HKLM Policies; require Governance (AllowsMachinePolicy).
 /// Magic tokens EOL/ALPHA/MAINTENANCE are ignored locally, matching Go acl.
 pub fn evaluate(
     allocator: std.mem.Allocator,
@@ -165,6 +167,7 @@ pub fn evaluate(
     certified: bool,
 ) !Decision {
     if (!certified) return .allow;
+    if (!nodeversion.allowsMachinePolicy(allocator)) return .allow;
 
     const target = normalizeVersion(version);
     if (target.len == 0) return .allow;

@@ -2,6 +2,7 @@ const std = @import("std");
 const windows = std.os.windows;
 const config = @import("config");
 const registry = @import("registry");
+const nodeversion = @import("nodeversion");
 
 pub const reg_value_trusted_modules = "TrustedModules";
 pub const reg_value_approved_modules = "ApprovedModules";
@@ -236,19 +237,22 @@ pub const MultiSzList = struct {
     source: ListSource,
 };
 
-/// HKLM policy, then HKLM preferences, then HKCU preferences.
+/// HKLM policy (Governance only), then HKLM preferences, then HKCU preferences.
 /// HKCU policy is skipped so a user cannot plant a fake policy.
 pub fn loadFirewallList(allocator: std.mem.Allocator, value_name: []const u8) MultiSzList {
+    const honor_policy = nodeversion.allowsMachinePolicy(allocator);
     const steps = [_]struct {
         hive: windows.HKEY,
         root: []const u8,
         source: ListSource,
+        policy: bool,
     }{
-        .{ .hive = windows.HKEY_LOCAL_MACHINE, .root = config.policy_registry_root, .source = .machine_policy },
-        .{ .hive = windows.HKEY_LOCAL_MACHINE, .root = config.preference_registry_root, .source = .machine_settings },
-        .{ .hive = windows.HKEY_CURRENT_USER, .root = config.preference_registry_root, .source = .your_settings },
+        .{ .hive = windows.HKEY_LOCAL_MACHINE, .root = config.policy_registry_root, .source = .machine_policy, .policy = true },
+        .{ .hive = windows.HKEY_LOCAL_MACHINE, .root = config.preference_registry_root, .source = .machine_settings, .policy = false },
+        .{ .hive = windows.HKEY_CURRENT_USER, .root = config.preference_registry_root, .source = .your_settings, .policy = false },
     };
     for (steps) |step| {
+        if (step.policy and !honor_policy) continue;
         if (registry.queryMultiStringOptional(allocator, step.hive, step.root, value_name) catch null) |vals| {
             return .{ .values = vals, .source = step.source };
         }
@@ -267,13 +271,14 @@ pub fn freeMultiSz(allocator: std.mem.Allocator, vals: []const []const u8) void 
 }
 
 pub fn loadFirewallSkipLockfile(allocator: std.mem.Allocator) bool {
-    _ = allocator;
-    const policy_hives = [_]windows.HKEY{
-        windows.HKEY_LOCAL_MACHINE,
-        windows.HKEY_CURRENT_USER,
-    };
-    if (registry.queryDwordOptionalWithFallback(&policy_hives, config.policy_registry_root, reg_value_firewall_skip_lockfile) catch null) |value| {
-        return value != 0;
+    if (nodeversion.allowsMachinePolicy(allocator)) {
+        const policy_hives = [_]windows.HKEY{
+            windows.HKEY_LOCAL_MACHINE,
+            windows.HKEY_CURRENT_USER,
+        };
+        if (registry.queryDwordOptionalWithFallback(&policy_hives, config.policy_registry_root, reg_value_firewall_skip_lockfile) catch null) |value| {
+            return value != 0;
+        }
     }
     if (registry.queryDwordOptionalWithFallback(registry.preferenceHives(), config.preference_registry_root, reg_value_firewall_skip_lockfile) catch null) |value| {
         return value != 0;
