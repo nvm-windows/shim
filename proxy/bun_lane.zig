@@ -1,8 +1,11 @@
 const std = @import("std");
 const build_options = @import("build_options");
+const eventlog = @import("eventlog");
 const nodeversion = @import("nodeversion");
 const shim_bun = @import("shim_bun");
 const malware_scan = @import("malware_scan.zig");
+
+const code_lifecycle_scripts_blocked: u32 = 4412;
 
 /// If argv0 is bun/bunx, find the real bun, optionally scan, spawn, and exit.
 /// Returns when the invoked name is not bun.
@@ -39,9 +42,31 @@ pub fn runIfBun(
         );
     }
 
+    var audit_ctx = eventlog.captureAuditContext(allocator);
+    defer audit_ctx.deinit(allocator);
+
+    // Match Node-backed PMs: lifecycle lock first, then minimum-age inject.
+    var life = try prepareBunLifecycleLock(
+        allocator,
+        command_name,
+        target.insert_x,
+        cfg.block_package_manager_lifecycle_scripts,
+        forwarded,
+    );
+    defer life.deinit(allocator);
+    logBunLifecycleScriptsBlocked(
+        allocator,
+        cfg.structured_logging,
+        command_name,
+        target.insert_x,
+        forwarded,
+        life.action,
+        audit_ctx,
+    );
+
     const minutes = nodeversion.effectiveNpmModuleMinimumAge(cfg.npm_module_minimum_age, build_options.certified);
     const forced = cfg.npm_module_minimum_age_machine_policy;
-    var age_args = try prepareBunMinimumAgeForwarded(allocator, command_name, target.insert_x, minutes, forced, forwarded);
+    var age_args = try prepareBunMinimumAgeForwarded(allocator, command_name, target.insert_x, minutes, forced, life.args);
     defer age_args.deinit(allocator);
 
     var env_map = try std.process.getEnvMap(allocator);
@@ -78,6 +103,182 @@ fn spawn(
         .Exited => |code| code,
         else => 1,
     };
+}
+
+const BunLifecycleAction = enum {
+    unchanged,
+    ignore_scripts_flag,
+};
+
+pub const BunLifecycleLock = struct {
+    args: []const []const u8,
+    action: BunLifecycleAction,
+
+    pub fn deinit(self: BunLifecycleLock, allocator: std.mem.Allocator) void {
+        allocator.free(self.args);
+    }
+};
+
+/// Force Bun's `--ignore-scripts` when Governance blocks lifecycle scripts.
+/// Install-class only (`bun install` / `add` / … and every `bunx`). bunx: flag
+/// precedes the package. bun: after the install-class verb.
+pub fn prepareBunLifecycleLock(
+    allocator: std.mem.Allocator,
+    command_name: []const u8,
+    insert_x: bool,
+    block_lifecycle_scripts: bool,
+    forwarded: []const []const u8,
+) !BunLifecycleLock {
+    if (!block_lifecycle_scripts or !bunInstallClass(command_name, insert_x, forwarded)) {
+        return .{
+            .args = try allocator.dupe([]const u8, forwarded),
+            .action = .unchanged,
+        };
+    }
+
+    const stripped = try stripBunIgnoreScriptsDisabled(allocator, forwarded);
+    errdefer allocator.free(stripped);
+
+    const at_front = insert_x or std.ascii.eqlIgnoreCase(command_name, "bunx");
+    const injected = try injectBunIgnoreScripts(allocator, stripped, at_front);
+    allocator.free(stripped);
+    return .{ .args = injected, .action = .ignore_scripts_flag };
+}
+
+fn logBunLifecycleScriptsBlocked(
+    allocator: std.mem.Allocator,
+    structured_logging: bool,
+    command_name: []const u8,
+    insert_x: bool,
+    forwarded: []const []const u8,
+    action: BunLifecycleAction,
+    audit_ctx: eventlog.AuditContext,
+) void {
+    if (!build_options.certified or !structured_logging or action == .unchanged) return;
+    if (!bunInstallClass(command_name, insert_x, forwarded)) return;
+
+    eventlog.writeStructuredInfoCode(allocator, "proxy", "package_manager.lifecycle_scripts_blocked", .{
+        .command = command_name,
+        .verb = bunInstallClassVerb(command_name, insert_x, forwarded) orelse "",
+        .action = @tagName(action),
+        .node_version = "",
+        .user = audit_ctx.user,
+        .sid = audit_ctx.sid,
+        .hostname = audit_ctx.hostname,
+        .parent_process = audit_ctx.parent_process,
+        .parent_pid = audit_ctx.parent_pid,
+        .project_name = audit_ctx.project_name,
+        .project_path = audit_ctx.project_path,
+    }, code_lifecycle_scripts_blocked);
+}
+
+fn bunInstallClassVerb(command_name: []const u8, insert_x: bool, forwarded: []const []const u8) ?[]const u8 {
+    if (insert_x or std.ascii.eqlIgnoreCase(command_name, "bunx")) {
+        return if (hasBunPositional(forwarded)) "bunx" else null;
+    }
+    return firstBunInstallClassVerb(forwarded);
+}
+
+fn hasBunPositional(forwarded: []const []const u8) bool {
+    for (forwarded) |arg| {
+        if (arg.len == 0) continue;
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (arg[0] == '-') continue;
+        return true;
+    }
+    return false;
+}
+
+fn firstBunInstallClassVerb(forwarded: []const []const u8) ?[]const u8 {
+    for (forwarded) |arg| {
+        if (arg.len == 0) continue;
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (arg[0] == '-') continue;
+        if (isBunLifecycleVerb(arg)) return arg;
+        return null;
+    }
+    return null;
+}
+
+fn isBunLifecycleVerb(arg: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(arg, "install") or
+        std.ascii.eqlIgnoreCase(arg, "i") or
+        std.ascii.eqlIgnoreCase(arg, "add") or
+        std.ascii.eqlIgnoreCase(arg, "update") or
+        std.ascii.eqlIgnoreCase(arg, "create") or
+        std.ascii.eqlIgnoreCase(arg, "x") or
+        std.ascii.eqlIgnoreCase(arg, "uninstall") or
+        std.ascii.eqlIgnoreCase(arg, "remove") or
+        std.ascii.eqlIgnoreCase(arg, "rm") or
+        std.ascii.eqlIgnoreCase(arg, "link") or
+        std.ascii.eqlIgnoreCase(arg, "publish");
+}
+
+fn stripBunIgnoreScriptsDisabled(allocator: std.mem.Allocator, forwarded: []const []const u8) ![]const []const u8 {
+    var kept = std.ArrayListUnmanaged([]const u8){};
+    errdefer kept.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < forwarded.len) {
+        const arg = forwarded[index];
+        if (std.mem.eql(u8, arg, "--")) {
+            try kept.appendSlice(allocator, forwarded[index..]);
+            break;
+        }
+        if (isBunIgnoreScriptsDisabledFlag(arg)) {
+            index += 1;
+            continue;
+        }
+        if (isBareIgnoreScripts(arg) and index + 1 < forwarded.len and isFalseWord(forwarded[index + 1])) {
+            index += 2;
+            continue;
+        }
+        // Drop a bare --ignore-scripts; we re-inject below.
+        if (isBareIgnoreScripts(arg)) {
+            index += 1;
+            continue;
+        }
+        try kept.append(allocator, arg);
+        index += 1;
+    }
+    return kept.toOwnedSlice(allocator);
+}
+
+fn injectBunIgnoreScripts(allocator: std.mem.Allocator, forwarded: []const []const u8, at_front: bool) ![]const []const u8 {
+    var out = std.ArrayListUnmanaged([]const u8){};
+    errdefer out.deinit(allocator);
+
+    if (at_front) {
+        try out.append(allocator, "--ignore-scripts");
+        try out.appendSlice(allocator, forwarded);
+        return out.toOwnedSlice(allocator);
+    }
+
+    var inserted = false;
+    for (forwarded) |arg| {
+        try out.append(allocator, arg);
+        if (inserted) continue;
+        if (arg.len == 0 or arg[0] == '-') continue;
+        try out.append(allocator, "--ignore-scripts");
+        inserted = true;
+    }
+    if (!inserted) {
+        try out.append(allocator, "--ignore-scripts");
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn isBunIgnoreScriptsDisabledFlag(arg: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(arg, "--ignore-scripts=false") or
+        std.ascii.eqlIgnoreCase(arg, "--no-ignore-scripts");
+}
+
+fn isBareIgnoreScripts(arg: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(arg, "--ignore-scripts");
+}
+
+fn isFalseWord(arg: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(arg, "false");
 }
 
 pub const BunAgeForwarded = struct {
@@ -147,18 +348,7 @@ pub fn prepareBunMinimumAgeForwarded(
 
 fn bunInstallClass(command_name: []const u8, insert_x: bool, forwarded: []const []const u8) bool {
     if (insert_x or std.ascii.eqlIgnoreCase(command_name, "bunx")) return true;
-
-    for (forwarded) |arg| {
-        if (arg.len == 0) continue;
-        if (arg[0] == '-') continue;
-        return std.ascii.eqlIgnoreCase(arg, "install") or
-            std.ascii.eqlIgnoreCase(arg, "i") or
-            std.ascii.eqlIgnoreCase(arg, "add") or
-            std.ascii.eqlIgnoreCase(arg, "update") or
-            std.ascii.eqlIgnoreCase(arg, "create") or
-            std.ascii.eqlIgnoreCase(arg, "x");
-    }
-    return false;
+    return firstBunInstallClassVerb(forwarded) != null;
 }
 
 fn hasBunAgeFlag(forwarded: []const []const u8) bool {
@@ -248,6 +438,56 @@ fn expectArgStrings(args: []const []const u8, expected: []const []const u8) !voi
     for (expected, args) |want, got| {
         try std.testing.expectEqualStrings(want, got);
     }
+}
+
+test "prepareBunLifecycleLock off leaves args alone" {
+    const allocator = std.testing.allocator;
+    var prepared = try prepareBunLifecycleLock(allocator, "bun", false, false, &.{ "install", "left-pad" });
+    defer prepared.deinit(allocator);
+    try std.testing.expect(prepared.action == .unchanged);
+    try expectArgStrings(prepared.args, &.{ "install", "left-pad" });
+}
+
+test "prepareBunLifecycleLock injects after install verb" {
+    const allocator = std.testing.allocator;
+    var prepared = try prepareBunLifecycleLock(allocator, "bun", false, true, &.{ "install", "left-pad" });
+    defer prepared.deinit(allocator);
+    try std.testing.expect(prepared.action == .ignore_scripts_flag);
+    try expectArgStrings(prepared.args, &.{ "install", "--ignore-scripts", "left-pad" });
+}
+
+test "prepareBunLifecycleLock strips disable flags then injects" {
+    const allocator = std.testing.allocator;
+    var prepared = try prepareBunLifecycleLock(
+        allocator,
+        "bun",
+        false,
+        true,
+        &.{ "add", "--ignore-scripts=false", "--no-ignore-scripts", "left-pad", "--", "--ignore-scripts=false" },
+    );
+    defer prepared.deinit(allocator);
+    try expectArgStrings(prepared.args, &.{
+        "add",
+        "--ignore-scripts",
+        "left-pad",
+        "--",
+        "--ignore-scripts=false",
+    });
+}
+
+test "prepareBunLifecycleLock bunx puts flag before package" {
+    const allocator = std.testing.allocator;
+    var prepared = try prepareBunLifecycleLock(allocator, "bunx", false, true, &.{"cowsay"});
+    defer prepared.deinit(allocator);
+    try expectArgStrings(prepared.args, &.{ "--ignore-scripts", "cowsay" });
+}
+
+test "prepareBunLifecycleLock skips non-install bun commands" {
+    const allocator = std.testing.allocator;
+    var prepared = try prepareBunLifecycleLock(allocator, "bun", false, true, &.{ "test", "unit" });
+    defer prepared.deinit(allocator);
+    try std.testing.expect(prepared.action == .unchanged);
+    try expectArgStrings(prepared.args, &.{ "test", "unit" });
 }
 
 test "prepareBunMinimumAgeForwarded injects seconds after install verb" {
