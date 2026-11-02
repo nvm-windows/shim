@@ -4,6 +4,7 @@
 //! tooling. Logging failures are swallowed so shim execution is never blocked.
 
 const std = @import("std");
+const build_options = @import("build_options");
 
 const REGHANDLE = u64;
 
@@ -696,11 +697,14 @@ fn writeStructuredJson(
     if (EventRegister(&provider_guid, null, null, &handle) != 0) return error.OpenFailed;
     defer _ = EventUnregister(handle);
 
+    const enriched = try enrichPayloadWithNVMVersion(allocator, payload_json);
+    defer allocator.free(enriched);
+
     const source_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, source);
     defer allocator.free(source_w);
     const event_name_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, event_name);
     defer allocator.free(event_name_w);
-    const payload_json_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, payload_json);
+    const payload_json_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, enriched);
     defer allocator.free(payload_json_w);
 
     const descriptors = [_]EVENT_DATA_DESCRIPTOR{
@@ -711,6 +715,25 @@ fn writeStructuredJson(
     };
 
     _ = EventWrite(handle, &descriptor, descriptors.len, @ptrCast(&descriptors));
+}
+
+/// Adds nvm_version from the shim build when the JSON object does not already set it.
+fn enrichPayloadWithNVMVersion(allocator: std.mem.Allocator, payload_json: []const u8) ![]u8 {
+    const ver = build_options.version;
+    if (ver.len == 0) {
+        return try allocator.dupe(u8, payload_json);
+    }
+    if (std.mem.indexOf(u8, payload_json, "\"nvm_version\"") != null) {
+        return try allocator.dupe(u8, payload_json);
+    }
+    const trimmed = std.mem.trim(u8, payload_json, " \t\r\n");
+    if (trimmed.len >= 2 and trimmed[0] == '{') {
+        if (trimmed.len == 2) {
+            return try std.fmt.allocPrint(allocator, "{{\"nvm_version\":\"{s}\"}}", .{ver});
+        }
+        return try std.fmt.allocPrint(allocator, "{{\"nvm_version\":\"{s}\",{s}", .{ ver, trimmed[1..] });
+    }
+    return try allocator.dupe(u8, payload_json);
 }
 
 fn writeStructuredValue(
