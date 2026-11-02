@@ -617,7 +617,10 @@ const LauncherClass = union(enum) {
 ///
 /// If no `{name}.exe`, treat the npm global the same as other module CLIs:
 /// follow the `.cmd` into `node_modules\<pkg>\` (js/cjs/mjs or extensionless
-/// script). Corepack is last, and only when no module entry exists.
+/// script). Standalone pnpm installs expose `PNPM_HOME\bin\pnpm.cmd` (often a
+/// wrapper, not an npm-style `node_modules\pnpm` pointer); resolve that after
+/// the npm prefix so `npm i -g pnpm` does not regress when both exist.
+/// Corepack is last, and only when no module/standalone entry exists.
 /// npm, npx, and corepack do not come through here.
 fn resolveCorepackBackedCommand(allocator: std.mem.Allocator, node_install_dir: []const u8, command_name: []const u8) ![]u8 {
     if (try resolveNativeCommandExe(allocator, node_install_dir, command_name)) |exe| {
@@ -643,6 +646,9 @@ fn resolveCorepackBackedCommand(allocator: std.mem.Allocator, node_install_dir: 
             return js_path;
         }
         if (try resolveNpmPrefixModuleEntry(allocator, node_install_dir, command_name)) |entry| {
+            return entry;
+        }
+        if (try resolvePnpmHomeCommand(allocator, command_name, package_name)) |entry| {
             return entry;
         }
     }
@@ -713,6 +719,37 @@ fn pnpmHomeExeDir(allocator: std.mem.Allocator) !?[]u8 {
         return null;
     }
     return home;
+}
+
+/// Standalone pnpm (`get.pnpm.io`): `PNPM_HOME\bin\pnpm.cmd` (or `PNPM_HOME\pnpm.cmd`).
+/// Prefer extracting `node_modules\pnpm\...` when the launcher is npm-shaped;
+/// otherwise return the `.cmd` itself for script trust + cmd.exe spawn.
+/// Corepack trampolines are ignored so resolution can fall through.
+fn resolvePnpmHomeCommand(allocator: std.mem.Allocator, command_name: []const u8, package_name: []const u8) !?[]u8 {
+    if (!std.ascii.eqlIgnoreCase(command_name, "pnpm")) return null;
+    const home = try pnpmHomeExeDir(allocator) orelse return null;
+    defer allocator.free(home);
+
+    const bin_dir = try std.fs.path.join(allocator, &.{ home, "bin" });
+    defer allocator.free(bin_dir);
+
+    const dirs = [_][]const u8{ bin_dir, home };
+    for (dirs) |dir| {
+        if (try findLauncherCmd(allocator, dir, command_name)) |cmd_path| {
+            switch (try classifyPackageLauncher(allocator, cmd_path, package_name)) {
+                .package_js => |js_path| {
+                    allocator.free(cmd_path);
+                    return js_path;
+                },
+                .corepack_trampoline => {
+                    allocator.free(cmd_path);
+                    continue;
+                },
+                .reject => return cmd_path,
+            }
+        }
+    }
+    return null;
 }
 
 fn resolvePackageModuleEntry(allocator: std.mem.Allocator, dir_path: []const u8, package_name: []const u8, command_name: []const u8) !?[]u8 {
@@ -4079,5 +4116,162 @@ test "pnpm without exe uses global module js" {
         try std.testing.expect(!std.ascii.startsWithIgnoreCase(resolved, version));
         return;
     }
+    try std.testing.expect(std.ascii.endsWithIgnoreCase(resolved, "pnpm.mjs"));
+}
+
+const TestEnv = struct {
+    extern "kernel32" fn SetEnvironmentVariableW(
+        lpName: [*:0]const u16,
+        lpValue: ?[*:0]const u16,
+    ) callconv(.winapi) std.os.windows.BOOL;
+
+    fn set(gpa: std.mem.Allocator, name: []const u8, value: ?[]const u8) !void {
+        const name_w = try std.unicode.utf8ToUtf16LeAllocZ(gpa, name);
+        defer gpa.free(name_w);
+        if (value) |v| {
+            const value_w = try std.unicode.utf8ToUtf16LeAllocZ(gpa, v);
+            defer gpa.free(value_w);
+            if (SetEnvironmentVariableW(name_w, value_w) == 0) return error.SetEnvironmentVariableFailed;
+        } else {
+            if (SetEnvironmentVariableW(name_w, null) == 0) return error.SetEnvironmentVariableFailed;
+        }
+    }
+};
+
+test "pnpm resolves PNPM_HOME bin cmd before corepack" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("node\\node_modules\\corepack\\dist");
+    try tmp.dir.makePath("pnpm_home\\bin");
+    try tmp.dir.writeFile(.{ .sub_path = "node\\node_modules\\corepack\\dist\\corepack.js", .data = "corepack\n" });
+    // Standalone installer wrapper: no node_modules\pnpm under bin.
+    try tmp.dir.writeFile(.{
+        .sub_path = "pnpm_home\\bin\\pnpm.cmd",
+        .data = "@ECHO off\r\n\"%~dp0\\pnpm.exe\" %*\r\n",
+    });
+
+    const version = try tmp.dir.realpathAlloc(allocator, "node");
+    defer allocator.free(version);
+    const home = try tmp.dir.realpathAlloc(allocator, "pnpm_home");
+    defer allocator.free(home);
+
+    const previous = std.process.getEnvVarOwned(allocator, "PNPM_HOME") catch null;
+    defer {
+        if (previous) |value| {
+            TestEnv.set(allocator, "PNPM_HOME", value) catch {};
+            allocator.free(value);
+        } else {
+            TestEnv.set(allocator, "PNPM_HOME", null) catch {};
+        }
+    }
+    try TestEnv.set(allocator, "PNPM_HOME", home);
+
+    const resolved = try resolveCorepackBackedCommand(allocator, version, "pnpm");
+    defer allocator.free(resolved);
+    try std.testing.expect(std.ascii.endsWithIgnoreCase(resolved, "bin\\pnpm.cmd") or std.ascii.endsWithIgnoreCase(resolved, "bin/pnpm.cmd"));
+    try std.testing.expect(!std.ascii.endsWithIgnoreCase(resolved, "corepack.js"));
+}
+
+test "pnpm prefers npm prefix module over PNPM_HOME cmd" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // npmGlobalPrefix defaults to %APPDATA%\npm (npm_config_prefix is ignored).
+    try tmp.dir.makePath("node");
+    try tmp.dir.makePath("appdata\\npm\\node_modules\\pnpm\\bin");
+    try tmp.dir.makePath("pnpm_home\\bin");
+    try tmp.dir.writeFile(.{ .sub_path = "appdata\\npm\\node_modules\\pnpm\\bin\\pnpm.mjs", .data = "export {}\n" });
+    try tmp.dir.writeFile(.{
+        .sub_path = "appdata\\npm\\pnpm.cmd",
+        .data = "@ECHO off\r\n\"%_prog%\" \"%dp0%\\node_modules\\pnpm\\bin\\pnpm.mjs\" %*\r\n",
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "pnpm_home\\bin\\pnpm.cmd",
+        .data = "@ECHO off\r\n\"%~dp0\\pnpm.exe\" %*\r\n",
+    });
+
+    const version = try tmp.dir.realpathAlloc(allocator, "node");
+    defer allocator.free(version);
+    const appdata = try tmp.dir.realpathAlloc(allocator, "appdata");
+    defer allocator.free(appdata);
+    const home = try tmp.dir.realpathAlloc(allocator, "pnpm_home");
+    defer allocator.free(home);
+
+    const previous_home = std.process.getEnvVarOwned(allocator, "PNPM_HOME") catch null;
+    defer {
+        if (previous_home) |value| {
+            TestEnv.set(allocator, "PNPM_HOME", value) catch {};
+            allocator.free(value);
+        } else {
+            TestEnv.set(allocator, "PNPM_HOME", null) catch {};
+        }
+    }
+    try TestEnv.set(allocator, "PNPM_HOME", home);
+
+    const previous_appdata = std.process.getEnvVarOwned(allocator, "APPDATA") catch null;
+    defer {
+        if (previous_appdata) |value| {
+            TestEnv.set(allocator, "APPDATA", value) catch {};
+            allocator.free(value);
+        } else {
+            TestEnv.set(allocator, "APPDATA", null) catch {};
+        }
+    }
+    try TestEnv.set(allocator, "APPDATA", appdata);
+
+    // Avoid a real %USERPROFILE%\.npmrc overriding the test prefix.
+    try tmp.dir.makePath("home");
+    const fake_profile = try tmp.dir.realpathAlloc(allocator, "home");
+    defer allocator.free(fake_profile);
+    const previous_profile = std.process.getEnvVarOwned(allocator, "USERPROFILE") catch null;
+    defer {
+        if (previous_profile) |value| {
+            TestEnv.set(allocator, "USERPROFILE", value) catch {};
+            allocator.free(value);
+        } else {
+            TestEnv.set(allocator, "USERPROFILE", null) catch {};
+        }
+    }
+    try TestEnv.set(allocator, "USERPROFILE", fake_profile);
+
+    const resolved = try resolveCorepackBackedCommand(allocator, version, "pnpm");
+    defer allocator.free(resolved);
+    try std.testing.expect(std.ascii.endsWithIgnoreCase(resolved, "pnpm.mjs"));
+}
+
+test "pnpm PNPM_HOME npm-shaped cmd extracts package js" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("node");
+    try tmp.dir.makePath("pnpm_home\\bin\\node_modules\\pnpm\\bin");
+    try tmp.dir.writeFile(.{ .sub_path = "pnpm_home\\bin\\node_modules\\pnpm\\bin\\pnpm.mjs", .data = "export {}\n" });
+    try tmp.dir.writeFile(.{
+        .sub_path = "pnpm_home\\bin\\pnpm.cmd",
+        .data = "@ECHO off\r\n\"%_prog%\" \"%dp0%\\node_modules\\pnpm\\bin\\pnpm.mjs\" %*\r\n",
+    });
+
+    const version = try tmp.dir.realpathAlloc(allocator, "node");
+    defer allocator.free(version);
+    const home = try tmp.dir.realpathAlloc(allocator, "pnpm_home");
+    defer allocator.free(home);
+
+    const previous = std.process.getEnvVarOwned(allocator, "PNPM_HOME") catch null;
+    defer {
+        if (previous) |value| {
+            TestEnv.set(allocator, "PNPM_HOME", value) catch {};
+            allocator.free(value);
+        } else {
+            TestEnv.set(allocator, "PNPM_HOME", null) catch {};
+        }
+    }
+    try TestEnv.set(allocator, "PNPM_HOME", home);
+
+    const resolved = try resolveCorepackBackedCommand(allocator, version, "pnpm");
+    defer allocator.free(resolved);
     try std.testing.expect(std.ascii.endsWithIgnoreCase(resolved, "pnpm.mjs"));
 }
