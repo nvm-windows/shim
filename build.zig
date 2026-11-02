@@ -323,11 +323,13 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addImport("errors", errors_module);
 
-    exe.root_module.addImport("eventlog", b.createModule(.{
+    const eventlog_module = b.createModule(.{
         .root_source_file = b.path(eventlog_path),
         .target = target,
         .optimize = optimize,
-    }));
+    });
+    eventlog_module.addOptions("build_options", build_options);
+    exe.root_module.addImport("eventlog", eventlog_module);
 
     if (std.mem.eql(u8, app, "node")) {
         const node_tests = b.addTest(.{
