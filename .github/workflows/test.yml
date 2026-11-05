@@ -1,0 +1,54 @@
+name: Check
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    paths:
+      - build.ps1
+      - build.zig
+      - build.zig.zon
+      - .zigversion
+      - node/**
+      - proxy/**
+      - reshim/**
+      - shared/**
+      - .github/workflows/test.yml
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  test:
+    name: zig build test
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Set up Zig
+        uses: xyzzylabs/setup-zig@v1
+        with:
+          zig-version-file: .zigversion
+          use-cache: true
+          cache-key: shim-test-${{ hashFiles('.zigversion', 'build.zig.zon') }}
+
+      - name: Run Zig unit tests
+        shell: pwsh
+        run: |
+          zig build test -Dapp=node
+          zig build test -Dapp=proxy
+          zig build test -Dapp=reshim
