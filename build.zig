@@ -218,7 +218,10 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     build_options.addOption(bool, "certified", certified);
-    exe.root_module.addOptions("build_options", build_options);
+    // One shared module — calling addOptions on both exe and eventlog makes Zig
+    // 0.15 emit duplicate build_options / build_options0 and breaks `zig build test`.
+    const build_options_module = build_options.createModule();
+    exe.root_module.addImport("build_options", build_options_module);
 
     exe.root_module.addImport("registry", registry_module);
 
@@ -328,7 +331,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    eventlog_module.addOptions("build_options", build_options);
+    eventlog_module.addImport("build_options", build_options_module);
     exe.root_module.addImport("eventlog", eventlog_module);
 
     if (std.mem.eql(u8, app, "node")) {

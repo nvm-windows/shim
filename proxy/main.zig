@@ -4076,9 +4076,9 @@ test "resolvePackageModuleEntry prefers pnpm.mjs over extensionless bin" {
     try std.testing.expect(std.ascii.endsWithIgnoreCase(entry, "pnpm.mjs"));
 }
 
-/// Contract with common/verifycache PackageManagerCliRelPathsFor("pnpm"):
-/// first three JS paths must stay mjs→cjs→js or SignVersionScripts will miss
-/// the entry proxy launches (NVM4306).
+// Contract with common/verifycache PackageManagerCliRelPathsFor("pnpm"):
+// first three JS paths must stay mjs→cjs→js or SignVersionScripts will miss
+// the entry proxy launches (NVM4306).
 test "pnpm_module_rel_paths prefer mjs then cjs then js for script trust" {
     try std.testing.expectEqualStrings("pnpm\\bin\\pnpm.mjs", pnpm_module_rel_paths[0]);
     try std.testing.expectEqualStrings("pnpm\\bin\\pnpm.cjs", pnpm_module_rel_paths[1]);

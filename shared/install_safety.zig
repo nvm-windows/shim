@@ -167,5 +167,17 @@ test "checkVersionDirTrust accepts normal directory" {
     defer tmp.cleanup();
     const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(path);
+    // GitHub-hosted runners often grant Authenticated Users write on %TEMP%.
+    // Skip the "private dir" assertion there; the reject test covers that case.
+    if (try allowsCrossUserWrite(std.testing.allocator, path)) return error.SkipZigTest;
     try checkVersionDirTrust(std.testing.allocator, path);
+}
+
+test "checkVersionDirTrust rejects cross-user writable directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(path);
+    if (!try allowsCrossUserWrite(std.testing.allocator, path)) return error.SkipZigTest;
+    try std.testing.expectError(error.CrossUserWritable, checkVersionDirTrust(std.testing.allocator, path));
 }

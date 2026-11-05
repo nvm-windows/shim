@@ -1063,6 +1063,9 @@ test "nodeFileSecurityState changes after write" {
     defer allocator.free(path);
     const first = nodeFileSecurityState(path) catch return error.SkipZigTest;
 
+    // Overwrite alone can leave file_id/USN unchanged on some CI volumes;
+    // delete+recreate forces a new NTFS identity.
+    try tmp.dir.deleteFile("node.exe");
     try tmp.dir.writeFile(.{ .sub_path = "node.exe", .data = "other" });
     const second = try nodeFileSecurityState(path);
     try std.testing.expect(first.file_id != second.file_id or first.usn != second.usn);

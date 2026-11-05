@@ -84,9 +84,38 @@ jobs:
             echo "Release needed for shim version '$version'."
           fi
 
+  test:
+    name: zig build test
+    needs: detect-version
+    if: ${{ needs.detect-version.outputs.should_release == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Set up Zig
+        uses: xyzzylabs/setup-zig@v1
+        with:
+          zig-version-file: .zigversion
+          use-cache: true
+          cache-key: shim-test-${{ hashFiles('.zigversion', 'build.zig.zon') }}
+
+      - name: Run Zig unit tests
+        shell: pwsh
+        run: |
+          zig build test -Dapp=node
+          zig build test -Dapp=proxy
+          zig build test -Dapp=reshim
+
   create-release:
     name: Create Tag + Release
-    needs: detect-version
+    needs:
+      - detect-version
+      - test
     if: ${{ needs.detect-version.outputs.should_release == 'true' }}
     runs-on: ubuntu-slim
     permissions:
@@ -121,6 +150,7 @@ jobs:
     name: Build And Upload (${{ matrix.arch }})
     needs:
       - detect-version
+      - test
       - create-release
     if: ${{ needs.detect-version.outputs.should_release == 'true' }}
     runs-on: ${{ matrix.runner }}
