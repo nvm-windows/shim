@@ -708,8 +708,22 @@ pub fn resolveConfiguredNode(allocator: std.mem.Allocator, cfg: ShimConfig, over
     };
 }
 
+/// True when cwd-relative path is a symlink/junction/mount-point. Missing paths
+/// are not reparse points. Encode failures fail closed (treated as reparse) so
+/// we skip rather than follow an unreadable planted link.
+fn cwdEntryIsReparsePoint(allocator: std.mem.Allocator, name: []const u8) bool {
+    const path_w = std.unicode.utf8ToUtf16LeAllocZ(allocator, name) catch return true;
+    defer allocator.free(path_w);
+    const attrs = windows.kernel32.GetFileAttributesW(path_w.ptr);
+    if (attrs == windows.INVALID_FILE_ATTRIBUTES) return false;
+    return (attrs & 0x400) != 0; // FILE_ATTRIBUTE_REPARSE_POINT
+}
+
 pub fn detectVersionFromCwd(allocator: std.mem.Allocator, detect_files: []const []const u8) !?DetectedVersion {
     for (detect_files) |file_name| {
+        // Refuse planted symlink detect files (GHSA-j6ch-mq5c-3h4x class).
+        if (cwdEntryIsReparsePoint(allocator, file_name)) continue;
+
         const raw = std.fs.cwd().readFileAlloc(allocator, file_name, 1024 * 1024) catch continue;
         defer allocator.free(raw);
 
@@ -1080,6 +1094,8 @@ pub fn detectPackageManagerConstraintFromFile(allocator: std.mem.Allocator, file
     if (!(std.ascii.eqlIgnoreCase(file_name, "package.json") or std.ascii.eqlIgnoreCase(file_name, "package-lock.json"))) {
         return null;
     }
+
+    if (cwdEntryIsReparsePoint(allocator, file_name)) return null;
 
     const raw = std.fs.cwd().readFileAlloc(allocator, file_name, 1024 * 1024) catch return null;
     defer allocator.free(raw);

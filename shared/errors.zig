@@ -24,17 +24,51 @@ pub fn noVersionsInstalled() noreturn {
     std.process.exit(1);
 }
 
-pub fn unresolvedVersionSpec(spec: []const u8) noreturn {
+/// Returns a display-safe version/alias token, or empty when the payload looks
+/// like arbitrary file contents (e.g. a followed symlink .nvmrc target).
+pub fn safeVersionDisplay(spec: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, spec, " \t\r\n");
-    if (trimmed.len > 0) {
+    if (trimmed.len == 0 or trimmed.len > 64) return "";
+    // Detect files are single-line version specs; multiline means file contents.
+    if (std.mem.indexOfAny(u8, trimmed, "\r\n") != null) return "";
+
+    for (trimmed) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or switch (c) {
+            '.', '-', '_', '/', '+', '<', '>', '=', '^', '~', '*', '|', ' ', '@' => true,
+            else => false,
+        };
+        if (!ok) return "";
+    }
+    return trimmed;
+}
+
+pub fn unresolvedVersionSpec(spec: []const u8) noreturn {
+    const display = safeVersionDisplay(spec);
+    if (display.len > 0) {
         std.debug.print(
             "Could not resolve Node.js version \"{s}\". Install a matching version with `nvm install`, or run `nvm use` to select an installed version.\n",
-            .{trimmed},
+            .{display},
         );
     } else {
-        std.debug.print("Could not resolve the configured Node.js version. Run `nvm use` to select an installed version.\n", .{});
+        // Do not echo raw detect-file bytes (symlink disclosure / GHSA-j6ch-mq5c-3h4x class).
+        std.debug.print(
+            "Could not resolve the Node.js version from the project detect file. Install a matching version with `nvm install`, or run `nvm use` to select an installed version.\n",
+            .{},
+        );
     }
     std.process.exit(1);
+}
+
+test "safeVersionDisplay accepts version tokens" {
+    try std.testing.expectEqualStrings("20.11.0", safeVersionDisplay("  20.11.0\n"));
+    try std.testing.expectEqualStrings("lts/jod", safeVersionDisplay("lts/jod"));
+    try std.testing.expectEqualStrings("^18.0.0", safeVersionDisplay("^18.0.0"));
+}
+
+test "safeVersionDisplay rejects file-like payloads" {
+    try std.testing.expectEqualStrings("", safeVersionDisplay("//registry.npmjs.org/:_authToken=secret"));
+    try std.testing.expectEqualStrings("", safeVersionDisplay("line1\nline2"));
+    try std.testing.expectEqualStrings("", safeVersionDisplay("{\"engines\":{\"node\":\"20\"}}"));
 }
 
 pub const AutoInstallFailure = union(enum) {
