@@ -59,6 +59,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const errors_tests = b.addTest(.{
+        .root_module = errors_module,
+    });
+    const run_errors_tests = b.addRunArtifact(errors_tests);
 
     const nodeversion_module = b.createModule(.{
         .root_source_file = b.path(nodeversion_path),
@@ -133,6 +137,7 @@ pub fn build(b: *std.Build) void {
     const run_verifycache_tests = b.addRunArtifact(verifycache_tests);
     const test_step = b.step("test", "Run shim unit tests");
     test_step.dependOn(&run_verifycache_tests.step);
+    test_step.dependOn(&run_errors_tests.step);
 
     const nodeversion_tests = b.addTest(.{
         .root_module = nodeversion_module,
