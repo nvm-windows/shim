@@ -50,6 +50,20 @@ fn isServerMagic(raw: []const u8) bool {
         std.ascii.eqlIgnoreCase(raw, "MAINTENANCE");
 }
 
+fn isServerOnlyMagic(raw: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(raw, "EOL") or
+        std.ascii.eqlIgnoreCase(raw, "MAINTENANCE");
+}
+
+fn isAlphaKeyword(raw: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(raw, "ALPHA");
+}
+
+fn isAlphaVersion(raw: []const u8) bool {
+    const lower = normalizeVersion(raw);
+    return std.ascii.indexOfIgnoreCase(lower, "-alpha") != null;
+}
+
 fn normalizeVersion(raw: []const u8) []const u8 {
     var s = std.mem.trim(u8, raw, " \t\r\n");
     if (s.len >= 1 and (s[0] == 'v' or s[0] == 'V')) s = s[1..];
@@ -160,7 +174,7 @@ fn matchesAny(allocator: std.mem.Allocator, target: []const u8, entries: []const
 
 /// Local version firewall. Community callers pass certified=false (always allow).
 /// Lists live under HKLM Policies; require Governance (AllowsMachinePolicy).
-/// Magic tokens EOL/ALPHA/MAINTENANCE are ignored locally, matching Go acl.
+/// EOL/MAINTENANCE are ignored locally (JWT/mirror). ALPHA matches -alpha* locally.
 pub fn evaluate(
     allocator: std.mem.Allocator,
     version: []const u8,
@@ -192,7 +206,11 @@ fn evaluateLists(
     defer block_neg.deinit(allocator);
     var block_pos = std.ArrayListUnmanaged([]const u8){};
     defer block_pos.deinit(allocator);
-    var magic_present = false;
+    var server_only_magic = false;
+    var alpha_allow_pos = false;
+    var alpha_allow_neg = false;
+    var alpha_block_pos = false;
+    var alpha_block_neg = false;
 
     if (allow_raw) |raw| {
         var parts = std.ArrayListUnmanaged([]const u8){};
@@ -201,10 +219,15 @@ fn evaluateLists(
         for (parts.items) |part| {
             const n = stripNotPrefix(part);
             if (n.entry.len == 0) continue;
-            if (isServerMagic(n.entry)) {
-                magic_present = true;
+            if (isAlphaKeyword(n.entry)) {
+                if (n.negated) alpha_allow_neg = true else alpha_allow_pos = true;
                 continue;
             }
+            if (isServerOnlyMagic(n.entry)) {
+                server_only_magic = true;
+                continue;
+            }
+            if (isServerMagic(n.entry)) continue;
             if (n.negated) {
                 try allow_neg.append(allocator, n.entry);
             } else {
@@ -219,10 +242,15 @@ fn evaluateLists(
         for (parts.items) |part| {
             const n = stripNotPrefix(part);
             if (n.entry.len == 0) continue;
-            if (isServerMagic(n.entry)) {
-                magic_present = true;
+            if (isAlphaKeyword(n.entry)) {
+                if (n.negated) alpha_block_neg = true else alpha_block_pos = true;
                 continue;
             }
+            if (isServerOnlyMagic(n.entry)) {
+                server_only_magic = true;
+                continue;
+            }
+            if (isServerMagic(n.entry)) continue;
             if (n.negated) {
                 try block_neg.append(allocator, n.entry);
             } else {
@@ -235,14 +263,24 @@ fn evaluateLists(
         return .{ .deny = .{ .version = target, .source = "VersionAllowList" } };
     }
 
-    const allow_configured = allow_neg.items.len + allow_pos.items.len > 0;
+    const allow_configured = allow_neg.items.len + allow_pos.items.len > 0 or alpha_allow_pos or alpha_allow_neg;
     if (matchesAny(allocator, target, allow_pos.items)) return .allow;
+
+    if (isAlphaVersion(target)) {
+        if (alpha_allow_neg) {
+            return .{ .deny = .{ .version = target, .source = "VersionAllowList" } };
+        }
+        if (alpha_allow_pos) return .allow;
+        if (alpha_block_pos and !alpha_block_neg) {
+            return .{ .deny = .{ .version = target, .source = "VersionBlockList" } };
+        }
+    }
 
     if (matchesAny(allocator, target, block_pos.items) and !matchesAny(allocator, target, block_neg.items)) {
         return .{ .deny = .{ .version = target, .source = "VersionBlockList" } };
     }
 
-    if (allow_configured and !magic_present) {
+    if (allow_configured and !server_only_magic) {
         return .{ .deny = .{ .version = target, .source = "VersionAllowList" } };
     }
 
@@ -330,4 +368,25 @@ test "evaluateLists EOL magic ignored locally" {
 test "evaluateLists EOL plus allow is not exclusive" {
     const d = try evaluateLists(std.testing.allocator, "18.19.1", "20.x\nEOL", null);
     try std.testing.expect(d == .allow);
+}
+
+test "evaluateLists ALPHA block denies alpha versions" {
+    const d = try evaluateLists(std.testing.allocator, "27.0.0-alpha.0.0.0", null, "ALPHA");
+    try std.testing.expect(d == .deny);
+    switch (d) {
+        .deny => |r| try std.testing.expectEqualStrings("VersionBlockList", r.source),
+        else => unreachable,
+    }
+}
+
+test "evaluateLists ALPHA block allows stable versions" {
+    const d = try evaluateLists(std.testing.allocator, "26.13.0", null, "ALPHA");
+    try std.testing.expect(d == .allow);
+}
+
+test "evaluateLists ALPHA allow is exclusive" {
+    const denied = try evaluateLists(std.testing.allocator, "26.13.0", "ALPHA", null);
+    try std.testing.expect(denied == .deny);
+    const allowed = try evaluateLists(std.testing.allocator, "27.0.0-alpha.0.0.0", "ALPHA", null);
+    try std.testing.expect(allowed == .allow);
 }
