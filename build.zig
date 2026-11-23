@@ -235,6 +235,18 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("nodeversion", nodeversion_module);
     exe.root_module.addImport("shimintegrity", shimintegrity_module);
 
+
+    const shim_link_module = b.createModule(.{
+        .root_source_file = b.path("reshim/shim_link.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const shim_link_tests = b.addTest(.{
+        .root_module = shim_link_module,
+    });
+    shim_link_tests.root_module.linkSystemLibrary("kernel32", .{});
+    const run_shim_link_tests = b.addRunArtifact(shim_link_tests);
+    test_step.dependOn(&run_shim_link_tests.step);
     if (std.mem.eql(u8, app, "reshim")) {
         exe.root_module.addImport("jobobject", b.createModule(.{
             .root_source_file = b.path(jobobject_path),
@@ -242,6 +254,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }));
         exe.root_module.addImport("shim_bun", shim_bun_module);
+        exe.root_module.addImport("shim_link", shim_link_module);
         exe.root_module.linkSystemLibrary("kernel32", .{});
         exe.root_module.linkSystemLibrary("advapi32", .{});
         const reshim_tests = b.addTest(.{

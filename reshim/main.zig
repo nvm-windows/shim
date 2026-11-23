@@ -8,17 +8,12 @@ const eventlog = @import("eventlog");
 const shimintegrity = @import("shimintegrity");
 const jobobject = @import("jobobject");
 const shim_bun = @import("shim_bun");
+const shim_link = @import("shim_link");
 
 const shim_version = build_options.version;
 
 // Marks shim names parked aside because the running image blocked deletion.
 const stale_shim_marker = ".nvm-retired-";
-
-extern "kernel32" fn CreateHardLinkW(
-    lpFileName: [*:0]const u16,
-    lpExistingFileName: [*:0]const u16,
-    lpSecurityAttributes: ?*anyopaque,
-) callconv(.winapi) windows.BOOL;
 
 extern "kernel32" fn CopyFileW(
     lpExistingFileName: [*:0]const u16,
@@ -158,6 +153,8 @@ pub fn main() !void {
     };
 
     var linked: usize = 0;
+    var failed: usize = 0;
+    var saw_link_failed = false;
     for (cmd_names) |name| {
         const key = try allocator.dupe(u8, name);
         defer allocator.free(key);
@@ -169,10 +166,12 @@ pub fn main() !void {
         const link_path = try std.fs.path.join(allocator, &.{ shim_dir, link_name });
         defer allocator.free(link_path);
 
-        createHardLink(allocator, link_path, proxy_path) catch |err| {
+        shim_link.createShimLink(allocator, link_path, proxy_path) catch |err| {
+            failed += 1;
             if (err == error.ShimFileInUse) {
                 std.debug.print("  failed {s}: in use by a running process (close it, then run 'nvm reshim --force')\n", .{link_name});
             } else {
+                saw_link_failed = true;
                 std.debug.print("  failed {s}: {}\n", .{ link_name, err });
             }
             if (existed_before_force) {
@@ -196,6 +195,13 @@ pub fn main() !void {
     }
 
     try writeStdoutf(allocator, silent, "\nCreated {d} shim(s).\n", .{linked});
+    if (failed > 0) {
+        if (saw_link_failed) {
+            shim_link.printShimLinkGuidance();
+        }
+        std.debug.print("reshim failed: {d} shim(s) could not be created.\n", .{failed});
+        std.process.exit(1);
+    }
     prewarmShims(allocator, shim_dir, silent);
     signVersionScriptsAfterReshim(allocator, install_root, target_version_dir, silent, forward_sign_changed);
 }
@@ -332,26 +338,6 @@ fn runPrewarmCommand(allocator: std.mem.Allocator, shim_dir: []const u8, command
         return;
     };
     _ = child.wait() catch return;
-}
-
-fn createHardLink(allocator: std.mem.Allocator, link_path: []const u8, existing_path: []const u8) !void {
-    const link_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, link_path);
-    defer allocator.free(link_w);
-    const existing_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, existing_path);
-    defer allocator.free(existing_w);
-
-    if (CreateHardLinkW(link_w, existing_w, null) == 0) {
-        if (CopyFileW(existing_w, link_w, 0) == 0) {
-            const copy_error = windows.GetLastError();
-            if (shimintegrity.filesHaveSameContents(existing_path, link_path)) {
-                return;
-            }
-            return switch (copy_error) {
-                .SHARING_VIOLATION, .ACCESS_DENIED, .USER_MAPPED_FILE => error.ShimFileInUse,
-                else => error.CreateHardLinkFailed,
-            };
-        }
-    }
 }
 
 fn resolveSiblingProgramProxyPath(allocator: std.mem.Allocator) ![]u8 {
