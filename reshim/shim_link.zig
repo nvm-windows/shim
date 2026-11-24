@@ -60,7 +60,7 @@ pub fn createShimLink(allocator: std.mem.Allocator, link_path: []const u8, exist
             );
             return error.ShimLinkFailed;
         },
-    };
+    }
 }
 
 pub fn printShimLinkGuidance() void {
