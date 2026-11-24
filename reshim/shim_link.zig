@@ -51,9 +51,15 @@ pub fn createShimLink(allocator: std.mem.Allocator, link_path: []const u8, exist
     }
 
     const symlink_error = windows.GetLastError();
-    return switch (symlink_error) {
-        .SHARING_VIOLATION, .USER_MAPPED_FILE => error.ShimFileInUse,
-        else => error.ShimLinkFailed,
+    switch (symlink_error) {
+        .SHARING_VIOLATION, .USER_MAPPED_FILE => return error.ShimFileInUse,
+        else => {
+            std.debug.print(
+                "  CreateHardLinkW={s} CreateSymbolicLinkW={s} link={s} target={s}\n",
+                .{ @tagName(hardlink_error), @tagName(symlink_error), link_path, existing_path },
+            );
+            return error.ShimLinkFailed;
+        },
     };
 }
 
@@ -65,13 +71,12 @@ pub fn printShimLinkGuidance() void {
         \\Developer Mode or the Create symbolic links privilege.
         \\
         \\Try one of:
-        \\  1) Keep Node storage on the same drive as NVM, for example:
-        \\       nvm config set root=%LOCALAPPDATA%\Author Software\nvm\installs
+        \\  1) Enable Developer Mode (symlink privilege), then:
+        \\       nvm reshim --force
+        \\       https://docs.nvm-windows.com/features/modes
         \\  2) Switch to link mode:
         \\       nvm config set mode=link
         \\       nvm use link
-        \\  3) Enable Developer Mode (symlink privilege):
-        \\       https://docs.nvm-windows.com/features/modes
         \\
     , .{});
 }

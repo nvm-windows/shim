@@ -629,12 +629,22 @@ pub fn activeVersionInstallDir(allocator: std.mem.Allocator, install_root: []con
 }
 
 pub fn loadInstallRoot(allocator: std.mem.Allocator) ![]u8 {
-    const config_hives = registry.preferenceHives();
-    const raw_root = (try queryStringPolicyThenPref(allocator, config_hives, reg_value_root)) orelse
-        try allocator.dupe(u8, default_root);
-    defer allocator.free(raw_root);
+	const config_hives = registry.preferenceHives();
+	const raw_root = (try queryStringPolicyThenPref(allocator, config_hives, reg_value_root)) orelse
+		try allocator.dupe(u8, default_root);
+	defer allocator.free(raw_root);
 
-    return expandEnv(allocator, raw_root);
+	return expandEnv(allocator, raw_root);
+}
+
+/// Fixed per-user runtime directory for .shim, .nodejs, proxy.exe, .sync, .cache, .verify.
+/// Not derived from InstallRoot — custom version storage must not relocate PATH shims.
+pub fn loadDataRoot(allocator: std.mem.Allocator) ![]u8 {
+	const lad = std.process.getEnvVarOwned(allocator, "LOCALAPPDATA") catch return error.InvalidDataRoot;
+	defer allocator.free(lad);
+	const trimmed = std.mem.trim(u8, lad, " \t\r\n");
+	if (trimmed.len == 0) return error.InvalidDataRoot;
+	return try std.fs.path.join(allocator, &.{ trimmed, "Author Software", "nvm" });
 }
 
 pub fn deinitConfig(allocator: std.mem.Allocator, cfg: ShimConfig) void {
