@@ -85,7 +85,12 @@ pub fn main() !void {
         try allocator.dupe(u8, std.fs.path.dirname(target_version_dir.?) orelse ".");
     defer allocator.free(install_root);
 
-    const shim_dir = try std.fs.path.resolve(allocator, &.{ install_root, "..", ".shim" });
+    // Fixed per-user runtime root (not parent(InstallRoot)). Custom InstallRoot
+    // on another drive must not relocate .shim / proxy.exe away from PATH .nodejs.
+    const data_root = try nodeversion.loadDataRoot(allocator);
+    defer allocator.free(data_root);
+
+    const shim_dir = try std.fs.path.join(allocator, &.{ data_root, ".shim" });
     defer allocator.free(shim_dir);
 
     var existing_before_force = std.StringHashMap(void).init(allocator);
@@ -113,7 +118,7 @@ pub fn main() !void {
         planned_removals.deinit(allocator);
     }
 
-    const proxy_path = try std.fs.path.resolve(allocator, &.{ install_root, "..", "proxy.exe" });
+    const proxy_path = try std.fs.path.join(allocator, &.{ data_root, "proxy.exe" });
     defer allocator.free(proxy_path);
 
     const program_node_shim = shimintegrity.resolveProgramNodeShimPath(allocator) catch null;
